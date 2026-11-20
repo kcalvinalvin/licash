@@ -561,6 +561,45 @@ async fn a_swap_moves_notes_from_one_hub_to_another_for_the_providers_fee() {
     assert_eq!(theirs.unwrap().unwrap().state, swaps::State::Done);
 }
 
+/// A client's way, counting the times it asks each hub what it says of
+/// itself.
+struct Counting(Client, Arc<Mutex<HashMap<String, u32>>>);
+
+impl Transport for Counting {
+    fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
+        if let Some(hub) = url.strip_suffix(licash_api::INFO) {
+            *self.1.lock().unwrap().entry(hub.to_owned()).or_default() += 1;
+        }
+        self.0.request(url, body)
+    }
+}
+
+/// Each round trip of a swap is one more over Tor, a second or more: a hub
+/// is asked what it says of itself where the swap needs its height, as the
+/// swap is made and for each lock looked at there, not again for who it
+/// is.
+#[tokio::test]
+async fn a_swap_asks_its_hubs_what_they_say_of_themselves_only_where_it_needs_their_height() {
+    let eco = Eco::new(200).await;
+    let path = eco.dir.path().join("client.sqlite");
+    let asked = Arc::new(Mutex::new(HashMap::new()));
+    let client = Client(eco.net.clone(), eco.desk.clone());
+    let counting = Wallet::open(&path, Counting(client, asked.clone())).unwrap();
+    let swap = counting
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap();
+    assert_eq!(swap.state, SwapState::Done);
+    let asked = asked.lock().unwrap().clone();
+    // Each as the swap is made; A again for the wallet's lock looked at,
+    // B for the provider's lock looked at and claimed.
+    assert_eq!((asked.get(A), asked.get(B)), (Some(&2), Some(&3)));
+}
+
 /// A follower elsewhere (a second handle on the client's wallet, on
 /// another thread) never sees a swap without its lock, which it would fail
 /// as one whose lock was never made: the swap, its lock and its notes are

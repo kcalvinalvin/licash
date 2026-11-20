@@ -17,7 +17,9 @@ use licash_api::{
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Row};
 
-use crate::{hub_url, locks::Pays, now, sql, unavailable, Error, LockState, Transport, Wallet};
+use crate::{
+    both, hub_url, locks::Pays, now, sql, unavailable, Error, LockState, Transport, Wallet,
+};
 
 /// Blocks the provider's lock leaves the wallet to claim it, beyond the
 /// provider's margin: the wallet's lock expires no later, so that its notes
@@ -142,9 +144,13 @@ impl<T: Transport> Wallet<T> {
         if from_hub == to_hub {
             return Err(Error::Invalid("a swap is between two hubs".into()));
         }
-        let (_, from_info) = self.refresh(&from).await?;
-        let (_, to_info) = self.refresh(&to).await?;
-        let offer: swaps::Info = self.get(&provider, swaps::SWAPS_INFO).await?;
+        // Asked at once, each a round trip over Tor; failed as when asked
+        // in turn, the first's failure first.
+        let hubs = both(self.refresh(&from), self.refresh(&to));
+        let ((from_said, to_said), offer) =
+            both(hubs, self.get(&provider, swaps::SWAPS_INFO)).await;
+        let ((_, from_info), (_, to_info)) = (from_said?, to_said?);
+        let offer: swaps::Info = offer?;
         let Terms { fee, expiry, .. } = terms(
             &provider,
             &offer,
@@ -307,8 +313,10 @@ impl<T: Transport> Wallet<T> {
         id: &ProposalId,
     ) -> Result<Option<[u8; 32]>, Error> {
         let provider = &record.provider;
-        let (_, from_info) = self.refresh(&record.from.1).await?;
-        let (_, to_info) = self.refresh(&record.to).await?;
+        // Only who the hubs are: as kept, not asked again, a round trip
+        // each over Tor.
+        let (_, from_info) = self.hub(&record.from.1)?;
+        let (_, to_info) = self.hub(&record.to)?;
         let request = swaps::Request::new(
             &from_info.address,
             id,

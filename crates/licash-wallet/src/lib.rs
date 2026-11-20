@@ -257,6 +257,29 @@ where
     failed.map_or(Ok(made), Err)
 }
 
+/// `a` and `b` under way at once, each to its end: what each made.
+async fn both<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
+    let (mut a, mut b) = (std::pin::pin!(a), std::pin::pin!(b));
+    let (mut made_a, mut made_b) = (None, None);
+    std::future::poll_fn(|cx| {
+        if made_a.is_none() {
+            if let Poll::Ready(made) = a.as_mut().poll(cx) {
+                made_a = Some(made);
+            }
+        }
+        if made_b.is_none() {
+            if let Poll::Ready(made) = b.as_mut().poll(cx) {
+                made_b = Some(made);
+            }
+        }
+        match (made_a.is_some(), made_b.is_some()) {
+            (true, true) => Poll::Ready((made_a.take().unwrap(), made_b.take().unwrap())),
+            _ => Poll::Pending,
+        }
+    })
+    .await
+}
+
 fn invalid(e: impl std::fmt::Display) -> Error {
     Error::Invalid(e.to_string())
 }
