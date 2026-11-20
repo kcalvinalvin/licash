@@ -1010,7 +1010,13 @@ impl Gateway {
                 timeout: if body.close.is_some() { 0 } else { until },
                 wait: body.close.as_ref().map(|_| CLOSE_WAIT),
             };
-            let fund_by = from.saturating_add(c.window);
+            // Its window from now, not from where the scan is: a scan behind
+            // the node would leave it a part of it, or none once caught up.
+            let now = match self.source.tip().await {
+                Ok(tip) => tip.height.max(from),
+                Err(_) => from,
+            };
+            let fund_by = now.saturating_add(c.window);
             let new = New {
                 body: &canonical,
                 amount,

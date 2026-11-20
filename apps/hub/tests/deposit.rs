@@ -657,6 +657,28 @@ async fn a_duplicate_receipt_is_canceled_when_its_deposit_locked_first() {
         .any(|a| a.contains("locked for a deposit")));
 }
 
+/// A deposit asked while the hub's scan is behind its node gets its whole
+/// window from the node's tip: not from where the scan is, which would
+/// leave it none once the scan caught up.
+#[tokio::test]
+async fn a_deposit_asked_while_the_scan_lags_keeps_its_whole_window() {
+    let net = Net::new().await;
+    let deposits = net.info().await.deposits.unwrap();
+    // Blocks the node has and the hub has not scanned.
+    let lag = 4;
+    {
+        let mut backend = net.backend.lock().unwrap();
+        for _ in 0..lag {
+            backend.chain.mine_with(None, Vec::new());
+        }
+    }
+    let tip = net.backend.lock().unwrap().chain.height();
+    let alice = net.wallet("alice");
+    let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+    let terms = deposit.terms.unwrap();
+    assert_eq!(terms.fund_by, tip + deposits.window);
+}
+
 #[tokio::test]
 async fn a_deposit_paid_at_depth_is_received_and_its_coins_claimed() {
     let net = Net::new().await;
