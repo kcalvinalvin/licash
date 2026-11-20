@@ -160,6 +160,11 @@ impl Hub {
         Ok(())
     }
 
+    /// The checkpoint of `commitment`, one locks named, if the hub added it.
+    pub fn checkpoint_named(&self, commitment: &[u8; 32]) -> Result<Option<Checkpoint>, Error> {
+        self.store.read(|c| checkpoint_of(c, commitment))
+    }
+
     /// The newest checkpoint, which new locks should name.
     pub fn checkpoint(&self) -> Option<Checkpoint> {
         self.newest

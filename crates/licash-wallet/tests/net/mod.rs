@@ -44,6 +44,17 @@ pub enum Fault {
     Hushed,
 }
 
+/// What a hub serving a lock's state leaves out of it, or lies about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockLie {
+    /// Its payer's signatures.
+    Unsigned,
+    /// The checkpoint its terms name.
+    Unanchored,
+    /// It says it was paid, showing no preimage.
+    PaidUnshown,
+}
+
 struct Site {
     hub: Option<Arc<Hub>>,
     seed: PathBuf,
@@ -74,6 +85,8 @@ pub struct Net {
     /// The proof of identity the hubs advertise instead of their own: none
     /// as from an older hub, or another.
     pub proof: Mutex<Option<Option<Hex>>>,
+    /// What the hubs leave out of the locks' states they serve.
+    pub lock_lies: Mutex<Vec<LockLie>>,
     dirs: Mutex<Vec<tempfile::TempDir>>,
 }
 
@@ -273,7 +286,10 @@ impl Net {
         let answer = match (path, body) {
             (licash_api::INFO, None) => self.info(&hub),
             (licash_api::RELEASE, Some(body)) => release(&hub, &kept, &body),
-            (path, None) if path.starts_with("/v1/lock/") => lock_state(&hub, &path[9..]),
+            (path, None) if path.starts_with("/v1/lock/") => {
+                let lies = self.lock_lies.lock().unwrap().clone();
+                lock_state(&hub, &path[9..], &lies)
+            }
             (path, Some(body)) => post(&hub, path, &body),
             _ => Err(Problem::invalid("no such route")),
         };
@@ -374,16 +390,29 @@ fn release(hub: &Hub, kept: &Mutex<inbox::Inbox>, body: &[u8]) -> Result<Vec<u8>
     Ok(serde_json::to_vec(&released).unwrap())
 }
 
-fn lock_state(hub: &Hub, id: &str) -> Result<Vec<u8>, Problem> {
+fn lock_state(hub: &Hub, id: &str, lies: &[LockLie]) -> Result<Vec<u8>, Problem> {
     let id = licash_api::lock_id(id)?;
     let lock = hub.locked(&id).map_err(problem)?;
     let signatures = hub.lock_signatures(&id).map_err(problem)?;
-    let settled = lock.settled.map(|branch| match branch {
+    let mut settled = lock.settled.map(|branch| match branch {
         Settled::Pay => licash_api::Settled::Pay,
         Settled::Refund => licash_api::Settled::Refund,
     });
-    let state = LockState::new(&lock.proposal, &lock.certificate, settled, lock.preimage)
+    if lies.contains(&LockLie::PaidUnshown) {
+        settled = Some(licash_api::Settled::Pay);
+    }
+    let mut state = LockState::new(&lock.proposal, &lock.certificate, settled, lock.preimage)
         .with_signatures(&signatures);
+    let named = *lock.proposal.lock().unwrap().terms().checkpoint();
+    if let Some(checkpoint) = hub.checkpoint_named(&named).map_err(problem)? {
+        state = state.with_checkpoint(&checkpoint);
+    }
+    if lies.contains(&LockLie::Unsigned) {
+        state.signatures.clear();
+    }
+    if lies.contains(&LockLie::Unanchored) {
+        state.checkpoint = None;
+    }
     Ok(serde_json::to_vec(&state).unwrap())
 }
 

@@ -7,7 +7,7 @@ use licash::claim::{Branch, Item};
 use licash::spend::{lock_hash, ChainProfile};
 use licash_api::{Code, Fee};
 use licash_wallet::{ClaimSlot, Error, LockState, PartTo, Wallet};
-use net::{Fault, Link, Net, HUB};
+use net::{Fault, Link, LockLie, Net, HUB};
 
 const FEE: Fee = Fee { base: 2, ppm: 0 };
 const PREIMAGE: [u8; 32] = [7; 32];
@@ -228,6 +228,41 @@ async fn a_refund_owed_takes_its_part_of_a_recoverys_cap_before_notes() {
     // Taken: none left to the others, nor the first anymore.
     let each = recoverable(&both, 100);
     assert_eq!((each[&first], each[&second]), (0, 0));
+}
+
+/// A preimage is revealed to a hub only once what proves its lock on
+/// Bitcoin is recorded: its payer's signatures and the checkpoint it
+/// names. A hub leaving either out, or saying the lock was paid without
+/// showing the preimage, learns nothing, and the lock stays its payer's
+/// to refund.
+#[tokio::test]
+async fn a_preimage_is_revealed_only_against_what_proves_its_lock_on_bitcoin() {
+    let (net, alice, bob) = parties().await;
+    let lock = alice
+        .lock(HUB, &bob.address(), 10, hash(), Some(20))
+        .await
+        .unwrap();
+    let lies = [
+        vec![LockLie::Unsigned],
+        vec![LockLie::Unanchored],
+        vec![LockLie::Unsigned, LockLie::PaidUnshown],
+        vec![LockLie::Unanchored, LockLie::PaidUnshown],
+    ];
+    for lie in lies {
+        *net.lock_lies.lock().unwrap() = lie.clone();
+        let refused = bob.claim(HUB, &lock.id, &PREIMAGE).await;
+        assert!(
+            matches!(&refused, Err(Error::Unavailable { reason, .. }) if reason.contains("proof")),
+            "{lie:?}: {refused:?}"
+        );
+        assert!(bob.owed_locks().unwrap().is_empty(), "{lie:?}");
+        net.lock_lies.lock().unwrap().clear();
+        let state = alice.follow_lock(&lock.id).await.unwrap().state;
+        assert_eq!(state, LockState::Locked, "{lie:?}");
+    }
+    // Proven, revealed and paid.
+    let received = bob.claim(HUB, &lock.id, &PREIMAGE).await.unwrap();
+    assert_eq!(received.amount, 10);
 }
 
 /// A lock paying the wallet that its hub never issued, its preimage

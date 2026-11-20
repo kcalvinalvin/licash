@@ -783,16 +783,26 @@ impl<T: Transport> Wallet<T> {
                 return Err(Error::Invalid(format!("its lock pays {amount} of {least}")));
             }
         }
+        // Before its hub learns the preimage: what proves the lock on
+        // Bitcoin, should it not issue it, its checkpoint the one it names.
+        let anchor = view.checkpoint.clone();
         match view.settled {
             Some(Settled::Refund) => {
                 return Err(Error::Invalid("the lock was refunded".into()));
             }
-            // Revealed already.
-            Some(Settled::Pay) => {}
-            None if matches!(reveal, Reveal::Public | Reveal::Issued) => {}
+            // Revealed already, as the preimage its hub shows proves.
+            Some(Settled::Pay) if view.preimage.is_some() => {}
+            _ if matches!(reveal, Reveal::Public | Reveal::Issued) => {}
             // Revealed to it already, its answer lost: no one new learns it.
-            None if self.owes(&id)? => {}
-            None => {
+            _ if self.owes(&id)? => {}
+            // Never revealed without the proof, whatever the hub says of it.
+            _ if view.signatures.is_none() || anchor.is_none() => {
+                return Err(unavailable(
+                    &url,
+                    "no proof of the lock on Bitcoin to reveal its preimage against",
+                ));
+            }
+            _ => {
                 let hub = info.locks.as_ref().map_or(u32::MAX, |l| l.height);
                 let (height, too_late) = match reveal {
                     Reveal::Protected => {
@@ -811,12 +821,7 @@ impl<T: Transport> Wallet<T> {
                 }
             }
         }
-        // Before its hub learns the preimage: what proves the lock on
-        // Bitcoin, should it not issue it.
         if let Some(signatures) = (view.signatures.as_ref()).filter(|_| reveal != Reveal::Issued) {
-            let anchor = (info.locks.as_ref())
-                .and_then(|l| l.checkpoint().ok())
-                .filter(|c| c.commitment() == *terms.checkpoint());
             self.owe(hub, keyset, &view, signatures, preimage, anchor)?;
         }
         let issued: Issued = self

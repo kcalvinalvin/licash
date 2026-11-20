@@ -474,10 +474,14 @@ async fn lock_state(State(hub): State<Arc<Hub>>, Path(id): Path<String>) -> Answ
             Settled::Pay => licash_api::Settled::Pay,
             Settled::Refund => licash_api::Settled::Refund,
         });
-        Ok(
-            LockState::new(&lock.proposal, &lock.certificate, settled, lock.preimage)
-                .with_signatures(&signatures),
-        )
+        let terms = lock.proposal.lock().map(|l| *l.terms().checkpoint());
+        let checkpoint = terms.map(|c| hub.checkpoint_named(&c)).transpose()?;
+        let state = LockState::new(&lock.proposal, &lock.certificate, settled, lock.preimage)
+            .with_signatures(&signatures);
+        Ok(match checkpoint.flatten() {
+            Some(checkpoint) => state.with_checkpoint(&checkpoint),
+            None => state,
+        })
     })
     .await
 }

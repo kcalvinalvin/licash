@@ -542,6 +542,9 @@ pub struct LockState {
     /// none from a hub older than them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signatures: Vec<Hex>,
+    /// The checkpoint its terms name, which anchors its proof on Bitcoin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<Hex>,
 }
 
 /// The branch of a lock its hub issued.
@@ -562,6 +565,9 @@ pub struct LockView {
     /// Its payer's owner signatures, checked against its certificate, if
     /// its hub gave them ([`LockState::signatures`]).
     pub signatures: Option<Vec<Signature>>,
+    /// The checkpoint its terms name, checked to be that one, if its hub
+    /// gave it ([`LockState::checkpoint`]).
+    pub checkpoint: Option<Checkpoint>,
 }
 
 /// Issue the pay branch of `lock` for `preimage`.
@@ -1415,7 +1421,14 @@ impl LockState {
             settled,
             preimage: preimage.map(|p| Hex(p.to_vec())),
             signatures: vec![],
+            checkpoint: None,
         }
+    }
+
+    /// With `checkpoint`, the one its terms name ([`LockState::checkpoint`]).
+    pub fn with_checkpoint(mut self, checkpoint: &Checkpoint) -> Self {
+        self.checkpoint = Some(Hex(checkpoint.to_bytes()));
+        self
     }
 
     /// With its payer's owner `signatures` ([`LockState::signatures`]).
@@ -1432,11 +1445,21 @@ impl LockState {
         keysets: impl Fn(&[u8; 32]) -> Option<&'k Keyset>,
     ) -> Result<LockView, Problem> {
         let proposal = Proposal::from_commitment_bytes(&self.proposal.0)?;
-        let hash = *proposal
+        let terms = proposal
             .lock()
             .ok_or_else(|| Problem::invalid("not a lock"))?
-            .terms()
-            .hash();
+            .terms();
+        let hash = *terms.hash();
+        let checkpoint = match &self.checkpoint {
+            Some(bytes) => {
+                let checkpoint = Checkpoint::from_bytes(&bytes.0)?;
+                if checkpoint.commitment() != *terms.checkpoint() {
+                    return Err(Problem::invalid("not the checkpoint the lock names"));
+                }
+                Some(checkpoint)
+            }
+            None => None,
+        };
         let keyset = keysets(proposal.keyset_id())
             .ok_or_else(|| Problem::new(Code::UnknownKeyset, "unknown keyset"))?;
         let certificate = Certificate::from_bytes(keyset, &self.certificate.0)?;
@@ -1467,6 +1490,7 @@ impl LockState {
             settled: self.settled,
             preimage,
             signatures,
+            checkpoint,
         })
     }
 }

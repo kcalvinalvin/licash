@@ -112,7 +112,11 @@ delivery failures and actionable warnings remain visible without logging.
 A lock pays its payee on a secret's preimage until it expires, then returns
 to the payer: the payee runs `secret` and hands over the hash, the payer
 runs `lock <address> <amount> <hash>`, and the payee runs `claim <id>
-<preimage>`. `resume` follows the payer's locks to their end.
+<preimage>`. `resume` follows the payer's locks to their end. A claim reveals
+the preimage to the hub only once the wallet recorded what proves the lock
+on Bitcoin, its payer's signatures and the checkpoint it names, both served
+with the lock's state (`/v1/lock/{id}`): a hub leaving either out is
+retried, and learns nothing.
 
 Through a hub with a Lightning gateway, `pay-invoice <bolt11>` pays an
 invoice with a lock refunded if the payment fails, and `invoice <amount>`
