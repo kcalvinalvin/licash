@@ -298,6 +298,10 @@ class Engine(context: Context) {
     @Volatile
     private var providersDue: Pair<Wallet, Long>? = null
 
+    /** The wallet whose swap providers were last asked ahead, and when they are again ([System.nanoTime]). */
+    @Volatile
+    private var providersWarmed: Pair<Wallet, Long>? = null
+
     init {
         AppLog.start(File(files, "logs"))
         // A debug build logs what each request over Tor and each relay took.
@@ -907,19 +911,34 @@ class Engine(context: Context) {
      * Look for the swap providers announced, apart from the rounds, for a
      * quote to ask them without waiting on relays: every [PROVIDERS_MS]
      * once looked for, [PROVIDERS_RETRY_MS] after failing to; at once for
-     * a wallet opened since.
+     * a wallet opened since. In sight, those found are asked ahead every
+     * [WARM_MS], for a quote to find their connections open.
      */
     private fun findProviders() {
         val wallet = wallet ?: return
         val due = providersDue
-        if (due != null && due.first === wallet && System.nanoTime() < due.second) return
+        val now = System.nanoTime()
+        val look = due == null || due.first !== wallet || now >= due.second
+        val warmed = providersWarmed
+        val warm = foreground && (warmed == null || warmed.first !== wallet || now >= warmed.second)
+        if (!look && !warm) return
         if (!findingProviders.compareAndSet(false, true)) return
         scope.launch {
-            val wait = runCatching { wallet.refreshProviders() }
-                .onFailure { AppLog.warn("looking for swap providers", it) }
-                .fold({ PROVIDERS_MS }, { PROVIDERS_RETRY_MS })
-            providersDue = wallet to System.nanoTime() + wait * 1_000_000
-            findingProviders.set(false)
+            try {
+                if (look) {
+                    val wait = runCatching { wallet.refreshProviders() }
+                        .onFailure { AppLog.warn("looking for swap providers", it) }
+                        .fold({ PROVIDERS_MS }, { PROVIDERS_RETRY_MS })
+                    providersDue = wallet to System.nanoTime() + wait * 1_000_000
+                }
+                if (foreground) {
+                    runCatching { wallet.warmProviders() }
+                        .onFailure { AppLog.info("asking swap providers ahead: ${it.message}") }
+                    providersWarmed = wallet to System.nanoTime() + WARM_MS * 1_000_000
+                }
+            } finally {
+                findingProviders.set(false)
+            }
         }
     }
 
@@ -1869,6 +1888,9 @@ class Engine(context: Context) {
         private const val BACKUP_RETRY_MS = 5 * 60_000L
         private const val PROVIDERS_MS = 15 * 60_000L
         private const val PROVIDERS_RETRY_MS = 2 * 60_000L
+
+        /** Under the Tor client's 5 min keep of an idle connection, so that one asked ahead stays open. */
+        private const val WARM_MS = 4 * 60_000L
         private const val OFFER_MS = 30 * 60_000L
         private const val HUBS_MS = 5 * 60_000L
         private const val QUOTE_MS = 4 * 60_000L

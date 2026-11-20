@@ -721,6 +721,29 @@ fn a_phone_finds_its_static_donation_address_at_a_provider_taking_them() {
     drop((swapping, cheaper));
 }
 
+#[test]
+fn a_phone_asks_the_providers_kept_ahead_of_a_quote() {
+    let hubs = Hubs::start();
+    let phone = hubs.phone(1_000);
+    // None kept: none asked.
+    assert_eq!(phone.warm_providers().unwrap(), 0);
+    let swapping = Swaps::start(&hubs, 0x51, TERMS);
+    // Once kept, each asked: its announcement may take a moment to come.
+    let mut asked = 0;
+    for _ in 0..50 {
+        phone.refresh_providers().unwrap();
+        asked = phone.warm_providers().unwrap();
+        if asked > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(asked, 1);
+    // Gone, still announced: asked, not answering.
+    drop(swapping);
+    assert_eq!(phone.warm_providers().unwrap(), 0);
+}
+
 fn via_quote(phone: &Wallet, request: &str) -> InvoiceQuote {
     let mut last = None;
     for _ in 0..50 {

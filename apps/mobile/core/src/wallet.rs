@@ -464,6 +464,23 @@ impl Wallet {
         Ok(u32::try_from(found).unwrap_or(u32::MAX))
     }
 
+    /// Ask each swap provider kept ([`Wallet::refresh_providers`]) what it
+    /// says of itself, waiting on each: the next quote then finds their
+    /// connections open, kept a few minutes, rather than opening circuits
+    /// to onion services for seconds as its owner waits. How many answered:
+    /// none if none is kept. The app calls it out of sight, while in sight.
+    pub fn warm_providers(&self) -> Result<u32, LicashError> {
+        let relays = hub_relays(&self.wallet)?;
+        if relays.is_empty() {
+            return Ok(0);
+        }
+        let started = Instant::now();
+        let warm = self.announced.warm(&self.wallet, &relays);
+        let answered = self.runtime.block_on(warm)?;
+        tracing::info!(answered, took = ?started.elapsed(), "swap providers asked ahead");
+        Ok(u32::try_from(answered).unwrap_or(u32::MAX))
+    }
+
     /// [`Wallet::discover_hubs`], on `relays` as well as on those the hubs
     /// trusted name, such as [`crate::default_relays`]: a wallet using no
     /// hub yet finds some. Told also how many more were announced that did

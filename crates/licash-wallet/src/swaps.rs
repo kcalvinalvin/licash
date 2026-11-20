@@ -462,6 +462,12 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
+    /// What the swap provider at `provider` says of itself and of the swaps
+    /// and payouts it makes: nothing kept.
+    pub async fn provider_info(&self, provider: &str) -> Result<swaps::Info, Error> {
+        self.get(&hub_url(provider)?, swaps::SWAPS_INFO).await
+    }
+
     /// Ask the hub at `url`, added, what it says of itself again, and keep
     /// it. [`Wallet::swap_quote`] judges a lock by the height its hubs last
     /// said they followed, which on quick blocks is soon far behind: a swap

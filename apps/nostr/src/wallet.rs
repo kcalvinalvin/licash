@@ -204,7 +204,9 @@ impl Announcements {
     {
         if let Some(found) = self.kept(relays, network) {
             let found = self.chosen(found, used);
-            let answered = self.asked(found, &ask, nostr).await?;
+            let answered = self
+                .asked(found, &ask, nostr, Some(QUOTE_GRACE_LEAST))
+                .await?;
             if !answered.is_empty() {
                 return Ok(answered);
             }
@@ -212,7 +214,29 @@ impl Announcements {
         }
         let found = crate::discover(relays, route, Role::Swaps, network).await?;
         let found = self.chosen(found, used);
-        Ok(self.asked(found, &ask, nostr).await?)
+        Ok(self
+            .asked(found, &ask, nostr, Some(QUOTE_GRACE_LEAST))
+            .await?)
+    }
+
+    /// Ask each swap provider kept from `relays` for `wallet`'s network,
+    /// as a quote would choose them, what it says of itself, waiting on
+    /// each: out of sight, so that the next quote finds its connections
+    /// open (the Tor client keeps them a while), not opening a circuit to
+    /// an onion service, and asks each first where it answered. How many
+    /// answered; none asked if none is kept.
+    pub async fn warm<T: Transport>(
+        &self,
+        wallet: &Wallet<T>,
+        relays: &[String],
+    ) -> Result<usize, Error> {
+        let Some(found) = self.kept(relays, wallet.network().name()) else {
+            return Ok(0);
+        };
+        let found = self.chosen(found, &HashSet::new());
+        let ask = |url: String| async move { wallet.provider_info(&url).await };
+        let nostr: fn(&licash_api::swaps::Info) -> Option<&str> = |i| i.nostr.as_deref();
+        Ok(self.asked(found, ask, nostr, None).await?.len())
     }
 
     /// Those of `found` to ask: each the wallet went through before (at a
@@ -247,16 +271,17 @@ impl Announcements {
             .collect()
     }
 
-    /// Those of `found` answering `ask` ([`answering`]), each asked first
-    /// at the URL it last answered at, within [`KEPT_FOR`] and while it
-    /// still announces it, then at the others in the order announced:
-    /// where each answers kept for the next, forgotten for one that does
-    /// not.
+    /// Those of `found` answering `ask` ([`answering`], waiting on the
+    /// others no longer than `least` says), each asked first at the URL it
+    /// last answered at, within [`KEPT_FOR`] and while it still announces
+    /// it, then at the others in the order announced: where each answers
+    /// kept for the next, forgotten for one that does not.
     async fn asked<Q, Fut>(
         &self,
         mut found: Vec<Found>,
         ask: impl Fn(String) -> Fut,
         nostr: fn(&Q) -> Option<&str>,
+        least: Option<Duration>,
     ) -> Result<Vec<(Found, String, Q)>, Error>
     where
         Fut: Future<Output = Result<Q, Error>>,
@@ -276,7 +301,7 @@ impl Announcements {
             }
         }
         let keys: Vec<String> = found.iter().map(|f| f.key.clone()).collect();
-        let answering = answering(found, ask, nostr, Some(QUOTE_GRACE_LEAST)).await?;
+        let answering = answering(found, ask, nostr, least).await?;
         let mut answered = lock();
         // Those heard from too long ago count for nothing: forgotten, so
         // that keys announcing once each are kept no longer.
@@ -1599,7 +1624,7 @@ mod tests {
             let key = key.clone();
             async move { Ok(Answer(key)) }
         };
-        announced.asked(found, ask, named).await.unwrap();
+        announced.asked(found, ask, named, None).await.unwrap();
         let answered = announced.answered.lock().unwrap();
         assert_eq!(answered.keys().collect::<Vec<_>>(), [&key]);
     }
@@ -1750,7 +1775,10 @@ mod tests {
         let quote = async |set: (&[&'static str], &[&'static str])| {
             *down.lock().unwrap() = set.0.iter().copied().collect();
             *other.lock().unwrap() = set.1.iter().copied().collect();
-            let answered = announced.asked(vec![two.clone()], &ask, named).await;
+            let found = vec![two.clone()];
+            let answered = announced
+                .asked(found, &ask, named, Some(QUOTE_GRACE_LEAST))
+                .await;
             let at = answered.unwrap().first().map(|(_, url, _)| url.clone());
             (at, std::mem::take(&mut *asked.lock().unwrap()))
         };
