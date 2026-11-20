@@ -924,9 +924,7 @@ class Engine(context: Context) {
      */
     private fun resumeContracts(chain: GoChain) {
         val ui = state.value
-        val waiting = ui.contracts.any {
-            it.state == ContractState.Opening || it.state == ContractState.Confirming
-        } || ui.recoveries.any { carriedOn(it) }
+        val waiting = ui.contracts.any { carriedOn(it) } || ui.recoveries.any { carriedOn(it) }
         val protecting = ui.contracts.any { it.state == ContractState.Protecting }
         if (!(waiting || protecting) || !contracting.compareAndSet(false, true)) return
         scope.launch {

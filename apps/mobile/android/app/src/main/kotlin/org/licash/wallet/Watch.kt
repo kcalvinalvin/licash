@@ -1,6 +1,7 @@
 package org.licash.wallet
 
 import org.licash.core.Activity
+import org.licash.core.Contract
 import org.licash.core.ContractExit
 import org.licash.core.ContractState
 import org.licash.core.ExitStep
@@ -138,6 +139,17 @@ internal fun exitNotices(exits: List<ContractExit>, recoveries: List<Recovery>):
         )
     }
     return told + disputed + capped
+}
+
+/**
+ * Whether `contract` still has steps to carry on: being opened or
+ * confirmed, or protecting while the notes she funded it with are not in
+ * her balance yet, issued only once its funding is buried.
+ */
+internal fun carriedOn(contract: Contract): Boolean = when (contract.state) {
+    ContractState.Opening, ContractState.Confirming -> true
+    ContractState.Protecting -> contract.funded > 0uL && !contract.fundedReceived
+    else -> false
 }
 
 /** Whether `recovery` still has steps to carry on. */

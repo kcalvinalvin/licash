@@ -1,6 +1,7 @@
 package org.licash.wallet
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -123,6 +124,24 @@ class WatchTest {
         assertEquals(Watch.LATER, watchOf(Ui(contracts = listOf(contract(ContractState.Protecting))), now))
         for (state in listOf(ContractState.Ending, ContractState.Closed)) {
             assertEquals(Watch.NONE, watchOf(Ui(contracts = listOf(contract(state))), now))
+        }
+    }
+
+    @Test
+    fun a_contract_is_carried_on_until_open_and_her_funded_notes_received() {
+        fun contract(state: ContractState, funded: ULong = 0uL, received: Boolean = false) = Contract(
+            id = "c0", hub = "https://hub.example", state = state, mock = false, cap = 131_071uL, covers = 0uL,
+            price = 23_024uL, funded = funded, fundedReceived = received, paidFrom = 23_300uL, protectsUntil = 5_000u,
+            closesAt = 5_500u, funding = null, createdAt = 0L, step = null, transfer = null,
+        )
+        assertTrue(carriedOn(contract(ContractState.Opening, 276uL)))
+        assertTrue(carriedOn(contract(ContractState.Confirming, 276uL)))
+        // Her notes are issued once its funding is buried, by then protecting.
+        assertTrue(carriedOn(contract(ContractState.Protecting, 276uL)))
+        assertFalse(carriedOn(contract(ContractState.Protecting, 276uL, received = true)))
+        assertFalse(carriedOn(contract(ContractState.Protecting)))
+        for (state in listOf(ContractState.Ending, ContractState.Closed)) {
+            assertFalse("$state", carriedOn(contract(state, 276uL)))
         }
     }
 
