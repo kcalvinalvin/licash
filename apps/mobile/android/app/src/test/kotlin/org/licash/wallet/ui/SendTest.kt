@@ -12,6 +12,16 @@ class SendTest {
     }
 
     @Test
+    fun a_code_is_shown_short_whatever_its_scheme_case_or_amount() {
+        val body = "tlicash1qqqqsqpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsabcdefgh"
+        val short = "tlicash1qq…abcdefgh"
+        assertEquals(short, shortCode("licash:$body"))
+        assertEquals(short, shortCode(" licash:$body?amount=5000 "))
+        assertEquals(short, shortCode("LICASH:${body.uppercase()}"))
+        assertEquals(short, shortCode(body))
+    }
+
+    @Test
     fun the_same_blocks_take_a_twentieth_of_the_time_on_mutinynet() {
         assertEquals("about 1 min", arrives(0u, 30u))
         assertEquals("about 1 min", arrives(1u, 30u))

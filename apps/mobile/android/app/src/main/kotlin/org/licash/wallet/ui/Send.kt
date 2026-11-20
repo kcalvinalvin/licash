@@ -331,7 +331,7 @@ fun Send(
                 is Step.Paying -> Paying(engine, ui, s) { amount, shown -> plan(s, amount, shown) }
                 Step.Busy -> Middle("One moment…")
                 Step.Planning -> Middle("One moment…")
-                is Step.Review -> Review(s.quote, s.through.takeIf { ui.developer }, { pay(s.code, s.amount) }) {
+                is Step.Review -> Review(s.quote, payee(engine, s.code), s.through.takeIf { ui.developer }, { pay(s.code, s.amount) }) {
                     // A swap first: any provider that could, to choose.
                     if (ui.developer && s.quote.swapFrom != null) {
                         Providers {
@@ -541,6 +541,7 @@ private fun Paying(engine: Engine, ui: Ui, s: Step.Paying, pay: (amount: ULong?,
         if (!s.visit) {
             Facts(
                 listOf(
+                    Fact("To", payee(engine, s.code), "to"),
                     Fact(
                         "Fee",
                         fee?.let { if (it == 0uL) "None" else if (exact != null) sat(it) else "Up to ${sat(it)}" } ?: "",
@@ -573,11 +574,12 @@ private fun Paying(engine: Engine, ui: Ui, s: Step.Paying, pay: (amount: ULong?,
  * notes to its hub first, and whether that hub is one not added.
  */
 @Composable
-private fun Review(quote: PayQuote, through: String?, pay: () -> Unit, more: @Composable () -> Unit) {
+private fun Review(quote: PayQuote, to: String, through: String?, pay: () -> Unit, more: @Composable () -> Unit) {
     val swap = quote.swapFrom
     Confirm(
         quote.amount,
-        costs(quote.amount, quote.fee, if (swap == null) "Instantly" else "Shortly") + listOfNotNull(
+        listOf(Fact("To", to, "to")) +
+            costs(quote.amount, quote.fee, if (swap == null) "Instantly" else "Shortly") + listOfNotNull(
             swap?.let { Fact("Moved first", "${sat(quote.swapped)} from ${name(it)}", "moves") },
             through?.let { Fact("Through", it, "through") },
         ),
@@ -748,6 +750,22 @@ private fun Payout(quote: PayoutQuote, own: Boolean, several: Boolean, pay: () -
 /** A long address, its ends shown. */
 private fun shortAddress(address: String): String =
     if (address.length <= 20) address else address.take(10) + "…" + address.takeLast(8)
+
+/**
+ * The wallet the code `code` pays, to check before paying: its contact's
+ * name if one, else the code shortened. A contact's is never shown of
+ * another wallet's code.
+ */
+@Composable
+private fun payee(engine: Engine, code: String): String {
+    var name by remember(code) { mutableStateOf<String?>(null) }
+    LaunchedEffect(code) { name = engine.contactOf(code).getOrNull()?.name }
+    return name ?: shortCode(code)
+}
+
+/** A payment code shortened: its text without scheme or amount, as a QR code's in upper case too. */
+internal fun shortCode(code: String): String =
+    shortAddress(code.trim().substringAfter(':').substringBefore('?').lowercase())
 
 /** Paid; if not to the payee's mailbox, what to hand them. */
 @Composable

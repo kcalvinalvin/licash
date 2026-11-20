@@ -172,6 +172,8 @@ async fn contact(phone: &Phone, bob: &licash_e2e::Wallet) -> anyhow::Result<()> 
     })
     .await?;
     phone.type_text("1000").await?;
+    // Whom it pays, a contact: by name.
+    phone.tagged("to", "Bob", 10).await?;
     phone.tagged("arrives", "Instantly", 10).await?;
     phone.tap_id("confirm").await?;
     phone.tagged("result", "Sent", 60).await?;
@@ -483,6 +485,10 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     })
     .await?;
     eprintln!("paying 5000, fee: {fee}");
+    // Whom it pays, no contact yet: the start of his code.
+    let text = bobs.to_string();
+    let body = text.strip_prefix("licash:").unwrap_or(&text);
+    phone.tagged("to", &body[..10], 10).await?;
     phone.tagged("arrives", "Instantly", 10).await?;
     phone.tap_id("confirm").await?;
     phone.tagged("result", "Sent", 60).await?;
