@@ -21,7 +21,7 @@ use crate::{
     chain::Chain, Activity, Balance, ChainError, ChainSource, Code, ContractTerms, Details,
     FoundHub, Holding, Hub, HubsFound, InvoiceQuote, Kind, LicashError, LightningInvoice,
     LightningTerms, Linking, Network, NoteLine, Notes, NotesOf, NotesPaid, Onchain, Paid, PaidTo,
-    PayOffer, PayQuote, Range, Rate, Scan, Scanned, State, TorStatus,
+    PayOffer, PayQuote, Range, Rate, Scan, Scanned, State, TorClient,
 };
 
 /// The rate deposits are paid at, in sat/vB: above what nodes relay.
@@ -56,7 +56,9 @@ pub struct Wallet {
     runtime: tokio::runtime::Runtime,
     wallet: licash_wallet::Wallet<Http>,
     route: Route,
-    tor: bool,
+    /// The app's Tor client, kept alive while the wallet uses it: none
+    /// unless over Tor.
+    tor: Option<Arc<TorClient>>,
     dir: PathBuf,
     /// Held while paying and finishing what is under way: the payments to
     /// send to mailboxes change only under it.
@@ -75,9 +77,6 @@ pub struct Wallet {
     /// When the hubs were last asked what URLs they name
     /// ([`Wallet::ask_onions`]): never since it opened if none.
     onions_asked: Mutex<Option<Instant>>,
-    /// The SOCKS5 proxy through its Tor client, once asked for
-    /// ([`Wallet::tor_proxy`]).
-    socks: Mutex<Option<licash_tor::Socks>>,
     /// The swap providers announced, as last looked for
     /// ([`Wallet::refresh_providers`]): quotes ask them without looking.
     announced: Announcements,
@@ -147,13 +146,13 @@ pub fn wallet_exists(dir: String) -> bool {
 impl Wallet {
     /// A new wallet of `network` in `dir`, which holds none, made at the
     /// chain's height `birthday` (0 if unknown), reaching hubs and relays
-    /// through Tor if `tor`.
+    /// through `tor` if any.
     #[uniffi::constructor]
     pub fn create(
         dir: String,
         network: Network,
         birthday: u32,
-        tor: bool,
+        tor: Option<Arc<TorClient>>,
     ) -> Result<Arc<Self>, LicashError> {
         let dir = PathBuf::from(dir);
         if wallet_exists(dir.display().to_string()) {
@@ -173,9 +172,9 @@ impl Wallet {
         })
     }
 
-    /// The wallet in `dir`.
+    /// The wallet in `dir`, reaching hubs and relays through `tor` if any.
     #[uniffi::constructor]
-    pub fn open(dir: String, tor: bool) -> Result<Arc<Self>, LicashError> {
+    pub fn open(dir: String, tor: Option<Arc<TorClient>>) -> Result<Arc<Self>, LicashError> {
         Self::start(PathBuf::from(dir), tor, licash_wallet::Wallet::open)
     }
 
@@ -185,30 +184,7 @@ impl Wallet {
 
     /// Whether it reaches hubs and relays through Tor.
     pub fn tor(&self) -> bool {
-        self.tor
-    }
-
-    /// How far its Tor client is in connecting, none unless over Tor. Not
-    /// connected, it starts connecting now rather than at its first use.
-    pub fn tor_status(&self) -> Option<TorStatus> {
-        let Route::Tor(tor) = &self.route else {
-            return None;
-        };
-        let status = tor.status();
-        if !status.ready {
-            let tor = tor.clone();
-            self.runtime.spawn(async move {
-                if let Err(e) = tor.bootstrap().await {
-                    tracing::warn!("connecting to Tor: {e}");
-                }
-            });
-        }
-        Some(TorStatus {
-            percent: status.percent,
-            ready: status.ready,
-            summary: status.summary,
-            blocked: status.blocked,
-        })
+        self.tor.is_some()
     }
 
     /// The chain's height when the wallet was made, or the first block it
@@ -217,25 +193,6 @@ impl Wallet {
     /// from them looks from there.
     pub fn birthday(&self) -> Option<u32> {
         Some(self.kept().birthday).filter(|b| *b > 0)
-    }
-
-    /// A SOCKS5 proxy through its Tor client, for the light client to
-    /// reach everything through, as `socks5://username:password@host:port`:
-    /// on the loopback interface, only with these credentials, while the
-    /// wallet is open. The same each time; none unless over Tor.
-    pub fn tor_proxy(&self) -> Result<Option<String>, LicashError> {
-        let Route::Tor(tor) = &self.route else {
-            return Ok(None);
-        };
-        let mut socks = self.socks.lock().unwrap_or_else(PoisonError::into_inner);
-        if socks.is_none() {
-            let served = self.runtime.block_on(tor.socks());
-            *socks = Some(served.map_err(LicashError::failed)?);
-        }
-        Ok(socks.as_ref().map(|socks| {
-            let (user, password) = (socks.username(), socks.password());
-            format!("socks5://{user}:{password}@{}", socks.address())
-        }))
     }
 
     /// Renew notes a hub no longer unlinks since it restarted, paying them
@@ -289,7 +246,7 @@ impl Wallet {
 
     fn start(
         dir: PathBuf,
-        tor: bool,
+        tor: Option<Arc<TorClient>>,
         wallet: impl FnOnce(&Path, Http) -> Result<licash_wallet::Wallet<Http>, licash_wallet::Error>,
     ) -> Result<Arc<Self>, LicashError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -297,13 +254,9 @@ impl Wallet {
             .enable_all()
             .build()
             .map_err(LicashError::failed)?;
-        let (http, route) = match tor {
-            true => {
-                let _inside = runtime.enter();
-                let tor = licash_tor::Tor::new(&dir.join("tor")).map_err(LicashError::failed)?;
-                (Http::tor(tor.clone()), Route::Tor(tor))
-            }
-            false => (Http::new(None).map_err(LicashError::failed)?, Route::Direct),
+        let (http, route) = match &tor {
+            Some(client) => (Http::tor(client.tor()), Route::Tor(client.tor())),
+            None => (Http::new(None).map_err(LicashError::failed)?, Route::Direct),
         };
         let wallet = wallet(&wallet_file(&dir), http)?;
         let wallet = Self {
@@ -318,7 +271,6 @@ impl Wallet {
             contracting: Mutex::new(()),
             times: Mutex::new(HashMap::new()),
             onions_asked: Mutex::new(None),
-            socks: Mutex::new(None),
             announced: Announcements::default(),
             refunds_looked: Mutex::new(HashMap::new()),
             mailbox: Mutex::new(None),
@@ -334,7 +286,7 @@ impl Wallet {
     /// any, while over Tor: its own URL is asked if that one does not open.
     /// Of hubs only visited, or announced by others, none.
     fn onions(&self) {
-        if !self.tor {
+        if self.tor.is_none() {
             return;
         }
         let hubs = match self.wallet.hubs() {
@@ -366,7 +318,7 @@ impl Wallet {
     /// now. All at once, in [`ASK_URLS`] at most: those not answering are
     /// asked again only next time.
     fn ask_onions(&self) {
-        if !self.tor {
+        if self.tor.is_none() {
             return;
         }
         {
@@ -434,7 +386,7 @@ impl Wallet {
         let host = url.split("://").nth(1).unwrap_or(url);
         let host = host.split(['/', ':']).next().unwrap_or(host);
         let onion = host.ends_with(".onion");
-        if onion && !self.tor {
+        if onion && self.tor.is_none() {
             return Err(LicashError::NeedsTor);
         }
         let url = match url.contains("://") {

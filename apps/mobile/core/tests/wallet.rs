@@ -39,7 +39,7 @@ use licash_hub_service::{
 use licash_mobile::{
     default_relays, set_logger, wallet_exists, Activity, Balance, ChainError, ChainSource, Details,
     Fees, FeesRaised, Kind, LicashError, Linking, Logger, Network, Onchain, PaidTo, PayOffer,
-    PayQuote, Range, Rate, Scanned, State, Wallet,
+    PayQuote, Range, Rate, Scanned, State, TorClient, Wallet,
 };
 use licash_nostr::{Announcement, Announcer, Role, Route};
 use licash_wallet::PaymentCode;
@@ -248,7 +248,7 @@ impl Net {
 
     /// A new wallet `name`, made at `birthday`, trusting the hub.
     fn wallet(&self, name: &str, birthday: u32) -> Arc<Wallet> {
-        let wallet = Wallet::create(self.dir(name), Network::Regtest, birthday, false).unwrap();
+        let wallet = Wallet::create(self.dir(name), Network::Regtest, birthday, None).unwrap();
         wallet.add_hub(self.url.clone()).unwrap();
         wallet
     }
@@ -677,7 +677,7 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
     assert!(!paid.delivered && paid.undelivered.is_some(), "{paid:?}");
     let handover = paid.handover.unwrap();
     assert_eq!(bob.scanned(handover.clone()).unwrap(), Scanned::Payment);
-    let carol = Wallet::create(net.dir("carol"), Network::Regtest, 0, false).unwrap();
+    let carol = Wallet::create(net.dir("carol"), Network::Regtest, 0, None).unwrap();
     let unknown = carol.receive(handover.clone(), false);
     assert!(
         matches!(&unknown, Err(LicashError::UnknownHub { url }) if *url == hubs[0].url),
@@ -699,12 +699,12 @@ fn a_phone_refuses_what_it_cannot_do_and_retries_an_uncertain_broadcast() {
     let light = Light::new(&net);
     let dir = net.dir("alice");
     assert!(!wallet_exists(dir.clone()));
-    let alice = Wallet::create(dir.clone(), Network::Regtest, 0, false).unwrap();
+    let alice = Wallet::create(dir.clone(), Network::Regtest, 0, None).unwrap();
     assert!(wallet_exists(dir.clone()));
-    let again = Wallet::create(dir.clone(), Network::Regtest, 0, false).map(|_| ());
+    let again = Wallet::create(dir.clone(), Network::Regtest, 0, None).map(|_| ());
     assert!(invalid(again).contains("already"));
     drop(alice);
-    let alice = Wallet::open(dir, false).unwrap();
+    let alice = Wallet::open(dir, None).unwrap();
     assert_eq!((alice.network(), alice.tor()), (Network::Regtest, false));
 
     // No hub: nothing to scan with or move to.
@@ -740,7 +740,7 @@ fn a_phone_refuses_what_it_cannot_do_and_retries_an_uncertain_broadcast() {
 
     // Codes and payments it cannot take.
     assert!(invalid(alice.scanned("garbage".into())).contains("neither"));
-    let elsewhere = Wallet::create(net.dir("mainnet"), Network::Bitcoin, 0, false).unwrap();
+    let elsewhere = Wallet::create(net.dir("mainnet"), Network::Bitcoin, 0, None).unwrap();
     let mainnet = elsewhere.payment_code(None).unwrap();
     assert!(invalid(alice.scanned(mainnet.text.clone())).contains("not on"));
     assert!(invalid(alice.pay(mainnet.text, Some(10))).contains("not on"));
@@ -803,7 +803,7 @@ fn a_move_accepted_before_an_error_is_kept_and_rebroadcast_after_restart() {
     assert_eq!(alice.balance().unwrap().moving, 3_000);
     assert_eq!(alice.balance().unwrap().onchain, 0);
     drop(alice);
-    let alice = Wallet::open(net.dir("alice"), false).unwrap();
+    let alice = Wallet::open(net.dir("alice"), None).unwrap();
     light.accepted_error.store(false, Ordering::SeqCst);
     scan(&alice, &light);
     assert_eq!(net.sent(), accepted);
@@ -1596,7 +1596,7 @@ fn a_phone_keeps_contacts_by_name_one_to_each_wallet() {
     // Codes paying on Bitcoin only, or on another chain: no contacts.
     let address = bob.bitcoin_address().unwrap();
     assert!(invalid(alice.save_contact("Dan".into(), address)).contains("paid in notes"));
-    let elsewhere = Wallet::create(net.dir("mainnet"), Network::Bitcoin, 0, false).unwrap();
+    let elsewhere = Wallet::create(net.dir("mainnet"), Network::Bitcoin, 0, None).unwrap();
     let mainnet = elsewhere.payment_code(None).unwrap();
     assert!(invalid(alice.save_contact("Eve".into(), mainnet.text)).contains("not on"));
     assert!(
@@ -1610,7 +1610,7 @@ fn a_phone_keeps_contacts_by_name_one_to_each_wallet() {
     let left = alice.contacts().unwrap();
     assert_eq!(left.len(), 1);
     drop(alice);
-    let alice = Wallet::open(net.dir("alice"), false).unwrap();
+    let alice = Wallet::open(net.dir("alice"), None).unwrap();
     assert_eq!(alice.contacts().unwrap(), left);
 }
 
@@ -1906,7 +1906,7 @@ fn a_phone_keeps_no_move_its_hub_never_answered_and_gives_up_those_kept_before()
         );
     }
     drop(earlier);
-    let alice = Wallet::open(net.dir("alice"), false).unwrap();
+    let alice = Wallet::open(net.dir("alice"), None).unwrap();
     assert_eq!(moves(&alice), 2);
     alice.resume().unwrap();
     assert_eq!(moves(&alice), 0);
@@ -1954,7 +1954,7 @@ fn a_move_whose_payment_is_in_a_block_is_moving_until_its_notes_arrive() {
 #[test]
 fn a_phone_reaches_a_hub_named_by_its_host_alone_over_https() {
     let net = Net::new(false);
-    let alice = Wallet::create(net.dir("alice"), Network::Regtest, 0, false).unwrap();
+    let alice = Wallet::create(net.dir("alice"), Network::Regtest, 0, None).unwrap();
     // Not over plain HTTP, which the hub here serves on its port.
     let host = net.url.strip_prefix("http://").unwrap();
     let secure = alice.add_hub(host.into());
@@ -2142,7 +2142,7 @@ fn a_phone_pays_a_hub_charging_more_than_its_contract_opened_under_once_approved
     // Her contract there opened while a payment was free.
     let free = r#"{"spend":{"base":0,"ppm":0},"lock":{"base":1,"ppm":0},"refund":{"base":1,"ppm":0},"output_msat":0}"#;
     contract_under(&dir, &hub.url, free);
-    let alice = Wallet::open(dir.clone(), false).unwrap();
+    let alice = Wallet::open(dir.clone(), None).unwrap();
     let agreed = Fees {
         spend: Rate { base: 0, ppm: 0 },
         ..charged
@@ -2169,7 +2169,7 @@ fn a_phone_pays_a_hub_charging_more_than_its_contract_opened_under_once_approved
     assert_eq!(paid.amount, 500);
     assert_eq!(notes(&alice), held - 501);
     drop(alice);
-    let alice = Wallet::open(dir, false).unwrap();
+    let alice = Wallet::open(dir, None).unwrap();
     assert!(alice.fees_raised().unwrap().is_empty());
     let asked = bob.payment_code(Some(100)).unwrap();
     assert_eq!(alice.pay(asked.qr, None).unwrap().amount, 100);
@@ -2244,27 +2244,19 @@ fn a_phone_previews_and_optimizes_notes_and_shows_the_fee_in_its_history() {
     assert_eq!(alice.maintain_notes().unwrap(), 0);
 }
 
-/// Over Tor, the light client goes through the wallet's own Tor client: a
-/// SOCKS5 proxy only it can use. Nothing here reaches the Tor network.
+/// Over Tor, the light client goes through the app's Tor client, wallet or
+/// not: a SOCKS5 proxy only it can use. Nothing here reaches the Tor
+/// network.
 #[test]
-fn a_wallet_over_tor_lends_the_light_client_a_proxy_of_its_own() {
+fn the_tor_client_lends_the_light_client_a_proxy_of_its_own() {
     use std::io::{Read, Write};
 
     let dir = tempfile::tempdir().unwrap();
-    let direct = Wallet::create(
-        dir.path().join("direct").display().to_string(),
-        Network::Signet,
-        0,
-        false,
-    );
-    assert_eq!(direct.unwrap().tor_proxy().unwrap(), None);
-
-    let tor = dir.path().join("tor").display().to_string();
-    let wallet = Wallet::create(tor, Network::Signet, 0, true).unwrap();
-    let url = wallet.tor_proxy().unwrap().unwrap();
+    let client = TorClient::new(dir.path().join("tor").display().to_string(), None).unwrap();
+    let url = client.proxy().unwrap();
     assert_eq!(
-        wallet.tor_proxy().unwrap().as_deref(),
-        Some(url.as_str()),
+        client.proxy().unwrap().as_str(),
+        url.as_str(),
         "the same each time"
     );
     let (credentials, address) = url
@@ -2292,7 +2284,17 @@ fn a_wallet_over_tor_lends_the_light_client_a_proxy_of_its_own() {
     assert_eq!(greet(user, password), 0);
     assert_ne!(greet(user, "guessed"), 0);
 
-    // Closed with the wallet.
+    // Kept open by a wallet over it, closed with the last of them.
+    let wallet = Wallet::create(
+        dir.path().join("wallet").display().to_string(),
+        Network::Signet,
+        0,
+        Some(client.clone()),
+    )
+    .unwrap();
+    assert!(wallet.tor());
+    drop(client);
+    assert_eq!(greet(user, password), 0);
     drop(wallet);
     assert!(std::net::TcpStream::connect(address).is_err());
 }
@@ -2303,8 +2305,14 @@ fn a_wallet_over_tor_lends_the_light_client_a_proxy_of_its_own() {
 #[test]
 fn a_wallet_over_tor_takes_things_on_from_a_thread_of_the_apps() {
     let dir = tempfile::tempdir().unwrap();
-    let tor = dir.path().join("tor").display().to_string();
-    let wallet = Wallet::create(tor, Network::Signet, 0, true).unwrap();
+    let tor = TorClient::new(dir.path().join("tor").display().to_string(), None).unwrap();
+    let wallet = Wallet::create(
+        dir.path().join("wallet").display().to_string(),
+        Network::Signet,
+        0,
+        Some(tor),
+    )
+    .unwrap();
     wallet.resume().unwrap();
     wallet.resume().unwrap();
 }

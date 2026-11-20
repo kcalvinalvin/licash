@@ -275,7 +275,7 @@ private fun BitcoinPage(engine: Engine, ui: Ui) {
 }
 
 /**
- * How the wallet's Tor client stands: how far it is in connecting, what
+ * How the app's Tor client stands: how far it is in connecting, what
  * it is doing, and why it seems stuck; and starting it afresh, after a yes.
  */
 @Composable

@@ -9,7 +9,7 @@ import java.nio.file.LinkOption
 
 /**
  * What the app keeps on the phone, in bytes, by what keeps it: the wallet,
- * Tor's state (in the wallet's directory), the light client of each network
+ * Tor's state, the light client of each network
  * it ran on, the logs, caches, and the rest of its data; the app itself, its
  * code and libraries, as Android counts it, if it says.
  */
@@ -29,12 +29,14 @@ data class Storage(
 /** What the app keeps on the phone now. Slow: off the main thread. */
 fun storage(context: Context): Storage {
     val files = context.filesDir
-    val tor = size(File(files, "wallet/tor"))
+    // Where an earlier version kept it, too, should it not have moved.
+    val oldTor = size(File(files, "wallet/tor"))
+    val tor = size(File(files, "tor")) + oldTor
     val chains = files.listFiles { f -> f.isDirectory && f.name.startsWith("chain-") }.orEmpty()
         .sortedBy { it.name }
         .map { it.name.removePrefix("chain-") to size(it) }
     val parts = Storage(
-        wallet = size(File(files, "wallet")) - tor,
+        wallet = size(File(files, "wallet")) - oldTor,
         tor = tor,
         chains = chains,
         logs = size(File(files, "logs")),

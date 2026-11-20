@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{kept_file, wallet_file, Kept, Wallet};
-use crate::{ChainSource, LicashError, Network};
+use crate::{ChainSource, LicashError, Network, TorClient};
 
 /// The bundle's format: 2 keeps the contracts in `wallet.sqlite`, where
 /// format 1 kept them in a `contracts.sqlite` of their own, which this
@@ -79,7 +79,7 @@ impl Wallet {
         phrase: String,
         network: Network,
         birthday: Option<u32>,
-        tor: bool,
+        tor: Option<Arc<TorClient>>,
     ) -> Result<Arc<Self>, LicashError> {
         let seed = seed_of(&phrase).map_err(failed)?;
         let birthday = birthday.unwrap_or(1).max(1);
@@ -115,7 +115,7 @@ impl Wallet {
     pub fn from_state_bundle(
         dir: String,
         bundle: String,
-        tor: bool,
+        tor: Option<Arc<TorClient>>,
     ) -> Result<Arc<Self>, LicashError> {
         let dir = std::path::PathBuf::from(dir);
         let install = || -> Result<()> {
@@ -472,7 +472,7 @@ mod tests {
     use super::*;
 
     fn wallet(dir: &Path) -> Arc<Wallet> {
-        Wallet::create(dir.display().to_string(), Network::Regtest, 42, false).unwrap()
+        Wallet::create(dir.display().to_string(), Network::Regtest, 42, None).unwrap()
     }
 
     #[test]
@@ -486,7 +486,7 @@ mod tests {
             phrase.clone(),
             Network::Regtest,
             None,
-            false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -507,7 +507,7 @@ mod tests {
             phrase,
             Network::Regtest,
             original.birthday(),
-            false,
+            None,
         )
         .unwrap();
         assert_eq!(dated.birthday(), Some(42));
@@ -557,7 +557,7 @@ mod tests {
         let restored = Wallet::from_state_bundle(
             dir.path().join("restored").display().to_string(),
             bundle.display().to_string(),
-            false,
+            None,
         )
         .unwrap();
         assert_eq!(restored.wallet.address(), original.wallet.address());
@@ -634,7 +634,7 @@ mod tests {
             assert!(Wallet::from_state_bundle(
                 dest.display().to_string(),
                 bundle.display().to_string(),
-                false
+                None
             )
             .is_err());
             assert!(!dest.exists());
@@ -648,7 +648,7 @@ mod tests {
         assert!(Wallet::from_state_bundle(
             dir.path().display().to_string(),
             "missing.tar".into(),
-            false
+            None
         )
         .is_err());
         assert_eq!(fs::read(wallet_file(dir.path())).unwrap(), b"keep");

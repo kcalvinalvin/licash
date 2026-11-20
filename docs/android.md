@@ -35,6 +35,10 @@ directory cache), About (the
 version, the storage used and the logs to export) and advanced mode, whose
 own page holds the notes, the log, the limit for renewing notes, the light
 client's settings, resetting its chain state and deleting the wallet.
+The app runs one Tor client and starts the light client
+through it at launch, wallet or not: catching up starts before a wallet is
+made. Its state lives in `files/tor`; an earlier version's, in the wallet's
+directory, moves there once (left where it is if it cannot).
 
 Cold storage, in advanced mode (or once set up), is a page of its own in
 Settings: the extended public key of an external wallet's account (a zpub,

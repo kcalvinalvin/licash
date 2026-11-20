@@ -8,10 +8,12 @@
 
 mod chain;
 mod log;
+mod tor;
 mod wallet;
 
 pub use chain::{ChainError, ChainSource};
 pub use log::{set_logger, Logger};
+pub use tor::TorClient;
 pub use wallet::{wallet_exists, Contact, Wallet};
 
 uniffi::setup_scaffolding!();
@@ -1131,7 +1133,7 @@ pub fn explorer(network: Network) -> Option<String> {
     }
 }
 
-/// How far the wallet's Tor client is in connecting to the Tor network.
+/// How far the app's Tor client is in connecting to the Tor network.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct TorStatus {
     /// Of the way, 0 to 100.

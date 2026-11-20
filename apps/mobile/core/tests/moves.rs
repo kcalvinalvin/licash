@@ -173,7 +173,7 @@ impl Hubs {
     /// A phone trusting both hubs, holding `amount` at the first.
     fn phone(&self, amount: u64) -> Arc<Wallet> {
         let dir = self.dir.path().join("phone").display().to_string();
-        let phone = Wallet::create(dir, Network::Regtest, 0, false).unwrap();
+        let phone = Wallet::create(dir, Network::Regtest, 0, None).unwrap();
         phone.add_hub(self.url(0)).unwrap();
         phone.add_hub(self.url(1)).unwrap();
         let code: PaymentCode = phone.payment_code(None).unwrap().qr.parse().unwrap();
@@ -707,7 +707,7 @@ fn a_phone_finds_its_static_donation_address_at_a_provider_taking_them() {
     assert_eq!(phone.donation_address().unwrap(), Some(address.clone()));
     drop(phone);
     let dir = hubs.dir.path().join("phone").display().to_string();
-    let phone = Wallet::open(dir, false).unwrap();
+    let phone = Wallet::open(dir, None).unwrap();
     assert_eq!(phone.donation_address().unwrap(), Some(address.clone()));
 
     // Its provider gone: shown as kept, unheard, rather than another's.

@@ -2,6 +2,7 @@ package org.licash.wallet
 
 import android.content.Context
 import android.net.Uri
+import android.os.SystemClock
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
@@ -61,6 +62,7 @@ import org.licash.core.ColdStorage
 import org.licash.core.Scan
 import org.licash.core.Scanned
 import org.licash.core.State
+import org.licash.core.TorClient
 import org.licash.core.TorStatus
 import org.licash.core.Wallet
 import org.licash.core.chainName
@@ -86,7 +88,7 @@ data class Ui(
     val chain: ChainStatus = ChainStatus(),
     /** How far looking for payments on Bitcoin got, once looking. */
     val scan: Scan? = null,
-    /** How far the wallet's Tor client is in connecting, over Tor. */
+    /** How far the app's Tor client is in connecting, over Tor. */
     val torStatus: TorStatus? = null,
     /** Payments on Bitcoin on their way: in no block yet. */
     val incoming: List<Activity> = emptyList(),
@@ -229,6 +231,17 @@ class Engine(context: Context) {
     private var light: LightClient? = null
     private var lightOf: String? = null
 
+    /**
+     * When the light client last started ([SystemClock.elapsedRealtime]),
+     * and the steps of catching up logged since, each with the time it took.
+     */
+    private var lightAt = 0L
+    private val phases = mutableSetOf<String>()
+
+    /** The app's Tor client, made once first needed over Tor ([tor]). */
+    @Volatile
+    private var torClient: TorClient? = null
+
     /** The coins on Bitcoin and payments on their way already told of. */
     private var told: MutableSet<String>? = null
 
@@ -352,7 +365,7 @@ class Engine(context: Context) {
                     (if (prefs.tor) "through Tor" else "Tor off") +
                         if (prefs.torChosen) ", as chosen" else ", by default",
                 )
-                runCatching { configured(Wallet.open(walletDir, prefs.tor)) }
+                runCatching { configured(Wallet.open(walletDir, tor())) }
                     .onSuccess { wallet = it }
                     .onFailure { e ->
                         AppLog.warn("opening the wallet", e)
@@ -367,32 +380,54 @@ class Engine(context: Context) {
     }
 
     /**
-     * Run the light client of the wallet's network, or the one chosen. Over
-     * Tor, everything it reaches goes through the wallet's own Tor client, so
-     * it waits for a wallet: never directly instead.
+     * The app's Tor client, over Tor: made the first time, its state moved
+     * out of the wallet's directory where an earlier version kept it. None
+     * with Tor off. It lives as long as the app, wallet or not.
+     */
+    private fun tor(): TorClient? {
+        if (!prefs.tor) return null
+        torClient?.let { return it }
+        synchronized(this) {
+            return torClient ?: TorClient(File(files, "tor").path, File(walletDir, "tor").path).also {
+                torClient = it
+                AppLog.info("Tor's state kept in ${it.dir()}")
+            }
+        }
+    }
+
+    /** The app's Tor client closed, once no wallet reaches anything through it. */
+    private fun closeTor() {
+        synchronized(this) {
+            torClient?.destroy()
+            torClient = null
+        }
+    }
+
+    /**
+     * Run the light client of the wallet's network, or the one chosen, wallet
+     * or not. Over Tor, everything it reaches goes through the app's Tor
+     * client: never directly instead.
      */
     private suspend fun startLight() {
         val network = wallet?.network() ?: prefs.network
-        val tor = wallet?.tor() ?: prefs.tor
-        // The wallet's own, while it is open: it holds a password, never logged.
+        val tor = prefs.tor
+        // It holds a password, never logged.
         val proxy = if (!tor) {
             ""
         } else {
-            mutex.withLock {
-                runCatching { wallet?.torProxy() }
-                    .onFailure { e ->
-                        AppLog.warn("the light client's way through Tor", e)
-                        state.update { it.copy(problem = explain(e)) }
-                    }
-                    .getOrNull()
-            }
+            runCatching { tor()?.proxy() }
+                .onFailure { e ->
+                    AppLog.warn("the light client's way through Tor", e)
+                    state.update { it.copy(problem = explain(e)) }
+                }
+                .getOrNull()
         }
         val key = listOf(chainName(network), prefs.peers, prefs.cdn, proxy ?: "none").joinToString("|")
         if (key == lightOf && light != null) return
         // Between wallet calls: one may be reading through it.
         mutex.withLock { stopLight() }
         if (proxy == null) {
-            AppLog.info("the light client waits for a wallet to reach Bitcoin through Tor")
+            AppLog.info("the light client cannot reach Bitcoin: no way through Tor")
             return
         }
         val name = chainName(network)
@@ -402,12 +437,20 @@ class Engine(context: Context) {
             .onSuccess {
                 light = it
                 lightOf = key
+                lightAt = SystemClock.elapsedRealtime()
+                synchronized(phases) { phases.clear() }
                 AppLog.info("light client of $name started")
             }
             .onFailure { e ->
                 AppLog.warn("starting the light client", e)
                 state.update { it.copy(problem = explain(e)) }
             }
+    }
+
+    /** A step of catching up logged, once a start, with the time it took since the light client started. */
+    private fun phase(step: String) {
+        val first = synchronized(phases) { phases.add(step.substringBefore(" to block")) }
+        if (first && lightAt > 0) AppLog.info("phase: $step, ${(SystemClock.elapsedRealtime() - lightAt) / 1000} s in")
     }
 
     private fun stopLight() {
@@ -440,7 +483,9 @@ class Engine(context: Context) {
     private suspend fun sync() {
         val light = light ?: return
         val status = statusOf(light)
-        state.update { it.copy(chain = status, torStatus = torStatus()) }
+        val tor = torStatus()
+        state.update { it.copy(chain = status, torStatus = tor) }
+        if (tor?.ready == true) phase("Tor ready")
         var hubs = wallet?.let { local { w -> w.hubs() } } ?: return
         if (hubs.isEmpty()) return
         if (!hubsLearned || System.currentTimeMillis() - hubsLearnedAt > HUBS_MS) {
@@ -477,6 +522,7 @@ class Engine(context: Context) {
                 }
                 if (scan.next > scan.height) {
                     caughtUp = true
+                    phase("payments looked for to block ${scan.height}")
                     break
                 }
                 // The hubs' tweaks lag the chain: on next round.
@@ -854,7 +900,7 @@ class Engine(context: Context) {
         mutex.withLock {
             val light = light
             val birthday = if (light != null && light.synced()) light.height().toUInt() else 0u
-            wallet = configured(Wallet.create(walletDir, prefs.network, birthday, prefs.tor))
+            wallet = configured(Wallet.create(walletDir, prefs.network, birthday, tor()))
             AppLog.info("wallet made at block $birthday")
         }
         lightLock.withLock { startLight() }
@@ -888,7 +934,7 @@ class Engine(context: Context) {
      * written down with them, or from the first block if none.
      */
     suspend fun restorePhrase(words: List<String>, birthday: UInt?): Result<Unit> = restored {
-        Wallet.fromPhrase(walletDir, words.joinToString(" "), prefs.network, birthday, prefs.tor)
+        Wallet.fromPhrase(walletDir, words.joinToString(" "), prefs.network, birthday, tor())
     }
 
     /** The block the wallet's coins on Bitcoin are looked for from, once known. */
@@ -902,8 +948,8 @@ class Engine(context: Context) {
         state.update { it.copy(chain = chain ?: it.chain, torStatus = tor) }
     }
 
-    /** How the wallet's Tor client stands, over Tor; it starts connecting if it is not. */
-    private fun torStatus(): TorStatus? = runCatching { wallet?.torStatus() }.getOrNull()
+    /** How the app's Tor client stands, over Tor; it starts connecting if it is not. */
+    private fun torStatus(): TorStatus? = runCatching { tor()?.status() }.getOrNull()
 
     /**
      * Start Tor afresh, as asked: what it learned of the Tor network (its
@@ -914,15 +960,19 @@ class Engine(context: Context) {
     suspend fun resetTor(): Result<Unit> = io {
         lightLock.withLock {
             mutex.withLock {
-                // The light client reaches Bitcoin through the wallet's Tor.
+                // The light client and the wallet reach everything through Tor.
                 stopLight()
                 wallet?.destroy()
                 wallet = null
+                closeTor()
                 try {
-                    for (part in listOf("state", "cache")) File(walletDir, "tor/$part").deleteRecursively()
+                    // Where it is kept, and where an earlier version kept it.
+                    for (dir in listOf(File(files, "tor"), File(walletDir, "tor"))) {
+                        for (part in listOf("state", "cache")) File(dir, part).deleteRecursively()
+                    }
                     AppLog.info("Tor's state forgotten")
                 } finally {
-                    if (walletExists(walletDir)) wallet = configured(Wallet.open(walletDir, prefs.tor))
+                    if (walletExists(walletDir)) wallet = configured(Wallet.open(walletDir, tor()))
                 }
             }
             state.update { it.copy(torStatus = null) }
@@ -940,7 +990,7 @@ class Engine(context: Context) {
                 val input = app.contentResolver.openInputStream(from) ?: error("that file cannot be read")
                 input.use { i -> copy.outputStream().use { i.copyTo(it) } }
             }.fold(
-                { restored { Wallet.fromStateBundle(walletDir, copy.path, prefs.tor) } },
+                { restored { Wallet.fromStateBundle(walletDir, copy.path, tor()) } },
                 { Result.failure(it) },
             )
         } finally {
@@ -959,7 +1009,7 @@ class Engine(context: Context) {
             prefs.network = w.network()
             if (w.tor() != prefs.tor) {
                 w.destroy()
-                w = Wallet.open(walletDir, prefs.tor)
+                w = Wallet.open(walletDir, tor())
             }
             wallet = configured(w)
             hubsLearned = false
@@ -1399,12 +1449,15 @@ class Engine(context: Context) {
                 wallet?.let {
                     it.destroy()
                     wallet = null
-                    wallet = configured(Wallet.open(walletDir, on))
+                    wallet = configured(Wallet.open(walletDir, tor()))
                 }
             }
         } finally {
-            // Its old way through Tor closed with the wallet.
-            lightLock.withLock { startLight() }
+            lightLock.withLock {
+                startLight()
+                // Off: nothing reaches anything through it any more.
+                if (!on) closeTor()
+            }
         }
         refresh()
     }
@@ -1531,7 +1584,7 @@ class Engine(context: Context) {
             WatchJob.cancel(app)
             ScanJob.cancel(app)
         }
-        // Through Tor, its way closed with the wallet.
+        // Its network may differ from the one chosen next.
         lightLock.withLock { startLight() }
         state.update { Ui(loaded = true, developer = prefs.developer, network = prefs.network) }
         refresh()
