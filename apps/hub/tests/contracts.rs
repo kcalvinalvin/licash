@@ -465,6 +465,8 @@ async fn a_hub_opens_contracts_on_its_newest_lock_checkpoint() -> Result<()> {
     let chain = Node(source.clone());
     // Following no chain yet: no offer.
     ensure!(openings.offer(None, 0).await.is_err());
+    // Following one, it proves its identity: a wallet adds it.
+    while !watch::step(&hub, &source).await? {}
     let seed = [7; 32];
     let (mine, wallet) = holder_wallet(&rt, &chain, dir.path(), &url, seed, &[100_000]).await?;
     while !watch::step(&hub, &source).await? {}
