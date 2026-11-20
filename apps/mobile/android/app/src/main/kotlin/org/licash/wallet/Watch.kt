@@ -60,6 +60,18 @@ internal fun watchOf(ui: Ui, now: Long): Watch {
     }
 }
 
+/**
+ * Whether the app is behind Bitcoin: its light client downloading or
+ * catching up, or the wallet's payments not looked for up to the blocks
+ * its hubs index. Waiting for a hub to be chosen is not behind.
+ */
+internal fun behind(ui: Ui): Boolean {
+    if (ui.chain.importing >= 0 || !ui.chain.synced) return true
+    if (ui.hubs.isEmpty()) return false
+    val scan = ui.scan ?: return true
+    return scan.next <= scan.height
+}
+
 /** A forced close's stages from the hub's answer until paid: kept at work, the hub's proof to check and challenge in time. */
 internal val DISPUTED = setOf(
     RecoveryStage.ANSWERED,

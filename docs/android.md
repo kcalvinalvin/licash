@@ -137,7 +137,11 @@ allows) keeps looking after the app is closed, without the foreground
 service; it stops once nothing is left to do, or when what is left is
 beyond the fee authority. Apart from it, a job every 4 hours or so while
 the phone rests (idle, with a network) syncs a round with Bitcoin, so coins
-paid to the wallet are found without opening the app. History shows each
+paid to the wallet are found without opening the app. Behind Bitcoin in
+sight for more than 15 seconds (a first start, or days away), the app
+starts its foreground service, so catching up continues should she leave
+it: its notification shows the step and how far, and it stops once caught
+up, or after an hour. History shows each
 remint as "Optimized notes",
 its fee alone. In advanced mode, a hub's sheet in Settings offers "Optimize
 notes": a preview, then a remint within the fee shown, bypassing the rests

@@ -11,6 +11,7 @@ import org.licash.core.Scan
 import org.licash.core.TorStatus
 import org.licash.wallet.ChainStatus
 import org.licash.wallet.Ui
+import org.licash.wallet.behind
 
 class SyncTest {
     private fun hub() = Hub(
@@ -47,6 +48,21 @@ class SyncTest {
         assertEquals(0.5f, stages[1].fraction!!, 0.0001f)
         // Waiting: no fraction shown.
         assertNull(stages[2].fraction)
+        assertTrue(catchingUp(ui))
+    }
+
+    @Test
+    fun the_pinned_headers_download_before_any_node_is_looked_for() {
+        val ui = Ui(chain = ChainStatus(importing = 42), hubs = listOf(hub()))
+        val stages = stages(ui)
+        assertEquals(
+            listOf("Block headers download", "Bitcoin nodes", "Block headers", "Block filters", "Your payments"),
+            stages.map { it.name },
+        )
+        assertEquals(Progress.DOING, stages[0].state)
+        assertEquals("Downloading (42%)", stages[0].detail)
+        assertEquals(0.42f, stages[0].fraction!!, 0.0001f)
+        assertTrue(stages.drop(1).all { it.state == Progress.WAITING })
         assertTrue(catchingUp(ui))
     }
 
@@ -100,5 +116,18 @@ class SyncTest {
     @Test
     fun without_a_hub_payments_wait_for_one() {
         assertEquals("Choose a hub first", stages(Ui(chain = caughtUp)).last().detail)
+    }
+
+    @Test
+    fun behind_until_the_chain_and_the_payments_are_caught_up() {
+        val hubs = listOf(hub())
+        assertTrue(behind(Ui(chain = ChainStatus(importing = 0), hubs = hubs)))
+        assertTrue(behind(Ui(chain = caughtUp.copy(synced = false), hubs = hubs)))
+        assertTrue(behind(Ui(chain = caughtUp, hubs = hubs)))
+        assertTrue(behind(Ui(chain = caughtUp, hubs = hubs, scan = scan(100u, 500u, 900u))))
+        assertFalse(behind(Ui(chain = caughtUp, hubs = hubs, scan = scan(100u, 901u, 900u))))
+        // Waiting for her to choose a hub is not catching up.
+        assertFalse(behind(Ui(chain = caughtUp)))
+        assertTrue(behind(Ui(chain = ChainStatus())))
     }
 }

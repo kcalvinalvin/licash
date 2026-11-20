@@ -70,6 +70,8 @@ import org.licash.core.defaultRelays
 import org.licash.core.explorer
 import org.licash.core.setLogger
 import org.licash.core.walletExists
+import org.licash.wallet.ui.Progress
+import org.licash.wallet.ui.stages
 
 /** What the screens show. */
 data class Ui(
@@ -141,6 +143,8 @@ data class ChainStatus(
     val synced: Boolean = false,
     val headers: Int = 0,
     val peerHeight: Int = 0,
+    /** How far, in percent, the headers this release pins are downloaded, before the client starts: -1 if not. */
+    val importing: Int = -1,
 )
 
 /** How `light` stands now. */
@@ -150,6 +154,7 @@ private fun statusOf(light: LightClient): ChainStatus = ChainStatus(
     synced = light.synced(),
     headers = runCatching { light.headers() }.getOrDefault(0),
     peerHeight = light.peerHeight(),
+    importing = light.importing(),
 )
 
 /** Something to tell the user once; `received` if it is money in. */
@@ -447,6 +452,36 @@ class Engine(context: Context) {
             }
     }
 
+    /**
+     * What to tell of a step that needs the wallet's coins on Bitcoin known
+     * while the app is behind it, with how far it is: none once caught up.
+     */
+    private fun stillCatchingUp(): String? {
+        val ui = state.value
+        if (!behind(ui)) return null
+        val step = stages(ui).firstOrNull { it.state != Progress.DONE } ?: return null
+        return "Still catching up with Bitcoin (${step.name.lowercase()}: ${step.detail}): " +
+            "try again once caught up."
+    }
+
+    /** Since when, in sight, the app is behind Bitcoin ([SystemClock.elapsedRealtime]). */
+    private var behindSince: Long? = null
+
+    /**
+     * Behind Bitcoin in sight for a while, as on a first start or after
+     * days away: the service keeps catching up should she leave the app,
+     * its progress in its notification. A catch-up of seconds shows none.
+     */
+    private fun keepCatchingUp() {
+        if (!behind(state.value)) {
+            behindSince = null
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        val since = behindSince ?: now.also { behindSince = it }
+        if (now - since >= CATCH_UP_AFTER_MS) WatchService.start(app)
+    }
+
     /** A step of catching up logged, once a start, with the time it took since the light client started. */
     private fun phase(step: String) {
         val first = synchronized(phases) { phases.add(step.substringBefore(" to block")) }
@@ -469,10 +504,13 @@ class Engine(context: Context) {
                 }
                 prefetchQuotes()
                 if (state.value.chain.synced) rounds.update { it + 1 }
+                if (foreground) keepCatchingUp()
             }
-            // Out of sight, what is watched waits for blocks: no hurry.
+            // Out of sight, what is watched waits for blocks: no hurry,
+            // unless catching up.
             val ms = when {
-                !foreground -> AWAY_MS
+                !foreground && !behind(state.value) -> AWAY_MS
+                !foreground -> ROUND_MS
                 eager -> EAGER_MS
                 else -> ROUND_MS
             }
@@ -486,6 +524,8 @@ class Engine(context: Context) {
         val tor = torStatus()
         state.update { it.copy(chain = status, torStatus = tor) }
         if (tor?.ready == true) phase("Tor ready")
+        // Nothing to ask of it before it starts.
+        if (status.importing >= 0) return
         var hubs = wallet?.let { local { w -> w.hubs() } } ?: return
         if (hubs.isEmpty()) return
         if (!hubsLearned || System.currentTimeMillis() - hubsLearnedAt > HUBS_MS) {
@@ -903,7 +943,9 @@ class Engine(context: Context) {
             wallet = configured(Wallet.create(walletDir, prefs.network, birthday, tor()))
             AppLog.info("wallet made at block $birthday")
         }
-        lightLock.withLock { startLight() }
+        // Running since the app started, of this network: shown at once,
+        // not waiting on it.
+        scope.launch { lightLock.withLock { startLight() } }
         refresh()
         poke()
     }
@@ -1231,6 +1273,7 @@ class Engine(context: Context) {
     /** Move the largest coin on Bitcoin, whole and alone, into Licash now, one cashed out here too. */
     suspend fun moveLargest(): Result<Activity> = io {
         val light = light ?: throw LicashException.Unavailable("not connected to Bitcoin yet")
+        stillCatchingUp()?.let { throw LicashException.Unavailable(it) }
         val moving = locked { it.moveLargestToLicash(GoChain(light)) }
         refresh()
         poke()
@@ -1309,6 +1352,10 @@ class Engine(context: Context) {
         val light = light
         if (light == null) {
             notices.tryEmit(Event("Not connected to Bitcoin yet: try again in a moment."))
+            return
+        }
+        stillCatchingUp()?.let {
+            notices.tryEmit(Event(it))
             return
         }
         var started = false
@@ -1606,6 +1653,7 @@ class Engine(context: Context) {
         private const val EAGER_MS = 4_000L
         private const val MAIL_MS = 1_000L
         private const val AWAY_MS = 60_000L
+        private const val CATCH_UP_AFTER_MS = 15_000L
         private const val PROVIDERS_MS = 15 * 60_000L
         private const val PROVIDERS_RETRY_MS = 2 * 60_000L
         private const val OFFER_MS = 30 * 60_000L

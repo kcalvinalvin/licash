@@ -49,7 +49,8 @@ private fun block(n: Long): String = digits(n.toULong())
 
 /**
  * The steps of catching up with Bitcoin for `ui`, in their order: Tor if
- * on, the nodes, the block headers, the block filters, then the wallet's
+ * on, the download of the headers this release pins while under way, the
+ * nodes, the block headers, the block filters, then the wallet's
  * payments. A step waits for the one before it.
  */
 fun stages(ui: Ui): List<Stage> {
@@ -75,6 +76,10 @@ fun stages(ui: Ui): List<Stage> {
         add("Tor", ready, doing, "Connected", tor?.let { it.percent.toFloat() / 100f })
     }
     val chain = ui.chain
+    if (chain.importing >= 0) {
+        val f = chain.importing / 100f
+        add("Block headers download", false, "Downloading" + shown(f), "", f)
+    }
     val nodes = "${chain.peers} " + if (chain.peers == 1L) "node" else "nodes"
     add("Bitcoin nodes", chain.peers > 0, "Looking for nodes", nodes)
     val target = chain.peerHeight.toLong().takeIf { it > 0 }

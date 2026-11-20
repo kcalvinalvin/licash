@@ -125,7 +125,15 @@ fun Home(
                     Column(
                         Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
                             .background(MaterialTheme.colorScheme.surfaceContainer).padding(horizontal = 16.dp, vertical = 8.dp),
-                    ) { SyncStages(engine, ui) }
+                    ) {
+                        SyncStages(engine, ui)
+                        Text(
+                            "You can leave the app: it keeps catching up, its progress in a notification.",
+                            modifier = Modifier.padding(bottom = 8.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
         }

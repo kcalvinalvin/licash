@@ -15,6 +15,7 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -28,6 +29,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import org.licash.wallet.ui.Progress
+import org.licash.wallet.ui.stages
 
 /*
  * The app at work out of sight, as far as Android lets it: a foreground
@@ -43,8 +46,8 @@ class Notifier(private val context: Context) {
     init {
         manager.createNotificationChannelsCompat(
             listOf(
-                channel(WATCHING, NotificationManagerCompat.IMPORTANCE_LOW, "Finishing payments",
-                    "Shown while the app finishes payments under way out of sight."),
+                channel(WATCHING, NotificationManagerCompat.IMPORTANCE_LOW, "Working in the background",
+                    "Shown while the app catches up with Bitcoin or finishes payments under way out of sight."),
                 channel(PAYMENTS, NotificationManagerCompat.IMPORTANCE_DEFAULT, "Payments",
                     "Money received, and payments finished or failed while the app was out of sight."),
                 channel(DEADLINES, NotificationManagerCompat.IMPORTANCE_HIGH, "Deadlines",
@@ -56,13 +59,40 @@ class Notifier(private val context: Context) {
     private fun channel(id: String, importance: Int, name: String, about: String) =
         NotificationChannelCompat.Builder(id, importance).setName(name).setDescription(about).build()
 
-    /** The foreground service's own, while it watches. */
-    fun watching(): Notification = builder(WATCHING)
-        .setContentTitle("Finishing payments under way")
-        .setContentText("Licash keeps at it until they are done.")
-        .setOngoing(true)
-        .setSilent(true)
-        .build()
+    /**
+     * The foreground service's own, while it works: finishing payments, or
+     * else catching up with Bitcoin, at the step `ui` is at.
+     */
+    fun watching(ui: Ui? = null): Notification {
+        val b = builder(WATCHING).setOngoing(true).setSilent(true).setOnlyAlertOnce(true)
+        val step = ui?.takeIf { it.watch != Watch.NOW && behind(it) }
+            ?.let { u -> stages(u).firstOrNull { it.state != Progress.DONE } }
+        if (step == null) {
+            return b.setContentTitle("Finishing payments under way")
+                .setContentText("Licash keeps at it until they are done.")
+                .build()
+        }
+        val percent = step.fraction?.let { (it * 100).toInt() }
+        return b.setContentTitle("Catching up with Bitcoin")
+            .setContentText("${step.name}: ${step.detail}")
+            .setProgress(100, percent ?: 0, percent == null)
+            .build()
+    }
+
+    /** The foreground service's notification shown anew. */
+    fun working(notification: Notification) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        try {
+            manager.notify(WATCHING_ID, notification)
+        } catch (e: SecurityException) {
+            AppLog.warn("a notification", e)
+        }
+    }
 
     /** Money in, or a payment finished: `key` names it, each told once. */
     fun payment(key: String, text: String) = post(key, PAYMENT_ID, builder(PAYMENTS).setContentTitle(text))
@@ -114,7 +144,8 @@ class Notifier(private val context: Context) {
 }
 
 /**
- * Keeps the engine at work while a payment is under way, until none is.
+ * Keeps the engine at work while a payment is under way, or while it
+ * catches up with Bitcoin, until neither: catching up for an hour at most.
  * Started only while the app is in sight, as Android requires; stopped by
  * Android after 6 hours a day since Android 15.
  */
@@ -130,7 +161,7 @@ class WatchService : Service() {
             ServiceCompat.startForeground(
                 this,
                 Notifier.WATCHING_ID,
-                engine.notifier.watching(),
+                engine.notifier.watching(engine.ui.value),
                 if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC else 0,
             )
         } catch (e: Exception) {
@@ -142,12 +173,27 @@ class WatchService : Service() {
         if (watching == null) {
             running = true
             engine.keep(true)
-            AppLog.info("watching payments under way")
+            AppLog.info(if (engine.ui.value.watch == Watch.NOW) "watching payments under way" else "catching up out of sight")
             watching = scope.launch {
+                val began = SystemClock.elapsedRealtime()
+                var shown: String? = null
                 // At most as long as Android 15 allows a day, on any Android:
                 // a line stuck under way leaves it to the periodic look.
-                val done = withTimeoutOrNull(MOST_MS) { engine.ui.first { it.watch != Watch.NOW } }
-                AppLog.info(if (done == null) "watched for long enough" else "nothing left to watch")
+                val done = withTimeoutOrNull(MOST_MS) {
+                    engine.ui.first { ui ->
+                        val n = engine.notifier.watching(ui)
+                        // Its text tells the step and how far: shown anew when it changes.
+                        val now = n.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
+                        if (now != shown) {
+                            shown = now
+                            engine.notifier.working(n)
+                        }
+                        // A light client that cannot catch up does not keep it at work for ever.
+                        val catching = behind(ui) && SystemClock.elapsedRealtime() - began < CATCH_UP_MS
+                        ui.watch != Watch.NOW && !catching
+                    }
+                }
+                AppLog.info(if (done == null) "watched for long enough" else "nothing left to watch or catch up")
                 stopSelf()
             }
         }
@@ -169,6 +215,7 @@ class WatchService : Service() {
 
     companion object {
         private const val MOST_MS = 6 * 3600 * 1000L
+        private const val CATCH_UP_MS = 3600 * 1000L
 
         @Volatile
         private var running = false
