@@ -73,6 +73,12 @@ pub(crate) fn deserialize_fixed<'de, D: serde::Deserializer<'de>, const N: usize
 ) -> Result<[u8; N], D::Error> {
     let v: Vec<u8> = if d.is_human_readable() {
         let s = String::deserialize(d)?;
+        // Its width first: a longer string is never decoded.
+        if s.len() != 2 * N {
+            return Err(serde::de::Error::custom(format!(
+                "{what} must be {N} bytes"
+            )));
+        }
         hex::decode(s).map_err(serde::de::Error::custom)?
     } else {
         serde_bytes::ByteBuf::deserialize(d)?.into_vec()
@@ -401,6 +407,22 @@ pub fn x_only_pub(sk: &Scalar) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::ec::gen_mul;
+
+    /// A string of the wrong width is refused before it is decoded: no
+    /// matter its length, nothing but the honest width is allocated.
+    #[test]
+    fn a_hex_string_of_the_wrong_width_is_refused_undecoded() {
+        let point = Point([2; 33]);
+        let honest = serde_json::to_string(&point).unwrap();
+        assert_eq!(serde_json::from_str::<Point>(&honest).unwrap(), point);
+        let long = format!("\"{}\"", "ab".repeat(1 << 20));
+        let e = serde_json::from_str::<Point>(&long)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("must be"), "{e}");
+        let short = format!("\"{}\"", "ab".repeat(32));
+        assert!(serde_json::from_str::<Point>(&short).is_err());
+    }
 
     #[test]
     fn bdhke_roundtrip_and_dleq() {
