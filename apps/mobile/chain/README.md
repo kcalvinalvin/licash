@@ -14,16 +14,20 @@ for `bitcoin`, `signet`, `mutinynet` and `regtest`.
   stored. Peers serve missing or rejected filters too. Block and filter
   headers come from peers, with one exception: a release may pin a deep
   block of each network (`mobile/pin_<network>.go`, made by `cmd/pin`),
-  and a store holding no header yet is then filled to it from the CDN's
-  import files before the node starts, both files downloaded through the
-  proxy and refused unless their length, SHA-256 and last entry are the
-  pinned ones (`node/pinned.go`). `cmd/pin` makes both files apart from
-  the CDN (from Bitcoin Core, or from peers with the pinned hash checked
-  against an Esplora server) and pins nothing unless the CDN's are the same bytes, so the
-  CDN is only a transport. A store holding headers, as on any upgrade,
-  never imports; a download that fails is not tried again on that store;
-  peers serve whatever the import does not. No pin, no request for
-  header files. Bitcoin, signet and mutinynet are pinned (blocks 975000,
+  and a store holding no header yet is then filled to it before the node
+  starts from two import files (block and filter headers) made of the
+  CDN's files of 100,000 headers each, four downloaded at once through the
+  proxy, each lane on circuits of its own, and refused unless their
+  length, SHA-256 and last entry are the pinned ones (`node/pinned.go`).
+  Each file of the CDN's is kept once whole, so a start killed or given up
+  on resumes. `cmd/pin` makes both import files apart from the CDN (from
+  Bitcoin Core, or from peers with the pinned hash checked against an
+  Esplora server) and pins nothing unless the CDN's are the same bytes, so
+  the CDN is only a transport. A store holding headers, as on any upgrade,
+  never imports; files other than the pinned, none served, or three starts
+  in a row downloading nothing mark the pin tried on that store; peers
+  serve whatever the import does not. No pin, no request for header
+  files. Bitcoin, signet and mutinynet are pinned (blocks 975000,
   330000 and 3605000).
 - Peers: neutrino's own discovery (DNS seeds filtered by service, then
   `addr`/`addrv2` gossip, onion addresses included through a proxy).
