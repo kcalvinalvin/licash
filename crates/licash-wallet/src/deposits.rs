@@ -50,7 +50,7 @@ use licash_onchain::deposit::{close_claim_key, Htlc, CLOSE_WAIT};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Row};
 
-use crate::{hub_url, invalid, now, sql, unavailable, Error, Transport, Wallet};
+use crate::{each_at_most, hub_url, invalid, now, sql, unavailable, Error, Transport, Wallet};
 
 /// Blocks a hub's tip may move between its info and its answer: the
 /// timeout it answers may be that much later than its info promises.
@@ -664,24 +664,35 @@ impl<T: Transport> Wallet<T> {
         let mut found = Vec::new();
         // A number counts as known only by a deposit that is the wallet's:
         // a hub answering anything else to each is asked `GAP` times, not
-        // without end.
+        // without end. The numbers sure to be asked next, as many as are
+        // left unknown before giving up, are asked at once, one round trip
+        // rather than one each over Tor: the same numbers as one at a time.
         while unknown < GAP {
-            let origin = Origin::Number(number);
-            let known = match self.find_deposit(hub, url, &address, origin, root).await? {
-                Found::Kept => true,
-                Found::New(deposit) => {
-                    found.push(*deposit);
-                    true
-                }
-                Found::Unknown | Found::NotMine => false,
-            };
-            match known {
-                true => (unknown, next) = (0, number.saturating_add(1)),
-                false => unknown += 1,
-            }
-            number = number
-                .checked_add(1)
+            let last = number
+                .checked_add(GAP - unknown)
                 .ok_or_else(|| Error::Invalid(format!("hub {url}: no deposit number left")))?;
+            let address = &address;
+            let mut window = each_at_most(usize::MAX, number..last, |n| async move {
+                let origin = Origin::Number(n);
+                Ok::<_, Error>((n, self.find_deposit(hub, url, address, origin, root).await?))
+            })
+            .await?;
+            window.sort_unstable_by_key(|(n, _)| *n);
+            for (n, one) in window {
+                let known = match one {
+                    Found::Kept => true,
+                    Found::New(deposit) => {
+                        found.push(*deposit);
+                        true
+                    }
+                    Found::Unknown | Found::NotMine => false,
+                };
+                match known {
+                    true => (unknown, next) = (0, n.saturating_add(1)),
+                    false => unknown += 1,
+                }
+            }
+            number = last;
         }
         self.store.write(|tx| {
             tx.execute(

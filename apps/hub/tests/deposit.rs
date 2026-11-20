@@ -1336,6 +1336,40 @@ async fn a_hub_answering_for_every_deposit_looked_for_is_asked_a_bounded_number_
 }
 
 #[tokio::test]
+async fn a_wallet_restored_finds_deposits_past_the_numbers_asked_at_once_asking_as_one_at_a_time_would(
+) {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    // More asked than the numbers asked at once in a first round.
+    let many = licash_wallet::DEPOSIT_GAP + 3;
+    for _ in 0..many {
+        alice.deposit_paying(HUB, 2_100).await.unwrap();
+    }
+    let mut asked: Vec<String> = alice
+        .deposits()
+        .unwrap()
+        .into_iter()
+        .map(|d| d.hash)
+        .collect();
+    drop(alice);
+    let same: Stands = Box::new(|response| response);
+    let (restored, times) = restored_behind(&net, "alice", "restored.sqlite", same);
+    restored.add_hub(HUB).await.unwrap();
+    let mut found: Vec<String> = (restored.deposits().unwrap().into_iter())
+        .map(|d| d.hash)
+        .collect();
+    asked.sort();
+    found.sort();
+    assert_eq!(found, asked);
+    // Each one asked, then as many unknown in a row as end a look, once
+    // each.
+    assert_eq!(
+        times.load(Ordering::SeqCst),
+        many + licash_wallet::DEPOSIT_GAP
+    );
+}
+
+#[tokio::test]
 async fn a_hub_takes_one_deposit_under_a_refund_key_and_answers_for_it_by_that_key() {
     let net = Net::new().await;
     let mut bodies = Vec::new();
