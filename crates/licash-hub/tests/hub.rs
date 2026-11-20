@@ -905,6 +905,35 @@ fn issued_outputs_unlink_once_and_only_until_the_hub_restarts() {
     session.finish(&keyset, &answer).unwrap();
 }
 
+/// An output unlinks once, to whoever asks first with its capability, and
+/// its payer, who made it, has the capability: she may use up her payee's
+/// unlink, leaving the note spendable and linked to her spend, never lost.
+/// Documented, not prevented (`docs/hub.md`).
+#[test]
+fn a_payer_may_use_up_the_one_unlink_of_the_note_she_paid() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let spend = Spend::new(&keyset, &[mint(&files, &alice, 8)], &[(bob.address(), 8)]);
+    let issued = spend.complete(&hub, &keyset);
+    // Alice's view of Bob's note: what she derived.
+    let seen = Coin {
+        note: issued[0].clone(),
+        derivation: spend.outputs[0].clone(),
+        owner: alice.clone(),
+    };
+    let his = spend.coin(&issued, 0, &bob);
+    let burnt = Session::start(&keyset, &seen.note, &seen.derivation).unwrap();
+    let answer = hub.unlink(burnt.request()).unwrap();
+    burnt.finish(&keyset, &answer).unwrap();
+    let late = Session::start(&keyset, &his.note, &his.derivation).unwrap();
+    assert_eq!(refused(hub.unlink(late.request())), Refusal::Unlinked);
+    // The note is still his to spend.
+    let onward = Spend::new(&keyset, &[his], &[(alice.address(), 8)]);
+    onward.complete(&hub, &keyset);
+}
+
 #[test]
 fn offers_survive_a_restart_and_release_after_it() {
     let files = files();

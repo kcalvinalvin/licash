@@ -110,6 +110,12 @@ database or file of an earlier layout (`deposits.sqlite`, `lightning.sqlite`,
 `hub.sqlite` of an earlier schema) is refused by name, never read nor
 replaced, and a hub is made anew.
 
+An output unlinks once, to whoever asks first with its capability (a payment's
+payer has it, having made the output). A payer may therefore use up her payee's
+single unlink: the note stays spendable and is never lost, but it stays linked
+to her spend. Unlinking is a privacy aid against a hub that colludes with
+payers, not a guarantee against a malicious payer.
+
 A spend's offer (its grant) its payer never released within a day is
 deleted, so that offers never made into spends cost no row for good; a
 wallet releasing it later offers the spend again. One note is offered in at
