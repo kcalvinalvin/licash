@@ -17,12 +17,14 @@ for `bitcoin`, `signet`, `mutinynet` and `regtest`.
   and a store holding no header yet is then filled to it from the CDN's
   import files before the node starts, both files downloaded through the
   proxy and refused unless their length, SHA-256 and last entry are the
-  pinned ones (`node/pinned.go`). `cmd/pin` makes both files from Bitcoin
-  Core alone and pins nothing unless the CDN's are the same bytes, so the
+  pinned ones (`node/pinned.go`). `cmd/pin` makes both files apart from
+  the CDN (from Bitcoin Core, or from peers with the pinned hash checked
+  against an Esplora server) and pins nothing unless the CDN's are the same bytes, so the
   CDN is only a transport. A store holding headers, as on any upgrade,
   never imports; a download that fails is not tried again on that store;
   peers serve whatever the import does not. No pin, no request for
-  header files.
+  header files. Bitcoin and signet are pinned (blocks 975000 and 330000);
+  mutinynet has no CDN to import from.
 - Peers: neutrino's own discovery (DNS seeds filtered by service, then
   `addr`/`addrv2` gossip, onion addresses included through a proxy).
   Besides, `node/` remembers the peers it completed a handshake with in
@@ -64,6 +66,18 @@ go run ./cmd/pin -network bitcoin -rpc http://127.0.0.1:8332 \
     -cookie ~/.bitcoin/.cookie > mobile/pin_bitcoin.go
 go run ./cmd/pin -network signet -rpc http://127.0.0.1:38332 \
     -cookie ~/.bitcoin/signet/.cookie > mobile/pin_signet.go
+```
+
+Without Core, `-esplora` makes both files from what the network's peers
+serve a light client (filter headers checked against several peers'
+checkpoints), requires the pinned block's hash to be the one the Esplora
+server tells at its height, and then the same CDN comparison and import:
+
+```sh
+go run ./cmd/pin -network bitcoin -esplora https://esplora.example/api \
+    > mobile/pin_bitcoin.go
+go run ./cmd/pin -network signet -esplora https://esplora.example/signet/api \
+    > mobile/pin_signet.go
 ```
 
 Before a release, refresh the fixed seeds (from the DNS seeds, and from a
