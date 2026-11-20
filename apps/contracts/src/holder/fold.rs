@@ -221,18 +221,31 @@ async fn close_once<T: Transport, C: Chain>(
     // Her nonce, of the key both sign with: neither the fee nor the claim
     // changes it. Nothing irrevocable happens before the hub has offered.
     let (sec, mine) = crate::fold(&o.babe, &o.funding, paid, Amount::ZERO)?.nonce(&key, id)?;
+    // Signed with the same key, so the hub offers the fold to her alone.
+    let signed = |route: &str, mut body: Vec<u8>| {
+        let digest = crate::fold_ask_digest(id, route, &body);
+        let signature =
+            Secp256k1::signing_only().sign_schnorr_no_aux_rand(&Message::from_digest(digest), &key);
+        body.extend(signature.as_ref());
+        body
+    };
     let prepared = async {
         let offer = match &claim {
-            None => post(wallet, hub, &url(FOLD), mine.0.to_vec()).await?,
+            None => post(wallet, hub, &url(FOLD), signed(FOLD, mine.0.to_vec())).await?,
             Some(c) => {
                 let ask = FoldAsk {
                     nonce: mine.0,
                     amount: c.amount,
                     notes: c.notes.clone(),
                 };
-                post(wallet, hub, &url(FOLD_CLAIM), ask.encode())
-                    .await
-                    .map_err(|e| notes_refused(e, c))?
+                post(
+                    wallet,
+                    hub,
+                    &url(FOLD_CLAIM),
+                    signed(FOLD_CLAIM, ask.encode()),
+                )
+                .await
+                .map_err(|e| notes_refused(e, c))?
             }
         };
         let offer = FoldOffer::decode(&offer).context("the hub's fold offer")?;

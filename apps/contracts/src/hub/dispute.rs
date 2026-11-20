@@ -281,16 +281,50 @@ impl Openings {
         }
     }
 
-    /// The first round of contract `id`'s fold: her public nonce `nonce`
-    /// taken, the hub's made, and the fee it takes from its share at the
-    /// rate of the day. Kept until she signs, or asks again.
+    /// The first round of contract `id`'s fold: her public nonce taken,
+    /// signed by her ([`crate::fold_ask_digest`]), the hub's made, and the
+    /// fee it takes from its share at the rate of the day. Kept until she
+    /// signs, or asks again.
     pub(super) async fn offer_fold(
         &self,
         id: &[u8; 32],
-        nonce: &[u8],
+        body: &[u8],
     ) -> Result<FoldOffer, Refused> {
+        let nonce = self.asked_by_her(id, crate::FOLD, body).await?;
         let hers = lichen_btc::musig::PubNonce::from_slice(nonce).map_err(Refused::bad)?;
         self.offered(id, hers, None).await
+    }
+
+    /// `body` less her signature, which it ends with: of `route`, by the
+    /// holder of contract `id`, with her payment key. Checked before the
+    /// hub does any work for it, or replaces the fold it offered her.
+    async fn asked_by_her<'a>(
+        &self,
+        id: &[u8; 32],
+        route: &str,
+        body: &'a [u8],
+    ) -> Result<&'a [u8], Refused> {
+        let (asked, signature) = body
+            .split_last_chunk::<64>()
+            .ok_or_else(|| Refused::bad("no signature of the fold asked"))?;
+        // Her key from its terms: the contract compiled only once she
+        // proves she asked.
+        let hub = self.stored(id).await?;
+        let base = hub
+            .base()
+            .ok_or_else(|| Refused::bad("not a signed contract"))?;
+        let hers = graph::party_pub(&base.parts().parties[0]).map_err(Refused::unavailable)?;
+        let signature = bitcoin::secp256k1::schnorr::Signature::from_slice(signature)
+            .map_err(|_| Refused::bad("not her signature of the fold asked"))?;
+        let digest = crate::fold_ask_digest(id, route, asked);
+        bitcoin::secp256k1::Secp256k1::verification_only()
+            .verify_schnorr(
+                &signature,
+                &bitcoin::secp256k1::Message::from_digest(digest),
+                &hers.payment,
+            )
+            .map_err(|_| Refused::bad("not her signature of the fold asked"))?;
+        Ok(asked)
     }
 
     /// The first round of a fold that pays her claim: as [`Self::offer_fold`],
@@ -301,7 +335,8 @@ impl Openings {
         id: &[u8; 32],
         body: &[u8],
     ) -> Result<FoldOffer, Refused> {
-        let ask = crate::FoldAsk::decode(body).map_err(Refused::bad)?;
+        let ask = self.asked_by_her(id, crate::FOLD_CLAIM, body).await?;
+        let ask = crate::FoldAsk::decode(ask).map_err(Refused::bad)?;
         let hers = lichen_btc::musig::PubNonce::from_slice(&ask.nonce).map_err(Refused::bad)?;
         self.offered(id, hers, Some((ask.amount, ask.notes))).await
     }
@@ -352,8 +387,9 @@ impl Openings {
 
     /// The second round of contract `id`'s fold: her partial signature
     /// on the fold last offered checked, the hub's added, the fold
-    /// broadcast. Its nonce is taken out first, whatever follows: asked
-    /// again, it is offered anew.
+    /// broadcast. Its nonce is taken out once her partial signature checks,
+    /// whatever follows: asked again, it is offered anew. A partial that
+    /// does not check leaves it, for her to sign.
     pub(super) async fn sign_fold(
         &self,
         id: &[u8; 32],
@@ -366,18 +402,23 @@ impl Openings {
             .try_into()
             .map_err(|_| Refused::bad("a partial signature is 32 bytes"))?;
         let (hub, o) = self.standing(id).await?;
-        let Some(pending) = self.folds().remove(id) else {
-            return Err(Refused::bad("no fold offered: POST a nonce first"));
+        let (pending, fold) = {
+            let mut folds = self.folds();
+            let Some(pending) = folds.get(id) else {
+                return Err(Refused::bad("no fold offered: POST a nonce first"));
+            };
+            let paid = pending
+                .claim
+                .as_ref()
+                .map_or(Amount::ZERO, |claim| claim.sats(&o));
+            let fold = crate::fold(&o.babe, &o.funding, paid, pending.fee).map_err(Refused::bad)?;
+            let holder = &o.babe.core().pubs[0].payment;
+            let nonces = &pending.nonces;
+            fold.verify_partial(holder, &nonces[0], nonces, &partial)
+                .map_err(|e| Refused::bad(format!("her partial signature: {e:#}")))?;
+            (folds.remove(id).expect("held under the lock"), fold)
         };
-        let paid = pending
-            .claim
-            .as_ref()
-            .map_or(Amount::ZERO, |claim| claim.sats(&o));
-        let fold = crate::fold(&o.babe, &o.funding, paid, pending.fee).map_err(Refused::bad)?;
-        let holder = &o.babe.core().pubs[0].payment;
         let nonces = &pending.nonces;
-        fold.verify_partial(holder, &nonces[0], nonces, &partial)
-            .map_err(|e| Refused::bad(format!("her partial signature: {e:#}")))?;
         // Her claim's notes retired before the hub signs, none that anything
         // spent: it holds her signature, so it may fold from here on.
         match (&pending.claim, filed) {
@@ -405,15 +446,20 @@ impl Openings {
         Ok(signed)
     }
 
-    /// Opening `id`, signed, as the hub holds it.
-    async fn signed_opening(&self, id: &[u8; 32]) -> Result<(Hub, HubOpening), Refused> {
+    /// Opening `id`, as the hub stores it: not given up.
+    async fn stored(&self, id: &[u8; 32]) -> Result<Hub, Refused> {
         let ctx = self.context().await?;
         let row = self.store().row(id).map_err(Refused::unavailable)?;
         let row = row.ok_or_else(|| Refused::bad("no such contract"))?;
         if row.abandoned {
             return Err(Refused::bad("an opening given up"));
         }
-        let hub = Hub::load(&row.state, &ctx).map_err(Refused::unavailable)?;
+        Hub::load(&row.state, &ctx).map_err(Refused::unavailable)
+    }
+
+    /// Opening `id`, signed, as the hub holds it.
+    async fn signed_opening(&self, id: &[u8; 32]) -> Result<(Hub, HubOpening), Refused> {
+        let hub = self.stored(id).await?;
         let o = hub
             .signed()
             .map_err(|_| Refused::bad("not a signed contract"))?;

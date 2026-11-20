@@ -56,10 +56,12 @@ pub const STEP: &str = "/v1/contracts/openings/{id}";
 /// POST a committed kept instance, as a versioned opening envelope.
 pub const INSTANCE: &str = "/v1/contracts/openings/{id}/instances";
 /// POST her public nonce (66 bytes) for the fold of contract `id`, paying
-/// her reserve back alone: the hub's [`FoldOffer`].
+/// her reserve back alone, then her signature of it ([`fold_ask_digest`]):
+/// the hub's [`FoldOffer`].
 pub const FOLD: &str = "/v1/contracts/openings/{id}/fold";
 /// POST a [`FoldAsk`] for the fold of contract `id` that pays her claim as
-/// well as her reserve: the hub's [`FoldOffer`], its fee and nonce.
+/// well as her reserve, then her signature of it ([`fold_ask_digest`]):
+/// the hub's [`FoldOffer`], its fee and nonce.
 pub const FOLD_CLAIM: &str = "/v1/contracts/openings/{id}/fold/claim";
 /// POST her partial signature (32 bytes) on the fold last offered, then, of
 /// a fold asked at [`FOLD_CLAIM`], the filing of her claim: the fold,
@@ -70,6 +72,17 @@ pub const FOLD_SIGN: &str = "/v1/contracts/openings/{id}/fold/sign";
 /// (`licash::recovery::evidence_to_bytes`), for her to check before she
 /// leaves the response uncontested.
 pub const EVIDENCE: &str = "/v1/contracts/openings/{id}/evidence";
+
+/// What she signs, with her payment key in contract `id`, to be offered
+/// its fold: the route asked ([`FOLD`] or [`FOLD_CLAIM`]) and the `body`
+/// her 64-byte signature follows. Her nonce is fresh each time, so nobody
+/// else replaces the fold offered to her, nor has the hub make one.
+pub fn fold_ask_digest(id: &[u8; 32], route: &str, body: &[u8]) -> [u8; 32] {
+    licash::crypto::tagged_hash(
+        "licash/contracts/fold-ask/v1",
+        &[id, route.as_bytes(), body],
+    )
+}
 
 /// What she signs, as the contract's claim key, to be shown the evidence
 /// of the hub's response `response` to contract `id`'s claim.

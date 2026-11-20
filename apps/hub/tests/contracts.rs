@@ -1765,6 +1765,62 @@ impl licash_wallet::Transport for NoFoldSign {
     }
 }
 
+/// [`Http`], with a stranger who knows her contract's id meddling in her
+/// fold: before her partial signature reaches the hub, he asks the hub for
+/// a fold on what she asked, without her signature, then sends it a
+/// partial signature of nothing. What the hub answered him, kept.
+struct Meddled {
+    http: Http,
+    asked: std::sync::Mutex<Option<(String, Vec<u8>)>>,
+    answered: Arc<std::sync::Mutex<Vec<u16>>>,
+}
+
+impl licash_wallet::Transport for Meddled {
+    async fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<licash_wallet::Response, String> {
+        if let Some(body) = &body {
+            if url.ends_with("/fold") || url.ends_with("/fold/claim") {
+                *self.asked.lock().unwrap() = Some((url.to_owned(), body.clone()));
+            }
+            if url.ends_with("/fold/sign") {
+                let (to, mut asked) = self.asked.lock().unwrap().clone().ok_or("not asked")?;
+                asked.truncate(asked.len().saturating_sub(64));
+                let offer = self.http.request(&to, Some(asked)).await?;
+                let partial = self.http.request(url, Some(vec![0; 32])).await?;
+                self.answered
+                    .lock()
+                    .unwrap()
+                    .extend([offer.status, partial.status]);
+            }
+        }
+        self.http.request(url, body).await
+    }
+}
+
+/// A fold is offered to its holder alone: a stranger is refused one of
+/// the contract, and a partial signature that does not check takes
+/// nothing, so her fold, offered before, is signed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_fold_offered_to_her_is_neither_replaced_nor_taken_by_a_stranger() -> Result<()> {
+    let answered = Arc::default();
+    let meddled = Meddled {
+        http: Http::new(None)?,
+        asked: Default::default(),
+        answered: Arc::clone(&answered),
+    };
+    let n = with_notes([35; 32], meddled).await?;
+    let (wallet, chain, mine) = (&n.wallet, &n.chain, &n.mine);
+    let txid = holder::close(wallet, chain, &mine.join("wallet.sqlite"), &n.contract.id).await?;
+    ensure!(holder::list(&mine.join("wallet.sqlite"))?[0].folded == Some(txid));
+    let answered = answered.lock().unwrap().clone();
+    ensure!(answered == [400, 400], "{answered:?}");
+    Ok(())
+}
+
 /// A fold the hub never signs leaves her claim to file: her recovery waits
 /// for the fold, then forces the contract closed on the same notes by
 /// itself, before it is too late, and is paid as a forced close is.
