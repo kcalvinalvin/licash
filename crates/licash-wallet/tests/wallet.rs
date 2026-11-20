@@ -447,7 +447,7 @@ async fn only_hubs_added_are_trusted() {
 }
 
 #[tokio::test]
-async fn a_hub_proving_another_identity_is_refused_and_one_proving_none_taken() {
+async fn a_hub_proving_another_identity_or_none_is_refused() {
     const OTHER: &str = "http://other.test";
     let net = network();
     net.start(OTHER, FEE);
@@ -474,10 +474,57 @@ async fn a_hub_proving_another_identity_is_refused_and_one_proving_none_taken() 
     assert_eq!(bob.hubs().unwrap().len(), 1);
     assert_eq!(bob.hubs().unwrap()[0].1.proof, proof(HUB));
 
-    // None, as from a hub older than proofs: taken, as ever.
+    // None: its keysets are no one's, and it is not added. One added is
+    // unavailable while it proves none, what it said before kept.
     *net.proof.lock().unwrap() = Some(None);
+    let none = bob.add_hub(OTHER).await;
+    assert!(
+        matches!(&none, Err(Error::Invalid(m)) if m.contains("proves no identity")),
+        "{none:?}"
+    );
+    let again = bob.add_hub(HUB).await;
+    assert!(
+        matches!(&again, Err(Error::Unavailable { reason, .. }) if reason.contains("no longer proves")),
+        "{again:?}"
+    );
+    assert_eq!(bob.hubs().unwrap().len(), 1);
+    assert_eq!(bob.hubs().unwrap()[0].1.proof, proof(HUB));
+    *net.proof.lock().unwrap() = None;
     bob.add_hub(OTHER).await.unwrap();
     assert_eq!(bob.hubs().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_hub_added_stays_the_one_it_proved_it_is() {
+    const OTHER: &str = "http://other.test";
+    let net = network();
+    net.start(OTHER, FEE);
+    let bob = party(&net, 2).await;
+    let added = HubId::of(&bob.hubs().unwrap()[0].1.address);
+    let keysets = bob.hubs().unwrap()[0].1.keysets.clone();
+
+    // Another hub answers at its URL, proving an identity of its own, with
+    // keysets new to the wallet: not learned as the hub added, whether
+    // what is under way asks or the owner adds it again.
+    net.alias(HUB, OTHER);
+    assert_ne!(HubId::of(&net.hub(HUB).advertise().unwrap().address), added);
+    let unavailable = |result: Result<(), Error>| {
+        assert!(
+            matches!(&result, Err(Error::Unavailable { reason, .. }) if reason.contains("no longer proves")),
+            "{result:?}"
+        );
+    };
+    unavailable(bob.lock(HUB, &bob.address(), 1, [0; 32], None).await.map(drop));
+    unavailable(bob.add_hub(HUB).await.map(drop));
+    let kept = bob.hubs().unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(HubId::of(&kept[0].1.address), added);
+    assert_eq!(kept[0].1.keysets, keysets);
+
+    // Nor are the notes it issues taken as that hub's.
+    let payment = net.pay(HUB, &bob.address(), 8);
+    assert!(bob.receive(&payment).is_err());
+    assert_eq!(available(&bob), (0, 0));
 }
 
 #[tokio::test]

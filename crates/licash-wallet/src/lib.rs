@@ -274,7 +274,7 @@ fn kept_hub(tx: &rusqlite::Transaction, hub: i64) -> Result<(bool, Info), Error>
 enum Keep {
     /// Trusted from now on: the owner added it.
     Add,
-    /// Visited, unless added: it proved it is the hub of this id.
+    /// Visited, unless added already: it proved it is the hub of this id.
     Visit(HubId),
     /// As it was kept; a hub new to the wallet trusted, as one the owner
     /// named.
@@ -1030,8 +1030,9 @@ impl<T: Transport> Wallet<T> {
     /// belongs to the hub that first advertised it: another URL advertising
     /// it is not that hub, unless it is the URL the hub is reached at, over
     /// HTTPS rather than plain HTTP. The hub is reached there from then on,
-    /// and still known at the other URL. A hub visited stays the one it
-    /// proved it is, unless added.
+    /// and still known at the other URL. A hub known, added or visited,
+    /// stays the one it proved it is: what it says is kept only with the
+    /// proof of that identity, and a hub new to the wallet only with one.
     fn keep_info(&self, url: &str, info: &Info, keep: Keep) -> Result<i64, Error> {
         let keysets = info.keysets().map_err(|p| unavailable(url, p))?;
         let text = serde_json::to_string(info).map_err(invalid)?;
@@ -1096,11 +1097,8 @@ impl<T: Transport> Wallet<T> {
                     let (trusted, kept) = kept_hub(tx, hub)?;
                     // Unavailable, not invalid: what is under way there
                     // waits for it to prove it again.
-                    if !trusted
-                        && keep != Keep::Add
-                        && (!proved || HubId::of(&kept.address) != HubId::of(&info.address))
-                    {
-                        return Err(unavailable(url, "no longer proves it is the hub visited"));
+                    if !proved || HubId::of(&kept.address) != HubId::of(&info.address) {
+                        return Err(unavailable(url, "no longer proves it is the hub known there"));
                     }
                     tx.execute(
                         "UPDATE hubs SET info = ?2, updated_at = ?3, trusted = ?4 WHERE id = ?1",
@@ -1109,6 +1107,11 @@ impl<T: Transport> Wallet<T> {
                     hub
                 }
                 None => {
+                    // Its keysets are its own by its proof alone: without
+                    // one, nothing tells them from another server's later.
+                    if !proved {
+                        return Err(Error::Invalid(format!("hub {url} proves no identity")));
+                    }
                     let trusted = !matches!(keep, Keep::Visit(_));
                     tx.execute(
                         "INSERT INTO hubs (info, updated_at, trusted) VALUES (?1, ?2, ?3)",

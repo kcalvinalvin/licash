@@ -153,9 +153,11 @@ mod tests {
 
     use bitcoin::hashes::Hash as _;
     use bitcoin::{OutPoint, Txid};
+    use licash::address::OwnerKeys;
+    use licash::crypto::schnorr_sign;
     use licash::note::IssuerKeys;
     use licash::spend::ChainProfile;
-    use licash_api::Info;
+    use licash_api::{Hex, Info};
     use licash_contract::opening::Phase;
     use licash_wallet::Response;
 
@@ -170,13 +172,12 @@ mod tests {
         /// The hub at `url`, of keys of its own, charging `fees` from now.
         fn charge(&self, url: &str, seed: u8, fees: Fees) {
             let keys = IssuerKeys::from_seed(&[seed; 32], 0, 6).unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("hub.sqlite");
-            let regtest = ChainProfile::Core30DefaultRegtest;
-            let address = Wallet::create(&path, &[seed; 32], regtest, Hubs::default())
-                .unwrap()
-                .address();
-            let info = Info::new(&[keys.keyset().unwrap()], address, fees, None);
+            let owner = OwnerKeys::from_seed(&[seed; 32]).unwrap();
+            let mut info = Info::new(&[keys.keyset().unwrap()], owner.address(), fees, None);
+            // A wallet keeps only a hub proving the identity it advertises.
+            let identity = info.identity(ChainProfile::Core30DefaultRegtest).unwrap();
+            let proof = schnorr_sign(owner.spend_secret(), &identity).unwrap();
+            info.proof = Some(Hex(proof.0.to_vec()));
             self.0.lock().unwrap().insert(url.to_owned(), info);
         }
     }

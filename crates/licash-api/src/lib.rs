@@ -338,7 +338,8 @@ pub struct Info {
     pub urls: Vec<String>,
     /// That the hub of [`Info::address`] says the rest of its
     /// [`Info::identity`] is its own: a BIP340 signature by its spend key.
-    /// None from hubs following no chain, and from older hubs.
+    /// None from hubs following no chain: a wallet keeps what a hub says
+    /// only with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<Hex>,
     /// What the hub takes beyond this version of the protocol, by name,
