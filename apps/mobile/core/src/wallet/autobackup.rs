@@ -242,9 +242,9 @@ impl Wallet {
         Ok(())
     }
 
-    /// Install the backup of `generation` ([`find_backup`]) from `files`, a
-    /// copy of its folder's files, into `dir`, a wallet of `phrase` on
-    /// `network`: never over a wallet there. The caller must warn against
+    /// Install the backup of `generation` (as `find_backup` found it) from
+    /// `files`, a copy of its folder's files, into `dir`, a wallet of
+    /// `phrase` on `network`: never over a wallet there. The caller must warn against
     /// keeping two wallet copies live.
     #[uniffi::constructor]
     pub fn from_backup(
