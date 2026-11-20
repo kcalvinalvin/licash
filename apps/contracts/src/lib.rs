@@ -366,7 +366,7 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
 /// proven with it alone, so none named here or in [`SIGNET_BEFORE`] is
 /// ever to go. A contract keeps its program when this one changes.
 pub const SIGNET: [u8; 32] =
-    hex!("36da1026087c39b7ed87fffbde8c70793b00bdf358a1dbe6a716c0d8f6eaabf4");
+    hex!("48b9bedfefa1edf9566ee9e7b5d35482e268cdc0bdc2602a40a1d46a12886bad");
 
 /// Whether [`SIGNET`] decides the compact filing: true only for a program
 /// built from a tree whose `licash::recovery` reads it, and set in the
@@ -391,7 +391,7 @@ pub const SIGNET_CHAINED: bool = true;
 /// must give (`r0/build-guest.sh chain`). The hub proves the header chain with
 /// it, and keeps the program in `r0/programs/` as it keeps the statements.
 pub const CHAIN: [u8; 32] =
-    hex!("746b6836d319091b004c2590412b84bef6961694e02ba45dbf3ecbc2ad6dfc2e");
+    hex!("67ace32269c9edb8882aefa75f81b974b506d74a1b11bcff1879197a4c61e77e");
 
 /// The programs signet's (and Mutinynet's) contracts opened under before [`SIGNET`], newest
 /// first: no contract opens under them, those that did are played still.
@@ -529,7 +529,7 @@ mod tests {
     fn the_hub_statement_image_is_pinned() {
         assert_eq!(
             SIGNET,
-            hex!("36da1026087c39b7ed87fffbde8c70793b00bdf358a1dbe6a716c0d8f6eaabf4"),
+            hex!("48b9bedfefa1edf9566ee9e7b5d35482e268cdc0bdc2602a40a1d46a12886bad"),
             "keep every funded contract's pinned guest available when changing opening trust"
         );
         assert_eq!(
