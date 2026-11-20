@@ -529,6 +529,29 @@ async fn a_locks_parts_are_what_it_pays_until_refunded_then_the_refund() {
     assert_eq!(parts(&alice), [(PartTo::Hub, 2), (PartTo::Kept, 62)]);
 }
 
+/// A hub behind the blocks the wallet looked in itself, or saying it is,
+/// is not believed on how many blocks a lock has left: the preimage is
+/// kept from it.
+#[tokio::test]
+async fn a_claim_counts_the_blocks_left_at_the_wallets_own_height_too() {
+    let (net, alice, bob) = parties().await;
+    let lock = alice
+        .lock(HUB, &bob.address(), 10, hash(), Some(12))
+        .await
+        .unwrap();
+    // Bob looked in every block up to the lock's margin; his hub says it
+    // stands twelve blocks before its expiry.
+    bob.watch_silent(None, lock.expiry - licash_wallet::CLAIM_MARGIN + 1)
+        .unwrap();
+    let refused = bob.claim(HUB, &lock.id, &PREIMAGE).await;
+    assert!(
+        matches!(&refused, Err(Error::Invalid(why)) if why.contains("too late")),
+        "{refused:?}"
+    );
+    let id = licash_api::lock_id(&lock.id).unwrap();
+    assert_eq!(net.hub(HUB).locked(&id).unwrap().preimage, None);
+}
+
 #[tokio::test]
 async fn a_claim_reveals_the_preimage_only_well_before_expiry() {
     let (net, alice, bob) = parties().await;

@@ -27,7 +27,9 @@ use crate::{
 };
 
 /// Blocks before its expiry after which the wallet no longer claims a
-/// lock: its hub pays a claim only before the lock expires.
+/// lock: its hub pays a claim only before the lock expires. Counted, as
+/// [`PROTECTED_MARGIN`] is, at the higher of its hub's height and the last
+/// block the wallet looked in itself ([`Wallet::scan_silent`]), if any.
 pub const CLAIM_MARGIN: u32 = 3;
 
 /// Blocks before its expiry within which the wallet reveals no preimage of
@@ -41,10 +43,9 @@ pub const PROTECTED_MARGIN: u32 = 6;
 /// How a claim reveals its preimage to the lock's hub.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Reveal {
-    /// Only with [`CLAIM_MARGIN`] blocks left, at the hub's height.
+    /// Only with [`CLAIM_MARGIN`] blocks left.
     Margin,
-    /// Only with [`PROTECTED_MARGIN`] blocks left, at the wallet's height
-    /// too.
+    /// Only with [`PROTECTED_MARGIN`] blocks left.
     Protected,
     /// Public already: as late as the hub pays.
     Public,
@@ -823,14 +824,13 @@ impl<T: Transport> Wallet<T> {
             }
             _ => {
                 let hub = info.locks.as_ref().map_or(u32::MAX, |l| l.height);
-                let (height, too_late) = match reveal {
-                    Reveal::Protected => {
-                        let own = self.silent_next()?.unwrap_or(0).saturating_sub(1);
-                        let height = hub.max(own);
-                        let too_late = height.saturating_add(PROTECTED_MARGIN) > terms.expiry();
-                        (height, too_late)
-                    }
-                    _ => (hub, hub.saturating_add(CLAIM_MARGIN) >= terms.expiry()),
+                // The last block the wallet looked in itself, if any: a hub
+                // behind it, or saying so, is not believed.
+                let own = self.silent_next()?.map_or(0, |next| next.saturating_sub(1));
+                let height = hub.max(own);
+                let too_late = match reveal {
+                    Reveal::Protected => height.saturating_add(PROTECTED_MARGIN) > terms.expiry(),
+                    _ => height.saturating_add(CLAIM_MARGIN) >= terms.expiry(),
                 };
                 if too_late {
                     return Err(Error::Invalid(format!(
