@@ -663,11 +663,11 @@ async fn fund(
     for need in needs {
         let id = licash_contracts::hex_id(&need.id);
         let amount = need.amount.to_sat().max(FEE_PAYOUT_FLOOR);
-        match crate::payout::for_fees(wallet, route, amount, rate).await {
+        // Recorded as awaited before it is made: one made is never asked
+        // for again.
+        let record = |hash: &str| recovery::expect_fee(path, &need.id, need.purpose, hash);
+        match crate::payout::for_fees(wallet, route, amount, rate, record).await {
             Ok(payout) => {
-                if let Err(e) = recovery::expect_fee(path, &need.id, need.purpose, &payout.hash) {
-                    tracing::warn!(id, "a fee payout not recorded: {e:#}");
-                }
                 lines.push(format!(
                     "{}  fees: {} paid out of notes to the wallet by payout {}",
                     &id[..16],

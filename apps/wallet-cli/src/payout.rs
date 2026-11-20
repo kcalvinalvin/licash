@@ -146,11 +146,13 @@ pub async fn for_fees(
     route: &Route,
     amount: u64,
     rate: bitcoin::FeeRate,
+    record: impl FnOnce(&str) -> anyhow::Result<()>,
 ) -> anyhow::Result<Payout> {
     let from = crate::richest_but(wallet, "")?;
     let to = wallet.silent_keys().address().to_string();
     let max_fee = amount / 100 + USUAL_MAX_FEE;
-    announced(wallet, route, (&from, &to), amount, (max_fee, rate)).await
+    let limits = (max_fee, rate);
+    recorded(wallet, route, (&from, &to), amount, limits, record).await
 }
 
 /// Pay `amount` out of notes at `from` to `to` through the provider
@@ -162,7 +164,20 @@ pub async fn announced(
     route: &Route,
     (from, to): (&str, &str),
     amount: u64,
+    limits: (u64, bitcoin::FeeRate),
+) -> anyhow::Result<Payout> {
+    recorded(wallet, route, (from, to), amount, limits, |_| Ok(())).await
+}
+
+/// [`announced`], `record` told the payout's hash before it is made: none
+/// made unless recorded.
+async fn recorded(
+    wallet: &Wallet<Http>,
+    route: &Route,
+    (from, to): (&str, &str),
+    amount: u64,
     (max_fee, rate): (u64, bitcoin::FeeRate),
+    record: impl FnOnce(&str) -> anyhow::Result<()>,
 ) -> anyhow::Result<Payout> {
     let relays = licash_nostr::wallet::hub_relays(wallet)?;
     if relays.is_empty() {
@@ -173,6 +188,7 @@ pub async fn announced(
     let found = found.await?.into_iter().next().with_context(|| {
         format!("no provider announced pays {amount} out from {from} within {max_fee} sat of fees")
     })?;
+    record(&found.quote.ticket)?;
     let payout = wallet.payout(&found.quote).await?;
     if let PayoutState::Failed(reason) = &payout.state {
         bail!("the payout failed ({reason}): its lock, if made, returns once expired");

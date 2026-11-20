@@ -325,7 +325,8 @@ impl Wallet {
     /// Pay out of her notes, to her own silent payment address, each coin
     /// her forced closes need of hers on Bitcoin to pay their fees
     /// ([`recovery::fee_needs`]): from her richest hub, through the
-    /// provider preferred, recorded as awaited. One not paid out is left
+    /// provider preferred, recorded as awaited before it is made, else not
+    /// made. One not paid out is left
     /// to her coins, as are its fees; nothing else held up.
     pub(super) fn fund_recoveries(&self, chain: &Chain) {
         let active = recovery::recoveries(self.wallet.path())
@@ -347,18 +348,22 @@ impl Wallet {
         let to = self.wallet.silent_keys().address().to_string();
         for need in needs {
             let amount = need.amount.to_sat().max(FEE_PAYOUT_FLOOR);
+            // Each payout recorded as awaited before it is made: one made
+            // is never asked for again.
+            let record = |hash: &str| {
+                recovery::expect_fee(self.wallet.path(), &need.id, need.purpose, hash).map_err(
+                    |e| LicashError::Unavailable {
+                        reason: format!("a fee payout not recorded: {e:#}"),
+                    },
+                )
+            };
             let paid = self
                 .payout_quote(to.clone(), Some(amount), None)
-                .and_then(|quote| self.pay_out_or_another(quote, Some(amount)));
+                .and_then(|quote| self.pay_out_recorded(quote, Some(amount), &record));
             let id = hex::encode(need.id);
             match paid {
                 Ok(paying) => {
                     tracing::info!(%id, hash = %paying.id, amount, "notes paid out for a forced close's fees");
-                    if let Err(e) =
-                        recovery::expect_fee(self.wallet.path(), &need.id, need.purpose, &paying.id)
-                    {
-                        tracing::warn!(%id, "a fee payout not recorded: {e:#}");
-                    }
                 }
                 Err(e) => tracing::warn!(%id, amount, "no payout for a forced close's fees: {e}"),
             }

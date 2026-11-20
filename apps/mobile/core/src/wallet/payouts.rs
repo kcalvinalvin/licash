@@ -107,35 +107,7 @@ impl Wallet {
         quote: PayoutQuote,
         asked: Option<u64>,
     ) -> Result<Activity, LicashError> {
-        let most = quote.fee;
-        let mut tried = vec![quote.provider.clone()];
-        let mut last = match self.try_pay_out(&quote)? {
-            Ok(paying) => return Ok(paying),
-            Err(e) => e,
-        };
-        let others = self.payout_offers(quote.address.clone(), asked, Some(quote.hub.clone()));
-        let others = match others {
-            Ok(others) => others,
-            Err(e) => {
-                tracing::info!("no other payout offer: {e}");
-                return Err(last);
-            }
-        };
-        // The chosen provider's fee rising is the user's to accept, said
-        // over whatever failed after.
-        let rose = matches!(last, LicashError::FeeRose { .. });
-        for offer in others {
-            if offer.fee > most || tried.contains(&offer.provider) {
-                continue;
-            }
-            tried.push(offer.provider.clone());
-            match self.try_pay_out(&offer)? {
-                Ok(paying) => return Ok(paying),
-                Err(e) if !rose => last = e,
-                Err(e) => tracing::info!(provider = %offer.provider, "paying out failed: {e}"),
-            }
-        }
-        Err(last)
+        self.pay_out_recorded(quote, asked, &|_| Ok(()))
     }
 
     /// Take the payouts under way on, on `chain`: claim each provider's
@@ -373,12 +345,53 @@ impl Wallet {
         }
     }
 
-    /// Paying out as `quote` says: the payout, under way, else why it
-    /// failed with nothing locked, to try another provider. Refused if
-    /// it failed once a lock was made.
+    /// [`Wallet::pay_out_or_another`], `record` told each payout's hash
+    /// before it is made: none made unless recorded.
+    pub(super) fn pay_out_recorded(
+        &self,
+        quote: PayoutQuote,
+        asked: Option<u64>,
+        record: &dyn Fn(&str) -> Result<(), LicashError>,
+    ) -> Result<Activity, LicashError> {
+        let most = quote.fee;
+        let mut tried = vec![quote.provider.clone()];
+        let mut last = match self.try_pay_out(&quote, record)? {
+            Ok(paying) => return Ok(paying),
+            Err(e) => e,
+        };
+        let others = self.payout_offers(quote.address.clone(), asked, Some(quote.hub.clone()));
+        let others = match others {
+            Ok(others) => others,
+            Err(e) => {
+                tracing::info!("no other payout offer: {e}");
+                return Err(last);
+            }
+        };
+        // The chosen provider's fee rising is the user's to accept, said
+        // over whatever failed after.
+        let rose = matches!(last, LicashError::FeeRose { .. });
+        for offer in others {
+            if offer.fee > most || tried.contains(&offer.provider) {
+                continue;
+            }
+            tried.push(offer.provider.clone());
+            match self.try_pay_out(&offer, record)? {
+                Ok(paying) => return Ok(paying),
+                Err(e) if !rose => last = e,
+                Err(e) => tracing::info!(provider = %offer.provider, "paying out failed: {e}"),
+            }
+        }
+        Err(last)
+    }
+
+    /// Paying out as `quote` says, its hash told `record` first: the
+    /// payout, under way, else why it failed with nothing locked, to try
+    /// another provider. Refused if it failed once a lock was made, or if
+    /// not recorded, nothing paid.
     fn try_pay_out(
         &self,
         quote: &PayoutQuote,
+        record: &dyn Fn(&str) -> Result<(), LicashError>,
     ) -> Result<Result<Activity, LicashError>, LicashError> {
         let ticketed = match self.ticketed(quote) {
             Ok(ticketed) => ticketed,
@@ -388,6 +401,7 @@ impl Wallet {
                 return Ok(Err(e));
             }
         };
+        record(&ticketed.ticket)?;
         let e = match self.pay_ticketed(&ticketed) {
             Ok(paying) => return Ok(Ok(paying)),
             Err(e) => e,
