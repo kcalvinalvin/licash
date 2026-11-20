@@ -474,6 +474,53 @@ mod consensus_all {
     }
 }
 
+/// Whether the statement of the contract of `base` would owe the claim
+/// filed as `filed` under `request` whole, should the hub show nothing
+/// against it: its own judgment ([`licash::recovery::owed`]), on the
+/// chain from her Base's checkpoint through `tip`, of which it is shown
+/// the blocks it reads. If not, why.
+///
+/// Made before she publishes anything, as a claim its statement finds
+/// wrong is owed nothing, whatever her notes are worth, and one it values
+/// less retires what it does not pay. What a later block of her
+/// publication's adds to the chain only buries an activation deeper and a
+/// refund's expiry further, so a claim owed whole at `tip` is from then
+/// on. An error is the chain's: to try again.
+async fn owed_whole<C: Chain>(
+    chain: &C,
+    base: &licash::base::Base,
+    request: &Request,
+    filed: &[u8],
+    tip: u32,
+) -> Result<std::result::Result<(), String>> {
+    let checkpoint = &base.parts().chain.checkpoint;
+    let mut shown = std::collections::BTreeMap::new();
+    loop {
+        let read = licash::chain::Chain::sparse(checkpoint.clone(), tip, shown.clone())?;
+        let owed = licash::recovery::owed(base, request, filed, &[], &read);
+        let unshown = read.unshown();
+        if unshown.is_empty() {
+            let owed = owed?;
+            return Ok(match (&owed.ineligible, owed.owed == request.amount) {
+                (Some(why), _) => Err(format!("its statement would owe her claim nothing: {why}")),
+                (None, false) => Err(format!(
+                    "its statement would owe her claim {} of {} sat",
+                    owed.owed, request.amount
+                )),
+                (None, true) => Ok(()),
+            });
+        }
+        // Each a block inside the chain it was not shown yet.
+        for height in unshown {
+            let header = chain.header(height).await.map_err(|e| anyhow!(e))?;
+            let bytes: [u8; 80] = bitcoin::consensus::serialize(&header)
+                .try_into()
+                .map_err(|_| anyhow!("a header of 80 bytes"))?;
+            shown.insert(height, bytes);
+        }
+    }
+}
+
 pub(super) fn validate_backup(store: &Store) -> Result<()> {
     for row in store.recoveries()? {
         State::decode(&row)?;
@@ -1098,8 +1145,12 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
     /// there owed on Bitcoin ([`LockClaim`]), within its cap: the refunds
     /// of those she made that expired at depth unsettled, and the pay
     /// branches of those paying her whose activation its statement shows
-    /// ([`activation::shown`]). Should the claim not be filed with those,
-    /// it is without them.
+    /// ([`activation::shown`]).
+    ///
+    /// Nothing of it is published before its statement would owe it whole
+    /// ([`owed_whole`]): a claim that would not be is made again without
+    /// the locks paying her, then without any lock, and one of her notes
+    /// alone that still would not be gives her recovery up, nothing spent.
     async fn claim(&self, state: &mut State, tip: u32) -> Result<Next> {
         // Before any note of hers is taken.
         self.o.forcible()?;
@@ -1115,14 +1166,25 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             (notes, locks) = self
                 .wallet
                 .claim_with_locks(&self.id, &slots, tip, Some(&pays))?;
-            let paying = locks.iter().any(|r| r.branch == Branch::Pay);
-            if paying {
-                let amount = self.amount(&notes, &funded, &locks);
-                if let Err(e) = self.filing(&notes, &funded, &locks, amount) {
-                    tracing::warn!(id = %crate::hex_id(&self.id), "a claim filed without the locks paying her: {e:#}");
-                    self.wallet.unclaim_notes(&self.id)?;
-                    (notes, locks) = self.wallet.claim_with_locks(&self.id, &slots, tip, None)?;
+            // Narrowed while a lock is left to leave out: those paying
+            // her, then every one.
+            for _ in 0..2 {
+                if locks.is_empty() {
+                    break;
                 }
+                let Err(why) = self.sound(&notes, &funded, &locks, tip).await? else {
+                    break;
+                };
+                let paying = locks.iter().any(|r| r.branch == Branch::Pay);
+                tracing::warn!(
+                    id = %crate::hex_id(&self.id), paying,
+                    "a claim filed without locks of hers: {why}"
+                );
+                self.wallet.unclaim_notes(&self.id)?;
+                (notes, locks) = match paying {
+                    true => (self.wallet).claim_with_locks(&self.id, &slots, tip, None)?,
+                    false => (self.wallet.claim_notes(&self.id, &slots)?, vec![]),
+                };
             }
             self.took
                 .store(!(notes.is_empty() && locks.is_empty()), Ordering::SeqCst);
@@ -1132,16 +1194,40 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             bail!("no notes at its hub to claim");
         }
         state.amount = self.amount(&notes, &funded, &locks);
-        let filing = match self.filing(&notes, &funded, &locks, state.amount) {
+        let filing = match self.sound(&notes, &funded, &locks, tip).await? {
             Ok(filing) => filing,
-            Err(e) => {
-                self.give_back(&format!("{e:#}"))?;
-                return Err(e);
+            Err(why) => {
+                self.give_back(&why)?;
+                bail!(why);
             }
         };
         state.notes = notes.iter().map(|n| hex::encode(n.to_bytes())).collect();
         state.filing = Some(hex::encode(filing.to_bytes(Format::of(&self.o.base))));
         Ok(Next::To(Stage::Claimed))
+    }
+
+    /// The filing of a claim of `notes`, `funded` and `locks`, which its
+    /// statement would owe whole at `tip` ([`owed_whole`]); or why there
+    /// is none. An error is the chain's: to try again.
+    async fn sound(
+        &self,
+        notes: &[ClaimNote],
+        funded: &[FundedNote],
+        locks: &[LockClaim],
+        tip: u32,
+    ) -> Result<std::result::Result<Filing, String>> {
+        let amount = self.amount(notes, funded, locks);
+        let filing = match self.filing(notes, funded, locks, amount) {
+            Ok(filing) => filing,
+            Err(e) => return Ok(Err(format!("{e:#}"))),
+        };
+        let request = Request {
+            amount,
+            claim_digest: *filing.publication().claim().digest(),
+        };
+        let filed = filing.to_bytes(Format::of(&self.o.base));
+        let owed = owed_whole(self.chain, &self.o.base, &request, &filed, tip).await?;
+        Ok(owed.map(|()| filing))
     }
 
     /// What a claim of `notes`, `funded` and `locks` is for: their face

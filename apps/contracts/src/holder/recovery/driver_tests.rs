@@ -804,3 +804,20 @@ fn a_dispute_is_made_of_transactions_of_known_size() {
         assert!(vsize <= most, "{name} weighs {vsize} vB, more than {most}");
     }
 }
+
+/// A claim its statement would find wrong, and owe nothing, is told so
+/// before anything of it is published.
+#[tokio::test]
+async fn a_claim_its_statement_would_owe_nothing_is_told_before_it_is_filed() {
+    let w = World::new();
+    let o = w.holder.signed().unwrap();
+    let request = Request {
+        amount: 4096,
+        claim_digest: [22; 32],
+    };
+    let refused = owed_whole(&w.chain, &o.base, &request, &[1, 2, 3], w.tip())
+        .await
+        .unwrap();
+    let why = refused.unwrap_err();
+    assert!(why.contains("would owe her claim nothing"), "{why}");
+}
