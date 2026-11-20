@@ -2642,6 +2642,8 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 .unwrap_or(Amount::ZERO)
                 + DUST;
             let mut free = super::coins(self.wallet, self.wallet_file)?;
+            // None it spends already: a coin twice is no transaction.
+            free.retain(|c| !coins.iter().any(|(op, _)| *op == c.outpoint));
             free.sort_by_key(|c| c.value);
             let pick = (free.iter().find(|c| c.value >= need.to_sat())).or(free.last());
             if let Some(c) = pick {
