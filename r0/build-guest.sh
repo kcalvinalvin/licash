@@ -22,7 +22,9 @@ pinned_gcc="riscv32-unknown-elf-gcc (gc891d8dc23e) 13.2.0" # rzup cpp 2024.1.5
 # Cargo hashes a path dependency outside a guest's workspace (crates/licash)
 # by where it is, into the guest's symbols: so the guest is built from a
 # copy of its sources at this path, the same on every machine, whichever
-# the checkout's. One build at a time uses it.
+# the checkout's, so it cannot be a path of each user's own. One build at
+# a time uses it, and only its owner: another's, or a link, is refused
+# rather than built in or waited on.
 build=/tmp/licash-r0
 src="$build/licash"
 flags="$(printf -- '-Cpasses=lower-atomic\x1f-Clink-arg=-Ttext=0x00200800\x1f-Clink-arg=--fatal-warnings\x1f-Cpanic=abort\x1f--cfg\x1fgetrandom_backend="custom"')"
@@ -59,7 +61,12 @@ sources=(Cargo.toml crates/licash crates/licash-chain crates/licash-hp crates/li
 if [ -n "$(git status --porcelain -- "${sources[@]}")" ]; then
     echo "uncommitted changes in the guest's sources: not a guest to keep" >&2
 fi
-mkdir -p "$build" r0/guests
+if [ -L "$build" ] || { [ -e "$build" ] && [ "$(stat -c %u "$build")" != "$(id -u)" ]; }; then
+    echo "$build is a link or another user's: not building in it (remove it, or build as its owner)" >&2
+    exit 1
+fi
+mkdir -p -m 700 "$build" r0/guests
+chmod 700 "$build"
 exec 9>"$build/lock"
 flock 9
 rm -rf "$src"
