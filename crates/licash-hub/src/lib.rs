@@ -442,8 +442,8 @@ pub struct Hub {
     policy: Policy,
     /// The newest checkpoint, as stored.
     newest: Mutex<Option<Checkpoint>>,
-    /// When the scan last reached the chain's tip.
-    synced_at: Mutex<Option<Instant>>,
+    /// The chain's tip the scan last reached, and until when that holds.
+    synced_at: Mutex<Option<locks::SyncedTip>>,
     /// Whether this process alerted a reorganization of a checkpoint.
     reorg_alerted: AtomicBool,
     /// The identity it last proved, and the proof: the same while it is.

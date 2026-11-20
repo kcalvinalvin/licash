@@ -132,7 +132,7 @@ impl Hub {
             request,
             node,
             amount: charge.pay,
-            synced: self.is_synced(),
+            synced: self.synced_tip(),
         })
     }
 
@@ -230,8 +230,9 @@ pub(crate) struct New<'a> {
     request: &'a str,
     node: &'a str,
     amount: u64,
-    /// Whether the hub followed the chain when checked.
-    synced: bool,
+    /// The tip the hub's scan last reached, checked in the transaction
+    /// that records it.
+    synced: Option<crate::locks::SyncedTip>,
 }
 
 /// Record `new` pending, in `tx`: the forward already recorded for its
@@ -256,7 +257,7 @@ pub(crate) fn record(tx: &rusqlite::Transaction<'_>, new: &New<'_>) -> Result<Fo
     if top >= new.expiry {
         return Err(Refusal::LockExpired.into());
     }
-    if !new.synced {
+    if !crate::locks::SyncedTip::holds(new.synced, tx)? {
         return Err(Refusal::Unsynced.into());
     }
     let live: bool = tx

@@ -493,6 +493,47 @@ fn a_hub_behind_the_chain_admits_no_lock_and_pays_no_third_party() {
     hub.settle(&l.id(), &SECRET).unwrap();
 }
 
+/// A rewind of the scan, however shallow, takes the tip it was synced at:
+/// no lock is admitted and no third party paid, whatever the time since,
+/// until the backend's tip is reached again. Blocks scanned past that tip
+/// keep it synced.
+#[test]
+fn a_hub_rewound_below_its_synced_tip_admits_no_lock_and_pays_no_third_party() {
+    let (files, hub, mut chain) = setup(policy());
+    let expiry = chain.height() + 6;
+    let l = standard(&files, &hub, terms(&hub, expiry, 1));
+    hub.lock(&l.signed, &l.notes).unwrap();
+    chain.mine(&hub, 2);
+    chain.sync(&hub);
+    // Scanned past the synced tip: the same chain, longer.
+    chain.mine(&hub, 1);
+    let other = standard(&files, &hub, terms(&hub, expiry, 1));
+    hub.lock(&other.signed, &other.notes).unwrap();
+    // Rewound below it: the lock may have expired on the backend's chain.
+    let height = chain.height();
+    chain.reorg(&hub, height - 1);
+    assert_eq!(refused(hub.settle(&l.id(), &SECRET)), Refusal::Unsynced);
+    let third = standard(&files, &hub, terms(&hub, expiry, 1));
+    assert_eq!(
+        refused(hub.lock(&third.signed, &third.notes)),
+        Refusal::Unsynced
+    );
+    // Nor is a payment forwarded for a lock to the hub.
+    let own = to_hub(&files, &hub, terms(&hub, expiry, 1));
+    chain.mine(&hub, 1);
+    chain.sync(&hub);
+    hub.lock(&own.signed, &own.notes).unwrap();
+    chain.reorg(&hub, chain.height());
+    let hash = lock_hash(&SECRET);
+    assert_eq!(
+        refused(hub.forward(&own.id(), &hash, "lnbcrt1", "node", 4)),
+        Refusal::Unsynced
+    );
+    chain.mine(&hub, 1);
+    chain.sync(&hub);
+    hub.settle(&l.id(), &SECRET).unwrap();
+}
+
 #[test]
 fn an_activation_in_time_pays_even_once_its_block_is_reorganized_away() {
     let (files, hub, mut chain) = setup(policy());

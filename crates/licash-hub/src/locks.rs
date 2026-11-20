@@ -299,19 +299,45 @@ impl Hub {
 
     /// The operator's backend has its best chain's tip at `height`, block
     /// `hash`: the scan is synced while it reached that tip, for at most
-    /// [`Timing::max_lag`], and not at all otherwise. Whether it reached it.
+    /// [`Timing::max_lag`], and while that block stays scanned, and not at
+    /// all otherwise. Whether it reached it.
     pub fn synced(&self, height: u32, hash: &[u8; 32]) -> Result<bool, Error> {
         let reached = self.store.read(tip)? == Some((height, *hash));
-        *self.synced_at.lock().unwrap_or_else(|e| e.into_inner()) = reached.then(Instant::now);
+        let until = Instant::now() + Duration::from_secs(self.policy.timing.max_lag);
+        let synced = reached.then_some(SyncedTip {
+            until,
+            height,
+            hash: *hash,
+        });
+        *self.synced_at.lock().unwrap_or_else(|e| e.into_inner()) = synced;
         Ok(reached)
     }
 
-    pub(crate) fn is_synced(&self) -> bool {
-        let max_lag = Duration::from_secs(self.policy.timing.max_lag);
-        self.synced_at
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some_and(|at| at.elapsed() <= max_lag)
+    /// The tip the scan last reached, to tell whether it is synced in the
+    /// transaction deciding by it ([`SyncedTip::holds`]).
+    pub(crate) fn synced_tip(&self) -> Option<SyncedTip> {
+        *self.synced_at.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The chain's tip the scan reached, as the operator's backend said:
+/// synced while it is still scanned, the scan rewound below it never, and
+/// until [`Timing::max_lag`] after.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SyncedTip {
+    until: Instant,
+    height: u32,
+    hash: [u8; 32],
+}
+
+impl SyncedTip {
+    /// Whether `tip` holds in `c`, the transaction that decides by it: a
+    /// rewind that took its block meanwhile is seen.
+    pub(crate) fn holds(tip: Option<Self>, c: &Connection) -> Result<bool, Error> {
+        let Some(tip) = tip.filter(|t| Instant::now() <= t.until) else {
+            return Ok(false);
+        };
+        Ok(block_at(c, tip.height)? == Some(tip.hash))
     }
 }
 
@@ -504,7 +530,7 @@ impl Hub {
         } else {
             charge.received(Branch::Pay, |i, d| issuances[i].open(keyset, d))?
         };
-        let synced = self.is_synced();
+        let synced = self.synced_tip();
         let settled = self.store.write(|tx| {
             match settled_of(tx, id)? {
                 Some(Settled::Pay) => return Ok(None),
@@ -517,7 +543,7 @@ impl Hub {
                     return Err(Refusal::LockExpired.into());
                 }
                 // It may have expired on a chain the hub has not scanned.
-                if !synced {
+                if !SyncedTip::holds(synced, tx)? {
                     return Err(Refusal::Unsynced.into());
                 }
             }
@@ -731,7 +757,7 @@ impl Hub {
         if terms.depth() < t.min_depth {
             return Err(Refusal::Timing("depth below the hub's least").into());
         }
-        if !self.is_synced() {
+        if !SyncedTip::holds(self.synced_tip(), tx)? {
             return Err(Refusal::Unsynced.into());
         }
         let (now, _) = tip(tx)?.ok_or(Refusal::NoChain)?;
