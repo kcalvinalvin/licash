@@ -352,18 +352,16 @@ impl Gateway {
         }
     }
 
-    /// Tell the operator `message` once for `key`.
+    /// Tell the operator `message` once for `key`: again next time if it
+    /// could not be told.
     async fn alert(&self, key: String, message: String) {
-        if !self
-            .alerted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key)
-        {
+        let alerted = || self.alerted.lock().unwrap_or_else(|e| e.into_inner());
+        if !alerted().insert(key.clone()) {
             return;
         }
         if let Err(e) = self.on_hub(move |hub| hub.alert(&message)).await {
             tracing::error!(error = %e, "cannot alert the operator");
+            alerted().remove(&key);
         }
     }
 }

@@ -787,6 +787,16 @@ async fn a_payment_in_flight_holds_its_lock_past_expiry_until_resolved() {
     // Expired at depth, it is not refunded while the payment is in flight.
     net.mine(lock.expiry + 1 - net.height(), None);
     assert_eq!(alerts(&net.hub), 0);
+    // An alert the hub cannot keep is told again the next round.
+    let db = rusqlite::Connection::open(net.dir.path().join("hub.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER no_alert BEFORE INSERT ON events WHEN NEW.kind = 'alert'
+         BEGIN SELECT RAISE(ABORT, 'full'); END;",
+    )
+    .unwrap();
+    net.gateway.round().await;
+    assert_eq!(alerts(&net.hub), 0);
+    db.execute_batch("DROP TRIGGER no_alert").unwrap();
     net.gateway.round().await;
     net.gateway.round().await;
     assert_eq!(alerts(&net.hub), 1, "alerted once of a late payment");
