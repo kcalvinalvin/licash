@@ -46,8 +46,10 @@ impl Openings {
 
     /// Her funded notes of contract `id`, issued: once issued, always;
     /// else only of an F the hub signed, buried [`FUNDED_DEPTH`] deep at
-    /// least, and unspent, even in the mempool: no claim of hers stands
-    /// to name them yet.
+    /// least, and unspent, even in the mempool. Not a guard against
+    /// paying twice: a spend of F meanwhile may follow, and a claim naming
+    /// the notes issued retires them (`Hub::retire_claimed`) whether or
+    /// not they were, so they are never spent as well.
     pub(super) async fn funded(&self, id: [u8; 32]) -> Result<FundedIssued, Refused> {
         let issuer = self.issuer.get().cloned();
         let issuer =
