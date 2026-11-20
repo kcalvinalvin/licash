@@ -74,7 +74,7 @@ impl Openings {
             .covers(opening.quote.cap, open.coin.value.to_sat())
             .map_err(Refused::bad)?;
         self.timing()
-            .allows(opening.quote.cap, opening.quote.chain.max_headers)
+            .allows(opening.quote.cap, terms::lock_of(&opening.quote))
             .map_err(Refused::bad)?;
         self.terms_of(&opening.quote, steps).await?;
         // Before she garbles for it; again, held, as it is funded.
@@ -170,7 +170,7 @@ impl Openings {
         }
         // The terms she chose, if within the hub's: those of the quote,
         // and what she funds of it (`deposit_units`, of 1-sat units).
-        let (cap, blocks) = (quote.cap, quote.chain.max_headers);
+        let (cap, blocks) = (quote.cap, terms::lock_of(quote));
         let funded = quote.graph.deposit_units;
         self.timing().allows(cap, blocks).map_err(Refused::bad)?;
         let checkpoint = self.source.checkpoint(height).await;

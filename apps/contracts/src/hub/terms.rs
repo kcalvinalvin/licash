@@ -12,6 +12,20 @@ use licash_contract::opening::{Bounds, Floors, Quote};
 /// The most blocks the hub's collateral is locked for.
 pub const LOCK: u32 = 1_000;
 
+/// The headers a contract's budget reaches past its close, beyond the blocks
+/// its collateral is locked for. Her request is spent by the hub's
+/// response, and her publication of her claim stays valid until the hub's
+/// default confirms, after the close: a claim judged on a chain cut short
+/// there could never be proven. The slack covers the checkpoint's age, the
+/// hub's default confirming, and the work buried on top of the publication.
+pub const HEADER_SLACK: u32 = 144;
+
+/// The blocks `quote`'s collateral is locked for: its header budget
+/// ([`HEADER_SLACK`] more) less the slack.
+pub fn lock_of(quote: &Quote) -> u32 {
+    quote.chain.max_headers.saturating_sub(HEADER_SLACK)
+}
+
 /// The notes a contract of the fixed terms protects, in sat: the least
 /// of the sizes ([`licash_api::sizes`]).
 pub const CAP: u32 = 131_071;
@@ -336,7 +350,7 @@ impl Timing {
     /// reach at most, and the hub's least response window.
     pub fn bounds(&self, quote: &Quote) -> Bounds {
         Bounds {
-            lock: quote.chain.max_headers,
+            lock: lock_of(quote),
             response_window: self.response_window,
         }
     }
@@ -432,7 +446,7 @@ impl Timing {
                 checkpoint,
                 funding_depth: self.depth,
                 work_depth: self.work_depth,
-                max_headers: blocks,
+                max_headers: blocks.saturating_add(HEADER_SLACK),
             },
             limits: Limits {
                 max_transaction_bytes: 100_000,
@@ -508,16 +522,16 @@ mod tests {
             (
                 None,
                 [
-                    "324adaaaaa576156dbafdd687f717e2396057dd0fa17a3e420b08a0b00edffe0",
-                    "6030e7a05ce6772e85587fc2f3373e6958dbbb47f18e202e045f200cdff47639",
+                    "c3b45fd557c7d133a33eaea1d13bb90ccd9297a06bac32f402da04245279d2e1",
+                    "af18dfd843a6ea1476141a3b3062335bf11c7555af4d35101c95206d29fd5c83",
                 ],
                 3_000,
             ),
             (
                 Some(RANGE),
                 [
-                    "a78b216fcd816f1412c2f31088579ac25c7c019ab834445041e3de8b7c046e61",
-                    "8a8dae12c770b4dee00a43b631664bd6da04c349c15d3691b17d856fafce61a1",
+                    "dec65303b03cd77361b2e93c675979780ee189a5b7bbddbcacbaa6962c488102",
+                    "b931abecc6d664189696e6f99243eb0ff2eb99cae216009fdaa44b5a901dc7b9",
                 ],
                 3_024,
             ),
@@ -575,6 +589,34 @@ mod tests {
         ppm_year_funded: 0,
     };
 
+    /// Her publication of her claim may land until the hub's default
+    /// confirms after the close, the claim's work buried on it: whatever
+    /// close the bounds allow, the quote's headers reach past both.
+    #[test]
+    fn the_header_budget_outlasts_the_latest_close_the_bounds_allow() {
+        let parts = Hub::peek(funded()).unwrap().base.parts().clone();
+        let (keyset, checkpoint) = (parts.keyset.clone(), parts.chain.checkpoint.clone());
+        // A tip as far past the checkpoint as a quote is still taken at.
+        let skew = 12;
+        for profile in [
+            ChainProfile::Core30DefaultRegtest,
+            ChainProfile::Core30Signet,
+            ChainProfile::Mutinynet,
+        ] {
+            let timing = Timing::of(profile, None).unwrap();
+            let quote = timing.quote(keyset.clone(), checkpoint.clone());
+            let bounds = timing.bounds(&quote);
+            assert_eq!(bounds.lock, timing.lock(), "{profile:?}");
+            let close = checkpoint.height() + skew + bounds.lock;
+            let budget = checkpoint.height() + quote.chain.max_headers;
+            let after = u32::from(quote.graph.publication_window) + quote.chain.work_depth;
+            assert!(
+                budget >= close + after,
+                "{profile:?}: {budget} < {close} + {after}"
+            );
+        }
+    }
+
     #[test]
     fn a_quote_chosen_is_as_wide_as_its_cap_and_as_long_as_its_blocks() {
         let parts = Hub::peek(funded()).unwrap().base.parts().clone();
@@ -589,7 +631,8 @@ mod tests {
         let chosen = quote(16_777_215, 26_280);
         assert_eq!(chosen.cap, 16_777_215);
         assert_eq!(chosen.graph.bits, 24);
-        assert_eq!(chosen.chain.max_headers, 26_280);
+        assert_eq!(chosen.chain.max_headers, 26_280 + HEADER_SLACK);
+        assert_eq!(lock_of(&chosen), 26_280);
         assert_eq!(chosen.fees.opening_fee_quote, 86_886);
         assert_eq!(chosen.graph.deposit_units, 0);
         // Half of it hers: interest on the hub's half only, her part in

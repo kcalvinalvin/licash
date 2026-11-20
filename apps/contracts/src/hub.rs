@@ -1399,11 +1399,13 @@ mod tests {
         let mut quote = openings
             .timing()
             .quote(p.keyset.clone(), p.chain.checkpoint.clone());
-        // The fixture's own limits, and its graph's id (the program it is
-        // proven with sets the cycles of a header).
+        // The fixture's own limits, its header budget (the hub's quotes
+        // reach past their lock, which the fixture's does not), and its
+        // graph's id (the program it is proven with sets the cycles of a
+        // header).
         quote.limits = p.limits.clone();
+        quote.chain.max_headers = p.chain.max_headers;
         quote.graph.id = p.graph.id;
-        assert_eq!(quote.chain.max_headers, p.chain.max_headers);
         assert!(run::quote_cycles(&quote) >= largest);
         let speed = prover::Speed {
             device: "cuda".into(),
