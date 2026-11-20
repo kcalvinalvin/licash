@@ -1151,7 +1151,9 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
     ///
     /// Nothing of it is published before its statement would owe it whole
     /// ([`owed_whole`]): a claim that would not be is made again without
-    /// the locks its hub never certified, then without the locks paying
+    /// the payments under way (the locks its hub never certified, and the
+    /// sends signed, unfinished, whose notes it claims after the others,
+    /// their outputs to her as fallbacks), then without the locks paying
     /// her, then without any lock, and one of her notes
     /// alone that still would not be gives her recovery up, nothing spent.
     async fn claim(&self, state: &mut State, tip: u32) -> Result<Next> {
@@ -1169,8 +1171,9 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             (notes, locks) =
                 self.wallet
                     .claim_with_locks(&self.id, &slots, tip, Some(&pays), true)?;
-            // Narrowed while a lock is left to leave out: those its hub
-            // never certified, then those paying her, then every one.
+            // Narrowed while a lock is left to leave out: the payments
+            // under way (sends signed, locks its hub never certified),
+            // then those paying her, then every one.
             for _ in 0..3 {
                 if locks.is_empty() {
                     break;
@@ -1178,7 +1181,11 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
                 let Err(why) = self.sound(&notes, &funded, &locks, tip).await? else {
                     break;
                 };
-                let own = |r: &LockClaim| matches!(r.source, Source::OwnInputs { .. });
+                // Of a payment under way: a lock its hub never certified,
+                // or a send's fallbacks.
+                let own = |r: &LockClaim| {
+                    matches!(r.source, Source::OwnInputs { .. } | Source::Plain { .. })
+                };
                 let uncertified = locks.iter().any(own);
                 let paying = locks.iter().any(|r| r.branch == Branch::Pay);
                 tracing::warn!(

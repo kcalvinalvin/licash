@@ -1521,6 +1521,9 @@ impl<T: Transport> Wallet<T> {
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let ephemeral = signed.proposal().ephemeral();
+        let inputs = (notes.iter())
+            .map(|n| Ok(n.message().identifier()?.0))
+            .collect::<Result<Vec<_>, Error>>()?;
         let kept = self.store.write(|tx| {
             tx.execute(
                 "UPDATE sends SET unlock = ?2, done_at = COALESCE(done_at, ?3) WHERE id = ?1",
@@ -1529,6 +1532,7 @@ impl<T: Transport> Wallet<T> {
             for (r, note) in &change {
                 insert_note(tx, keyset, note, id, &ephemeral, r.branch, r.position)?;
             }
+            claims::finished_while_claimed(tx, id, &inputs)?;
             delivery::released(tx, id, kept)
         })?;
         Ok(Paid {
@@ -1769,11 +1773,7 @@ impl<T: Transport> Wallet<T> {
     /// What its hub proves of the inputs of payment `id`: nothing if it
     /// cannot tell.
     async fn spent_inputs(&self, url: &str, id: &ProposalId) -> inquiry::Shown {
-        let inputs = self.store.read(|c| {
-            let mut stmt = c.prepare("SELECT y FROM notes WHERE spent_by = ?1")?;
-            let rows = stmt.query_map([id.as_bytes()], |r| r.get(0))?;
-            Ok(rows.collect::<Result<Vec<_>, _>>()?)
-        });
+        let inputs = self.inputs_of(id);
         match inputs {
             Ok(inputs) => self.shown(url, &inputs).await,
             Err(e) => Err(e),
@@ -1797,9 +1797,12 @@ impl<T: Transport> Wallet<T> {
             let given_up = tx.execute(step.give_up(), params![id.as_bytes(), reason])? == 1;
             if given_up {
                 for y in gone {
+                    // Or a recovery's that took it from the payment: what
+                    // it claims of it is the hub's to answer.
                     tx.execute(
-                        "UPDATE notes SET gone_at = ?3 WHERE y = ?1 AND spent_by = ?2",
-                        params![y, id.as_bytes(), now()],
+                        "UPDATE notes SET gone_at = ?3
+                         WHERE y = ?1 AND (spent_by = ?2 OR spent_kind = ?4) AND gone_at IS NULL",
+                        params![y, id.as_bytes(), now(), Spender::Recovery.name()],
                     )?;
                 }
                 tx.execute(

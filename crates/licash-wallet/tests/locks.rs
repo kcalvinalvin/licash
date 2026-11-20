@@ -858,3 +858,84 @@ async fn a_lock_its_hub_refused_but_served_is_taken_on_again_once_shown() {
     );
     assert_eq!(available(&alice), (52, 0));
 }
+
+/// A payment signed whose release its hub never answered: a force close
+/// claims its notes, its change named beside them should its hub show it
+/// released, and takes no more of either for another recovery. Given
+/// back, the payment is the wallet's again; finished while claimed, its
+/// change stays the recovery's, its notes the payment's.
+#[tokio::test]
+async fn a_recovery_claims_a_signed_payment_its_hub_never_released() {
+    let (net, alice, bob) = parties().await;
+    net.fail(licash_api::RELEASE, Fault::Lost);
+    let Err(Error::Pending { id, .. }) = alice.send(HUB, &bob.address(), 10).await else {
+        panic!("not pending");
+    };
+    let state = |alice: &Wallet<Link>| {
+        let sends = alice.sends().unwrap();
+        sends.iter().find(|s| s.id == id).unwrap().state.clone()
+    };
+    assert_eq!(state(&alice), licash_wallet::State::Signed);
+    let keyset = *net.hub(HUB).info().keysets[0].id();
+    let slot = |id: [u8; 32]| ClaimSlot {
+        id,
+        keyset,
+        cap: 1_000,
+        max: 32,
+    };
+    let (first, second) = ([7; 32], [8; 32]);
+    // Left out where the caller leaves such payments out.
+    let (notes, locks) = alice
+        .claim_with_locks(&first, &[slot(first)], 100, None, false)
+        .unwrap();
+    assert!(notes.is_empty() && locks.is_empty());
+    let (notes, locks) = alice
+        .claim_with_locks(&first, &[slot(first)], 100, None, true)
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].note.message().denomination(), 64);
+    assert_eq!(locks.len(), 1);
+    let send = &locks[0];
+    assert_eq!(hex::encode(send.id.as_bytes()), id);
+    let input = notes[0].note.message().identifier().unwrap();
+    assert!(matches!(&send.source, Source::Plain { inputs, .. } if *inputs == vec![input]));
+    assert_eq!(send.value, 0);
+    assert!(!send.items.is_empty() && send.keys.len() == send.items.len());
+    assert!(send.items.iter().all(|i| matches!(
+        i,
+        Item::Pending { branch: Branch::Pay, preimage: None, source, .. } if *source == send.id
+    )));
+    // Read back as taken; no other recovery takes it.
+    assert_eq!(alice.claimed_notes(&first, &keyset).unwrap().len(), 1);
+    assert_eq!(alice.claimed_locks(&first, &keyset).unwrap().len(), 1);
+    let (notes, none) = alice
+        .claim_with_locks(&second, &[slot(second)], 100, None, true)
+        .unwrap();
+    assert!(notes.is_empty() && none.is_empty());
+
+    // Given back: the payment's again, and finished.
+    alice.unclaim_notes(&first).unwrap();
+    assert!(alice.claimed_locks(&first, &keyset).unwrap().is_empty());
+    assert_eq!(available(&alice).0, 0);
+    assert_eq!(state(&alice), licash_wallet::State::Signed);
+    let (notes, _) = alice
+        .claim_with_locks(&first, &[slot(first)], 100, None, true)
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    // Finished while claimed: its change the recovery's.
+    alice.resume().await.unwrap();
+    assert_eq!(state(&alice), licash_wallet::State::Done);
+    assert_eq!(available(&alice).0, 0);
+    let claimed = alice.claimed_notes(&first, &keyset).unwrap();
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|n| n.note.message().denomination())
+            .sum::<u64>(),
+        52
+    );
+    assert!(alice.claimed_locks(&first, &keyset).unwrap().is_empty());
+    // Given back: its change free, its notes spent.
+    alice.unclaim_notes(&first).unwrap();
+    assert_eq!(available(&alice), (52, 0));
+}

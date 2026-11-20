@@ -28,7 +28,13 @@
 //!
 //! A force close gives up the payments of its keyset's notes that the
 //! wallet never asked its hub to sign, which no hub can release, to claim
-//! their notes as any.
+//! their notes as any. A payment signed and not finished, which its hub
+//! may have released, has its notes claimed after the others, within what
+//! they leave of the cap: each of its notes taken by the recovery, and
+//! its outputs to the wallet named as fallbacks ([`Source::Plain`]), owed
+//! should its hub show it released. Finished while taken, its notes are
+//! the payment's again and its outputs to the wallet the recovery's;
+//! given back unfinished, its notes are the payment's again.
 
 use std::cmp::Reverse;
 use std::collections::{hash_map::Entry, BTreeSet, HashMap};
@@ -60,6 +66,10 @@ use crate::{held, invalid, Error, Held, Transport, Wallet};
 /// Or, of a lock this wallet made that its hub never certified, its
 /// refund on its own inputs ([`Source::OwnInputs`]), its signed body the
 /// witness and each input's hold key authorizing the claim too.
+///
+/// Or, of a payment the wallet signed that its hub never released to it,
+/// its outputs to the wallet, as fallbacks ([`Source::Plain`]): worth
+/// nothing of themselves, its notes claimed beside them as notes.
 #[derive(Clone)]
 pub struct LockClaim {
     pub id: ProposalId,
@@ -371,11 +381,22 @@ impl<T: Transport> Wallet<T> {
                 })
                 .collect();
             // Before the locks are marked, which close its slot.
-            let notes = match cap > 0 && max > 0 {
+            let mut notes = match cap > 0 && max > 0 {
                 true => take_notes(t, &keyset, id, &left)?,
                 false => vec![],
             };
-            for lock in &locks {
+            let mut locks = locks;
+            if uncertified {
+                let held: u64 = notes.iter().map(|n| n.note.message().denomination()).sum();
+                let left = (cap.saturating_sub(held), max.saturating_sub(notes.len()));
+                let (inputs, sends) = self.take_sends(t, &keyset, id, left)?;
+                notes.extend(inputs);
+                locks.extend(sends);
+            }
+            for lock in locks
+                .iter()
+                .filter(|l| !matches!(l.source, Source::Plain { .. }))
+            {
                 let table = match lock.branch {
                     Branch::Refund => "locks",
                     Branch::Pay => "owed_locks",
@@ -471,8 +492,19 @@ impl<T: Transport> Wallet<T> {
             }
             Ok((refunds, owed_rows(c, OWED_CLAIMED, params![id])?))
         })?;
-        let mut locks = Vec::with_capacity(refunds.len() + owed.len());
+        let sends = self.store.read(|c| {
+            let mut sends = Vec::new();
+            for (send, release) in signed_sends(c)? {
+                let Some(claim) = self.send_claim(c, &keyset, &send, &release, id)? else {
+                    continue;
+                };
+                sends.extend(claim.1);
+            }
+            Ok(sends)
+        })?;
+        let mut locks = Vec::with_capacity(refunds.len() + owed.len() + sends.len());
         locks.extend(refunds);
+        locks.extend(sends);
         for (_, row) in &owed {
             if let Some(pay) = self.lock_pay(&keyset, row)? {
                 locks.push(pay);
@@ -608,6 +640,123 @@ impl<T: Transport> Wallet<T> {
             )));
         }
         Ok(())
+    }
+
+    /// Take for the recovery of contract `id` the payments under `keyset`
+    /// signed and not finished, the oldest first, each whose notes are all
+    /// still its own and fit in what is `left` of its cap and its count:
+    /// their notes, and their outputs to the wallet as fallbacks.
+    fn take_sends(
+        &self,
+        t: &rusqlite::Transaction<'_>,
+        keyset: &Keyset,
+        id: &[u8; 32],
+        left: (u64, usize),
+    ) -> Result<(Vec<ClaimNote>, Vec<LockClaim>), Error> {
+        let (mut cap, mut max) = left;
+        let (mut notes, mut sends) = (Vec::new(), Vec::new());
+        for (send, release) in signed_sends(t)? {
+            let claimed = match self.send_claim(t, keyset, &send, &release, &send) {
+                Ok(claimed) => claimed,
+                // One the wallet can't read back is left to its hub.
+                Err(e) => {
+                    tracing::warn!(id = %hex::encode(&send), "a payment's notes not claimable: {e}");
+                    continue;
+                }
+            };
+            let Some((ys, fallback)) = claimed else {
+                continue;
+            };
+            let inputs = (ys.iter())
+                .map(|y| claim_note(t, keyset, y))
+                .collect::<Result<Vec<_>, _>>()?;
+            let value: u64 = inputs.iter().map(|n| n.note.message().denomination()).sum();
+            let count = inputs.len() + fallback.as_ref().map_or(0, |f| f.keys.len());
+            if value > cap || count > max {
+                continue;
+            }
+            for y in &ys {
+                let taken = t.execute(
+                    "UPDATE notes SET spent_by = ?1, spent_kind = ?3 WHERE y = ?2 AND spent_by = ?4",
+                    params![id, y, crate::Spender::Recovery.name(), send],
+                )?;
+                if taken != 1 {
+                    return Err(Error::NoteTaken);
+                }
+            }
+            (cap, max) = (cap - value, max - count);
+            notes.extend(inputs);
+            sends.extend(fallback);
+        }
+        Ok((notes, sends))
+    }
+
+    /// The payment `send` of `release`, signed, under `keyset`, if its
+    /// notes are all held by `holder` and none dropped: their points, and
+    /// its outputs to the wallet as a claim's fallbacks, if any. None if
+    /// under another keyset, or a note of it is not so held.
+    fn send_claim(
+        &self,
+        c: &rusqlite::Connection,
+        keyset: &Keyset,
+        send: &[u8],
+        release: &str,
+        holder: &[u8],
+    ) -> Result<Option<SendClaim>, Error> {
+        let release: licash_api::Release = serde_json::from_str(release).map_err(invalid)?;
+        if release.keyset.0 != keyset.id() {
+            return Ok(None);
+        }
+        let lookup = |id: &[u8; 32]| (id == keyset.id()).then_some(keyset);
+        let (signed, notes) = release.decode(lookup).map_err(invalid)?;
+        let proposal = signed.proposal();
+        if proposal.id().as_bytes() != send {
+            return Err(Error::Invalid("a payment's release of another".into()));
+        }
+        let mut inputs = signed.verify(keyset, &notes)?;
+        inputs.sort_unstable();
+        let ys: Vec<[u8; 33]> = inputs.iter().map(|y| y.0).collect();
+        for y in &ys {
+            let held: bool = c.query_row(
+                "SELECT EXISTS (SELECT 1 FROM notes
+                 WHERE y = ?1 AND spent_by = ?2 AND gone_at IS NULL)",
+                params![y, holder],
+                |r| r.get(0),
+            )?;
+            if !held {
+                return Ok(None);
+            }
+        }
+        let (mut items, mut keys) = (Vec::new(), Vec::new());
+        let received = self.owner.scan_key().receive(proposal)?;
+        for r in received.iter().filter(|r| r.branch == Branch::Pay) {
+            let message = r.derivation.message().clone();
+            keys.push((
+                message.clone(),
+                r.derivation.hold_key(self.owner.hold_root())?,
+            ));
+            items.push(Item::Pending {
+                message,
+                source: proposal.id(),
+                branch: Branch::Pay,
+                index: r.position,
+                blinding: *r.derivation.blinding(),
+                preimage: None,
+            });
+        }
+        // Paying the wallet nothing: its notes alone, no source to name.
+        let id = proposal.id();
+        let fallback = (!items.is_empty()).then_some(LockClaim {
+            id,
+            branch: Branch::Pay,
+            items,
+            source: Source::Plain { id, inputs },
+            witness: SourceWitness::Signed { signed, notes },
+            keys,
+            value: 0,
+            activation: None,
+        });
+        Ok(Some((ys, fallback)))
     }
 
     /// The pay branch of the owed lock of `row`, under `keyset`: none if
@@ -818,6 +967,16 @@ impl<T: Transport> Wallet<T> {
                 "UPDATE notes SET spent_by = NULL, spent_kind = NULL WHERE spent_by = ?1",
                 [id],
             )?;
+            // The notes of the payments under way it took are theirs again.
+            for (send, offer) in pending_sends(t)? {
+                for y in send_inputs(&offer)? {
+                    t.execute(
+                        "UPDATE notes SET spent_by = ?1, spent_kind = ?3
+                         WHERE y = ?2 AND spent_by IS NULL AND gone_at IS NULL",
+                        params![send, y, crate::Spender::Send.name()],
+                    )?;
+                }
+            }
             let locks = t.execute(
                 "UPDATE locks SET claimed_by = NULL WHERE claimed_by = ?1",
                 [id],
@@ -947,6 +1106,78 @@ fn give_up_unsigned(t: &rusqlite::Transaction<'_>, keyset: &[u8; 32]) -> Result<
         tracing::warn!(id = %hex::encode(&id), "an unsigned payment given up for a recovery");
     }
     Ok(())
+}
+
+/// A payment's notes a recovery claims, by their points, and its outputs
+/// to the wallet as the claim's fallbacks, if any.
+type SendClaim = (Vec<[u8; 33]>, Option<LockClaim>);
+
+/// Of the payment `send`, finished, whose notes `inputs` a recovery took:
+/// its notes the payment's again, spent, and its outputs to the wallet
+/// that recovery's, which its claim names.
+pub(crate) fn finished_while_claimed(
+    t: &rusqlite::Transaction<'_>,
+    send: &ProposalId,
+    inputs: &[[u8; 33]],
+) -> Result<(), Error> {
+    let mut holders = BTreeSet::new();
+    for y in inputs {
+        let holder: Option<Vec<u8>> = t
+            .query_row(
+                "SELECT spent_by FROM notes WHERE y = ?1 AND spent_kind = ?2",
+                params![y, crate::Spender::Recovery.name()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        holders.extend(holder);
+    }
+    // Two recoveries never take one payment's notes: all or none.
+    let Some(holder) = holders.into_iter().next() else {
+        return Ok(());
+    };
+    for y in inputs {
+        t.execute(
+            "UPDATE notes SET spent_by = ?1, spent_kind = ?3 WHERE y = ?2 AND spent_by = ?4",
+            params![send.as_bytes(), y, crate::Spender::Send.name(), holder],
+        )?;
+    }
+    t.execute(
+        "UPDATE notes SET spent_by = ?2, spent_kind = ?3
+         WHERE proposal = ?1 AND spent_by IS NULL AND session IS NULL AND gone_at IS NULL",
+        params![send.as_bytes(), holder, crate::Spender::Recovery.name()],
+    )?;
+    tracing::info!(id = %hex::encode(send.as_bytes()), "a payment finished while a recovery claims it");
+    Ok(())
+}
+
+/// The payments signed and not finished, the oldest first: each id and
+/// its release.
+fn signed_sends(c: &rusqlite::Connection) -> Result<Vec<(Vec<u8>, String)>, Error> {
+    let mut stmt = c.prepare(
+        "SELECT id, release FROM sends
+         WHERE release IS NOT NULL AND done_at IS NULL AND abandoned IS NULL
+         ORDER BY created_at, id",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The payments under way, finished or given up neither: each id and its
+/// offer.
+fn pending_sends(c: &rusqlite::Connection) -> Result<Vec<(Vec<u8>, String)>, Error> {
+    let mut stmt =
+        c.prepare("SELECT id, offer FROM sends WHERE done_at IS NULL AND abandoned IS NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The notes a payment's `offer` spends, by their points.
+pub(crate) fn send_inputs(offer: &str) -> Result<Vec<[u8; 33]>, Error> {
+    let offer: licash_api::Offer = serde_json::from_str(offer).map_err(invalid)?;
+    let proposal = Proposal::from_commitment_bytes(&offer.proposal.0)?;
+    (proposal.inputs().iter())
+        .map(|m| Ok(m.identifier()?.0))
+        .collect()
 }
 
 /// Take for the recovery of contract `id`, one of `slots`, its share of

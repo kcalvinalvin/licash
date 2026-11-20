@@ -2918,6 +2918,114 @@ async fn a_force_close_claims_the_refund_of_a_lock_its_hub_never_certified() -> 
     Ok(())
 }
 
+/// A transport that loses every request to release a payment: its hub
+/// holds its offer, never its owner's signature.
+struct NoRelease(Http);
+
+impl licash_wallet::Transport for NoRelease {
+    async fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<licash_wallet::Response, String> {
+        if body.is_some() && url.ends_with(licash_api::RELEASE) {
+            return Err("lost".into());
+        }
+        self.0.request(url, body).await
+    }
+}
+
+/// A payment she signed whose release never reached the hub: her force
+/// close claims its notes beside her others, its change named as a
+/// fallback, and the hub, which never released it, finds it owed all she
+/// asks: her timeout pays it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_force_close_claims_the_notes_of_a_payment_its_hub_never_released() -> Result<()> {
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let range = Range {
+        max_cap: 50_000_000,
+        max_blocks: 5_000,
+        per_coin: 2,
+        ppm_year: 10_000,
+        ppm_year_funded: 0,
+    };
+    let (url, source, hub, openings) = hub_answering_with(&rt, &at, Some(range)).await?;
+    let chain = Node(source.clone());
+    let (mine, wallet) = holder_wallet_over(
+        &rt,
+        &chain,
+        &dir.path().join("wallet"),
+        &url,
+        [19; 32],
+        &[COIN, COIN],
+        NoRelease(Http::new(None)?),
+    )
+    .await?;
+    let chosen = Ask {
+        cap: Some(131_071),
+        blocks: 1_000,
+        ..ask()
+    };
+    let opened = holder::open(&wallet, &chain, &mine.join("wallet.sqlite"), &url, chosen).await?;
+    for _ in 0..3 {
+        let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 2_048)?;
+        wallet.receive(&payment)?;
+    }
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine.join("wallet.sqlite")).await?;
+    ensure!(available(&wallet)? == 6_144);
+
+    // A payment to Bob signed, its release lost.
+    let bob = licash::address::OwnerKeys::from_seed(&[0xbb; 32])?.address();
+    let lost = wallet.send(&url, &bob, 1_000).await;
+    ensure!(
+        matches!(&lost, Err(licash_wallet::Error::Pending { .. })),
+        "{lost:?}"
+    );
+    ensure!(available(&wallet)? == 4_096);
+    while !watch::step(&hub, &source).await? {}
+
+    let rate = bitcoin::FeeRate::from_sat_per_vb(2).context("a rate")?;
+    let forced = recovery::force_close(
+        &wallet,
+        &chain,
+        &mine.join("wallet.sqlite"),
+        &opened.id,
+        rate,
+    )
+    .await?;
+    // Her two notes, and the payment's.
+    ensure!(
+        forced.notes == 3 && forced.claimed == 6_144 + opened.funded,
+        "{forced:?}"
+    );
+    let mut done = None;
+    for _ in 0..800 {
+        rt.mine(1)?;
+        while !watch::step(&hub, &source).await? {}
+        let round = openings.answer_requests().await?;
+        ensure!(round.failed == 0, "{round:?}");
+        let r =
+            recovery::advance(&wallet, &chain, &mine.join("wallet.sqlite"), rate).await?[0].clone();
+        ensure!(r.stage != Stage::Lost, "{r:?}");
+        if r.stage == Stage::Done {
+            done = Some(r);
+            break;
+        }
+    }
+    let done = done.context("never paid")?;
+    ensure!(
+        done.response.is_none() && done.timeout.is_some() && done.payout == done.timeout,
+        "{done:?}"
+    );
+    Ok(())
+}
+
 /// A transport that loses every request to settle a lock: its hub never
 /// learns a preimage from the wallet.
 struct NoSettle(Http);

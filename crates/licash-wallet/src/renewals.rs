@@ -18,7 +18,7 @@ use licash::{
     spend::{Proposal, ProposalId},
 };
 use licash_api::{Code, Fees, Info, Offer};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 use crate::{
     code_name,
@@ -249,12 +249,26 @@ impl<T: Transport> Wallet<T> {
         }
     }
 
-    /// The notes the payment `id` takes.
+    /// The notes the payment `id` takes: those it holds, and, of a send,
+    /// those its offer spends that a recovery took from it.
     pub(crate) fn inputs_of(&self, id: &ProposalId) -> Result<Vec<[u8; 33]>, Error> {
         self.store.read(|c| {
-            let mut stmt = c.prepare("SELECT y FROM notes WHERE spent_by = ?1")?;
+            let mut stmt = c.prepare("SELECT y FROM notes WHERE spent_by = ?1 ORDER BY y")?;
             let rows = stmt.query_map([id.as_bytes()], |r| r.get(0))?;
-            Ok(rows.collect::<Result<_, _>>()?)
+            let mut ys: Vec<[u8; 33]> = rows.collect::<Result<_, _>>()?;
+            let offer: Option<String> = c
+                .query_row(
+                    "SELECT offer FROM sends WHERE id = ?1",
+                    [id.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(offer) = offer {
+                ys.extend(crate::claims::send_inputs(&offer)?);
+                ys.sort_unstable();
+                ys.dedup();
+            }
+            Ok(ys)
         })
     }
 
