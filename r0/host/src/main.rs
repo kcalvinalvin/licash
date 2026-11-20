@@ -108,6 +108,21 @@ fn export(bin: &[u8], receipt: &Receipt, expected: &[u8]) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec_pretty(&data)?)
 }
 
+/// That `kept`, an export of an earlier run ([`export`]), is of `bin` and
+/// proves `expected`: it is never taken for the proof of another input.
+fn check_export(bin: &[u8], expected: &[u8], kept: &[u8]) -> Result<()> {
+    let kept: serde_json::Value = serde_json::from_slice(kept).context("the kept proof")?;
+    ensure!(
+        kept["image_id"].as_str() == Some(&compute_image_id(bin)?.to_string()),
+        "the kept proof is of another program"
+    );
+    ensure!(
+        kept["journal"].as_str() == Some(&hex::encode(expected)),
+        "the kept proof is of another input"
+    );
+    Ok(())
+}
+
 /// `args` as `count` positionals, then at most one program, then any number of
 /// `--assume <receipt>`: the receipts of other programs the guest verifies.
 fn with_assumptions<'a>(
@@ -228,6 +243,27 @@ mod tests {
         ] {
             assert!(args(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_proof_kept_is_taken_for_its_own_program_and_input_alone() {
+        // Any program kept: the tracked ones, whichever they are now.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../programs");
+        let first = std::fs::read_dir(dir).unwrap().next().unwrap().unwrap();
+        let bin = &std::fs::read(first.path()).unwrap()[..];
+        let id = compute_image_id(bin).unwrap();
+        let kept = |id: &str, journal: &str| {
+            serde_json::json!({"image_id": id, "journal": journal, "seal": ""})
+                .to_string()
+                .into_bytes()
+        };
+        let own = kept(&id.to_string(), &hex::encode([1u8, 2]));
+        check_export(bin, &[1, 2], &own).unwrap();
+        // Another input, another program, or no proof at all.
+        assert!(check_export(bin, &[1, 3], &own).is_err());
+        let other = kept(&"0".repeat(64), &hex::encode([1u8, 2]));
+        assert!(check_export(bin, &[1, 2], &other).is_err());
+        assert!(check_export(bin, &[1, 2], b"not json").is_err());
     }
 
     #[test]

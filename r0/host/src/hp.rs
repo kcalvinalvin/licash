@@ -110,6 +110,13 @@ pub fn prove(path: &str, work: &Path, program: Option<&str>, assume: &[String]) 
     create_dir_all(work)?;
     let out = work.join("proof.json");
     if out.exists() {
+        // Kept from a run on this input and program, or none to take.
+        super::check_export(&bin, &expected, &read(&out)?).with_context(|| {
+            format!(
+                "{}: remove the work directory to prove again",
+                out.display()
+            )
+        })?;
         println!("{NAME}: proven already: {}", out.display());
         return Ok(());
     }
@@ -242,9 +249,19 @@ pub fn succinct(
         }
         Err(e) => return Err(e.into()),
     };
-    succinct.verify(id).context("the kept receipt")?;
-    ensure!(succinct.journal.bytes == expected, "journal");
+    check_receipt(&succinct, id, expected)?;
     Ok(succinct)
+}
+
+/// `receipt`, kept in a work directory, is `id`'s and proves `expected`.
+pub fn check_receipt(
+    receipt: &Receipt,
+    id: risc0_zkvm::sha::Digest,
+    expected: &[u8],
+) -> Result<()> {
+    receipt.verify(id).context("the kept receipt")?;
+    ensure!(receipt.journal.bytes == expected, "journal");
+    Ok(())
 }
 
 /// `hp-stark`, the CUDA build's part of [`prove`].

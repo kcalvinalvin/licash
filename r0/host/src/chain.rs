@@ -12,7 +12,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use licash_chain::{extend, Batch};
 
-use crate::hp::{on_device, receipts, succinct};
+use risc0_zkvm::{compute_image_id, Receipt};
+
+use crate::hp::{check_receipt, on_device, receipts, succinct};
 use crate::probe;
 
 const NAME: &str = "chain";
@@ -57,8 +59,17 @@ pub fn prove(path: &str, work: &Path, program: Option<&str>, assume: &[String]) 
     let expected = expected(&bytes)?;
     create_dir_all(work)?;
     let receipts = receipts(assume)?;
-    if work.join("receipt").exists() {
-        println!("{NAME}: proven already: {}", work.join("receipt").display());
+    let kept = work.join("receipt");
+    if kept.exists() {
+        // Kept from a run on this batch and program, or none to take.
+        let receipt: Receipt = bincode::deserialize(&read(&kept)?)?;
+        check_receipt(&receipt, compute_image_id(&bin)?, &expected).with_context(|| {
+            format!(
+                "{}: remove the work directory to prove again",
+                kept.display()
+            )
+        })?;
+        println!("{NAME}: proven already: {}", kept.display());
         return Ok(());
     }
     on_device("chain-stark", path, work, program, assume, |po2| {
