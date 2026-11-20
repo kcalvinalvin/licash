@@ -168,7 +168,10 @@ pub struct HubKeys {
 /// reserve, as [`Wallet::recover_closes`] left it.
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct RecoveredClose {
-    pub number: u32,
+    /// The coin that opened the contract, `txid:vout`.
+    pub coin: String,
+    /// Which of that coin's deposits at the hub it is.
+    pub attempt: u8,
     pub outpoint: String,
     pub value: u64,
     pub height: u32,
@@ -201,17 +204,17 @@ impl Wallet {
 
     /// Find on Bitcoin, through `chain` from block `from`, the payments of
     /// contracts' defaults to the close deposits this wallet's seed asked at
-    /// the hub of `hub_address` and `close_root` (hex, `hub_keys`), among its
-    /// first `numbers`, and hand the network a refund of each whose wait
-    /// passed, to the wallet's fallback address: no wallet file of the
-    /// deposit and no hub needed, only the seed and those two.
+    /// the hub of `hub_address` and `close_root` (hex, `hub_keys`) for the
+    /// contracts its coins opened, and hand the network a refund of each
+    /// whose wait passed, to the wallet's fallback address: no wallet file
+    /// of the deposit and no hub needed, only the seed, the wallet's coins
+    /// found again, and those two.
     pub fn recover_closes(
         &self,
         chain: Arc<dyn ChainSource>,
         hub_address: String,
         close_root: String,
         from: u32,
-        numbers: u32,
     ) -> Result<Vec<RecoveredClose>, LicashError> {
         let address = hex::decode(hub_address.trim())
             .map_err(|_| LicashError::invalid("the hub's address is not hex"))?;
@@ -225,10 +228,13 @@ impl Wallet {
             .runtime
             .block_on(licash_wallet::Blocks::height(&chain))
             .map_err(|reason| LicashError::Unavailable { reason })?;
-        let found = self.runtime.block_on(
-            self.wallet
-                .find_close_payments(&address, &root, numbers, &chain, from),
-        )?;
+        let found = self.runtime.block_on(self.wallet.find_close_payments(
+            &address,
+            &root,
+            &[],
+            &chain,
+            from,
+        ))?;
         let to = self.wallet.fallback_address()?.script_pubkey();
         let rate = FeeRate::from_sat_per_vb(REFUND_RATE).expect("a rate");
         let mut out = Vec::new();
@@ -239,14 +245,15 @@ impl Wallet {
                     self.wallet
                         .refund_close_payment(&address, &root, payment, to.clone(), rate)?;
                 if let Err(e) = chain.0.broadcast(bitcoin::consensus::serialize(&tx)) {
-                    tracing::warn!(number = payment.number, %e, "broadcasting a close deposit's refund");
+                    tracing::warn!(close = ?payment.close, %e, "broadcasting a close deposit's refund");
                 } else {
-                    tracing::info!(number = payment.number, txid = %tx.compute_txid(), "a close deposit's coins taken back");
+                    tracing::info!(close = ?payment.close, txid = %tx.compute_txid(), "a close deposit's coins taken back");
                     refund = Some(tx.compute_txid().to_string());
                 }
             }
             out.push(RecoveredClose {
-                number: payment.number,
+                coin: payment.close.coin.to_string(),
+                attempt: payment.close.attempt,
                 outpoint: payment.outpoint.to_string(),
                 value: payment.value,
                 height: payment.height,

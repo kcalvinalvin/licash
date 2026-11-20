@@ -84,7 +84,9 @@ pub use code::{
 pub use coins::MAX_INPUTS;
 pub use cold::{Cold, ColdRules, ColdScript, ColdWithdrawal, GAP as COLD_GAP};
 pub use delivery::{Delivery, Due, Inboxed, ACK_WITHIN, PAGES_AT_ONCE};
-pub use deposits::{CloseDeposit, Deposit, DepositState, DepositTerms, GAP as DEPOSIT_GAP};
+pub use deposits::{
+    Close, CloseDeposit, Deposit, DepositState, DepositTerms, CLOSE_ATTEMPTS, GAP as DEPOSIT_GAP,
+};
 pub use inquiry::Checked;
 pub use lightning::{refund_blocks, Invoice, InvoiceState, Payable, ViaQuote, ROUTE_BLOCKS};
 pub use locks::{Incoming, Lock, LockState, Via, CLAIM_MARGIN, PROTECTED_MARGIN};

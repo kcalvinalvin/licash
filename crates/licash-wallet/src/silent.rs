@@ -807,6 +807,24 @@ impl<T: Transport> Wallet<T> {
 }
 
 impl<T: Transport> Wallet<T> {
+    /// Every coin the wallet found, spent or not, or only those spent
+    /// (`spent`): those that may have opened a contract.
+    pub(crate) fn silent_outpoints(&self, spent: bool) -> Result<Vec<OutPoint>, Error> {
+        self.store.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT txid, vout FROM silent_coins
+                 WHERE NOT ?1 OR spent_by IS NOT NULL ORDER BY height, txid, vout",
+            )?;
+            let rows = stmt.query_map([spent], |r| {
+                Ok(OutPoint::new(
+                    Txid::from_byte_array(r.get::<_, [u8; 32]>(0)?),
+                    r.get(1)?,
+                ))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
     /// The coins at the silent payment address not spent in a block,
     /// oldest first.
     pub fn silent_coins(&self) -> Result<Vec<SilentCoin>, Error> {

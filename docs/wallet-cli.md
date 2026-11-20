@@ -269,13 +269,16 @@ agreed to, and claims them. A close deposit nobody asked for is taken back
 2016 blocks after the close paid it, like any deposit, with `refund <hash> --to
 <address> --chain <url>`, and the hub is paid nothing.
 
-Its address is of the wallet's seed and the hub's published root alone. With
-the wallet's file and the hub both gone, keep the seed, each hub's `address`
-and `deposits.close_root` from `hubs --json`, and run `recover --hub-address
-<hex> --claim-root <hex> --chain <url>` (or `--hub <url>` where a file
-records the hub): it finds on Bitcoin the payments of contracts' defaults to
-the wallet's close deposits (`--from` a block, `--numbers` deposit numbers
-looked for) and, with `--to <address>`, takes back those 2016 blocks old. A
+Its address is of the wallet's seed, the coin that opened the contract and the
+hub's published root alone. With the wallet's file and the hub both gone,
+keep the seed, each hub's `address` and `deposits.close_root` from `hubs
+--json`, find your coins again (`onchain scan`, which needs a hub serving
+silent payment tweaks, any hub), and run `recover --hub-address <hex>
+--claim-root <hex> --chain <url>` (or `--hub <url>` where a file records the
+hub): it finds on Bitcoin the payments of contracts' defaults to the close
+deposits of the wallet's coins (`--from` a block, `--coin <txid:vout>` for a
+coin the scan cannot find, repeated) and, with `--to <address>`, takes back
+those 2016 blocks old. A
 payment the hub already claimed, with the notes it locked, shows as spent.
 
 The fees a hub charges as a contract opens there are the most the wallet

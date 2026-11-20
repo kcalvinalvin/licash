@@ -2504,11 +2504,11 @@ fn a_phone_names_what_a_restore_needs_of_its_hub_and_refuses_what_it_is_not() {
     assert_eq!(root.len(), 64, "{root}");
     // Nothing paid its close deposits: nothing found, nothing sent.
     let none = alice
-        .recover_closes(light.clone(), address.clone(), root.clone(), 0, 10)
+        .recover_closes(light.clone(), address.clone(), root.clone(), 0)
         .unwrap();
     assert!(none.is_empty(), "{none:?}");
     let refused = |address: &str, root: &str| {
-        invalid(alice.recover_closes(light.clone(), address.into(), root.into(), 0, 10))
+        invalid(alice.recover_closes(light.clone(), address.into(), root.into(), 0))
     };
     assert!(refused("zz", &root).contains("hex"));
     assert!(refused(&address, "0707").contains("32 bytes"));

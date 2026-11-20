@@ -264,7 +264,7 @@ async fn open_once<T: Transport, C: Chain>(
         .checked_add(crate::CLOSE_BLOCKS)
         .context("the close deposit's timeout overflows")?;
     let deposit_for_reserve = wallet
-        .close_deposit(&hub, offer.quote.graph.reserve_alice, timeout)
+        .close_deposit(&hub, deposit, offer.quote.graph.reserve_alice, timeout)
         .await;
     let deposit_for_reserve =
         deposit_for_reserve.map_err(|e| anyhow!("{hub}'s deposit for her reserve: {e}"))?;

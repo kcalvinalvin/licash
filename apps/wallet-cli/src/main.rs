@@ -315,7 +315,8 @@ enum Command {
     },
     /// Find on Bitcoin the payments of contracts' defaults to the deposits
     /// that return their reserves, which this wallet's seed asked of a hub,
-    /// and take back those whose wait passed: with the seed, the hub's
+    /// and take back those whose wait passed: with the seed, the wallet's
+    /// coins (found again by a scan, or named with --coin), the hub's
     /// address and its deposit root alone, its file and the hub both gone.
     /// A hub's address and root are in `hubs --json`: keep them with the
     /// seed.
@@ -338,9 +339,10 @@ enum Command {
         /// The block to look from [default: the first].
         #[arg(long, default_value_t = 0)]
         from: u32,
-        /// How many of the hub's deposit numbers to look for.
-        #[arg(long, default_value_t = 100)]
-        numbers: u32,
+        /// A coin that opened a contract, `txid:vout`, beside those the
+        /// wallet found: for a wallet that cannot find its coins again.
+        #[arg(long = "coin")]
+        coins: Vec<bitcoin::OutPoint>,
         /// Take back what is due to this address [default: only look].
         #[arg(long)]
         to: Option<String>,
@@ -1173,7 +1175,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             claim_root,
             chain,
             from,
-            numbers,
+            coins,
             to,
             fee_rate,
         } => {
@@ -1182,7 +1184,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 (None, Some(address), Some(root)) => HubKeys::Named(address, root),
                 _ => bail!("--hub, or --hub-address with --claim-root"),
             };
-            return recover(&wallet, keys, &chain, from, numbers, to, fee_rate, json).await;
+            return recover(&wallet, keys, &chain, from, &coins, to, fee_rate, json).await;
         }
         Command::Refund {
             hash,
@@ -2222,7 +2224,7 @@ async fn recover(
     hub: HubKeys,
     chain: &str,
     from: u32,
-    numbers: u32,
+    coins: &[bitcoin::OutPoint],
     to: Option<String>,
     fee_rate: Option<u64>,
     json: bool,
@@ -2254,7 +2256,7 @@ async fn recover(
     let blocks = onchain::Blocks(source.clone());
     let tip = source.tip().await?.height;
     let payments = wallet
-        .find_close_payments(&address, &root, numbers, &blocks, from)
+        .find_close_payments(&address, &root, coins, &blocks, from)
         .await?;
     let network = licash_chain_client::network(wallet.network());
     let to = match &to {
@@ -2291,15 +2293,17 @@ async fn recover(
             }
         };
         rows.push(json!({
-            "number": payment.number, "hash": hex::encode(payment.hash),
+            "coin": payment.close.coin.to_string(), "attempt": payment.close.attempt,
+            "hash": hex::encode(payment.hash),
             "outpoint": payment.outpoint.to_string(), "value": payment.value,
             "height": payment.height, "refundable_after": due,
             "spent_by": payment.spent_by.map(|t| t.to_string()),
             "refund": refund.map(|t| t.to_string()), "status": status,
         }));
         lines.push(format!(
-            "#{}  {}  block {}  {status}",
-            payment.number,
+            "{} #{}  {}  block {}  {status}",
+            payment.close.coin,
+            payment.close.attempt,
             say::sat(payment.value),
             payment.height
         ));

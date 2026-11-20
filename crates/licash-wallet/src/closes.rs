@@ -2,12 +2,14 @@
 //! wallet's seed alone.
 //!
 //! The address of such a deposit is of the hash and refund key the seed
-//! gives, the hub's deposit root and nothing else: the hub's claim key
-//! derives from the root, and the refund waits blocks after the payment,
-//! naming no height. A wallet that lost its file, its hub gone or silent,
-//! so needs only the seed, the hub's address (the bytes its deposits' secrets
-//! derive with) and its deposit root, both public, to look for the
-//! payments of its contracts' defaults and take them back.
+//! gives for the coin that opened the contract ([`Close`]), the hub's
+//! deposit root and nothing else: the hub's claim key derives from the
+//! root, and the refund waits blocks after the payment, naming no height.
+//! A wallet that lost its file, its hub gone or silent, so needs only the
+//! seed, its coins (found again as any of its payments, or named), the
+//! hub's address (the bytes its deposits' secrets derive with) and its
+//! deposit root, both public, to look for the payments of its contracts'
+//! defaults and take them back.
 
 use std::collections::HashMap;
 
@@ -16,7 +18,7 @@ use licash::spend::lock_hash;
 use licash_onchain::deposit::{Htlc, CLOSE_WAIT};
 
 use crate::{
-    deposits::{close_htlc, close_preimage, refund_secret, x_only},
+    deposits::{close_htlc, x_only, Close, CLOSE_ATTEMPTS},
     silent::chain_error,
     Blocks, Error, Transport, Wallet,
 };
@@ -25,8 +27,8 @@ use crate::{
 /// reserve, which this wallet's seed asked of a hub.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClosePayment {
-    /// The deposit's number at its hub.
-    pub number: u32,
+    /// The coin that opened the contract, and the attempt at its hub.
+    pub close: Close,
     /// Its hash.
     pub hash: [u8; 32],
     pub outpoint: OutPoint,
@@ -50,42 +52,54 @@ impl ClosePayment {
 }
 
 impl<T: Transport> Wallet<T> {
-    /// The deposits `numbers` first of the hub of `address`, whose deposit
-    /// root is `root`, as the seed asked them.
-    fn close_htlcs(
+    /// The deposit `close` at the hub of `address`, whose deposit root is
+    /// `root`, as the seed asks it, and its refund key.
+    fn close_htlc_of(
         &self,
         address: &[u8],
         root: &XOnlyPublicKey,
-        numbers: u32,
-    ) -> Result<Vec<(u32, Htlc)>, Error> {
-        (0..numbers)
-            .map(|number| {
-                let preimage = close_preimage(&self.keys.deposit, address, number);
-                let refund = refund_secret(&self.keys.deposit, address, number)?;
-                let htlc = close_htlc(root, &lock_hash(&preimage), &x_only(&refund));
-                Ok((number, htlc))
-            })
-            .collect()
+        close: &Close,
+    ) -> Result<(Htlc, bitcoin::secp256k1::SecretKey), Error> {
+        let preimage = close.preimage(&self.keys.deposit, address);
+        let refund = close.refund_secret(&self.keys.deposit, address)?;
+        Ok((
+            close_htlc(root, &lock_hash(&preimage), &x_only(&refund)),
+            refund,
+        ))
     }
 
     /// The payments `chain` shows, from block `from` to its tip, to the
     /// deposits that return a contract's reserve that this wallet's seed
-    /// asked at its hub, numbered below `numbers`, and what spent each,
-    /// found without the hub: by the hub's `address` bytes and deposit
-    /// `root`. Blocks are read where a filter says one pays them, else all.
+    /// asked at its hub, of a coin the wallet found or one of `coins`
+    /// (named, for a wallet that cannot find its coins again), and what
+    /// spent each, found without the hub: by the hub's `address` bytes and
+    /// deposit `root`. Blocks are read where a filter says one pays them,
+    /// else all.
     pub async fn find_close_payments(
         &self,
         address: &[u8],
         root: &XOnlyPublicKey,
-        numbers: u32,
+        coins: &[OutPoint],
         chain: &impl Blocks,
         from: u32,
     ) -> Result<Vec<ClosePayment>, Error> {
-        let htlcs = self.close_htlcs(address, root, numbers)?;
-        let by_script: HashMap<ScriptBuf, (u32, [u8; 32])> = htlcs
-            .iter()
-            .map(|(number, htlc)| (htlc.script_pubkey(), (*number, htlc.hash)))
-            .collect();
+        let mut all = self.silent_outpoints(false)?;
+        for coin in coins {
+            if !all.contains(coin) {
+                all.push(*coin);
+            }
+        }
+        let mut by_script: HashMap<ScriptBuf, (Close, [u8; 32])> = HashMap::new();
+        for coin in all {
+            for attempt in 0..CLOSE_ATTEMPTS {
+                let close = Close { coin, attempt };
+                let (htlc, _) = self.close_htlc_of(address, root, &close)?;
+                by_script.insert(htlc.script_pubkey(), (close, htlc.hash));
+            }
+        }
+        if by_script.is_empty() {
+            return Ok(Vec::new());
+        }
         let scripts: Vec<&[u8]> = by_script.keys().map(|script| script.as_bytes()).collect();
         let tip = chain.height().await.map_err(chain_error)?;
         let mut found: HashMap<OutPoint, ClosePayment> = HashMap::new();
@@ -115,14 +129,14 @@ impl<T: Transport> Wallet<T> {
                 }
                 let txid = tx.compute_txid();
                 for (vout, output) in (0u32..).zip(&tx.output) {
-                    let Some((number, hash)) = by_script.get(&output.script_pubkey) else {
+                    let Some((close, hash)) = by_script.get(&output.script_pubkey) else {
                         continue;
                     };
                     let outpoint = OutPoint { txid, vout };
                     found.insert(
                         outpoint,
                         ClosePayment {
-                            number: *number,
+                            close: *close,
                             hash: *hash,
                             outpoint,
                             value: output.value.to_sat(),
@@ -134,7 +148,7 @@ impl<T: Transport> Wallet<T> {
             }
         }
         let mut payments: Vec<_> = found.into_values().collect();
-        payments.sort_by_key(|p| (p.height, p.number, p.outpoint.vout));
+        payments.sort_by_key(|p| (p.height, p.outpoint.txid, p.outpoint.vout));
         Ok(payments)
     }
 
@@ -150,12 +164,10 @@ impl<T: Transport> Wallet<T> {
         to: ScriptBuf,
         rate: FeeRate,
     ) -> Result<Transaction, Error> {
-        let preimage = close_preimage(&self.keys.deposit, address, payment.number);
-        let refund = refund_secret(&self.keys.deposit, address, payment.number)?;
-        let htlc = close_htlc(root, &lock_hash(&preimage), &x_only(&refund));
+        let (htlc, refund) = self.close_htlc_of(address, root, &payment.close)?;
         if htlc.hash != payment.hash {
             return Err(Error::Invalid(
-                "a payment of another deposit than its number's".into(),
+                "a payment of another deposit than its coin's".into(),
             ));
         }
         htlc.refund_tx(

@@ -1046,8 +1046,7 @@ impl Transport for Lying {
         url: &str,
         body: Option<Vec<u8>>,
     ) -> Result<licash_wallet::Response, String> {
-        let path = url.strip_prefix(HUB).unwrap_or(url);
-        let stands = body.is_none() && path.starts_with("/v1/deposit/");
+        let stands = body.is_none() && url.contains("/v1/deposit/");
         let response = self.hub.request(url, body).await?;
         if !stands {
             return Ok(response);
@@ -1081,6 +1080,19 @@ fn restored_behind(
     let network = ChainProfile::Core30DefaultRegtest;
     let wallet = Wallet::create(&path, &seed, network, front).unwrap();
     (wallet, asked)
+}
+
+/// Record `coin` as one the wallet of the file at `path` found and spent,
+/// as a scan of its payments finds it again: one that may have opened a
+/// contract.
+fn found_spent(path: &std::path::Path, coin: OutPoint) {
+    let db = rusqlite::Connection::open(path).unwrap();
+    db.execute(
+        "INSERT INTO silent_coins (txid, vout, value, output, tweak, height, spent_by, spent_height)
+         VALUES (?1, ?2, 10000, x'00', x'00', 1, ?3, 2)",
+        rusqlite::params![coin.txid.to_byte_array(), coin.vout, [9u8; 32]],
+    )
+    .unwrap();
 }
 
 /// A hub's answer of where a deposit stands, changed by `change` if it
@@ -1143,12 +1155,16 @@ async fn a_deposit_answered_other_than_asked_is_not_taken_on_by_a_wallet_restore
         ("nothing asked", changed(|s| s.request = None)),
     ];
     for (n, (what, stands)) in lies.into_iter().enumerate() {
-        let (restored, _) = restored_behind(&net, "alice", &format!("lied{n}.sqlite"), stands);
+        let file = format!("lied{n}.sqlite");
+        let (restored, _) = restored_behind(&net, "alice", &file, stands);
+        found_spent(&net.dir.path().join(file), opening_coin());
         restored.add_hub(HUB).await.unwrap();
         assert_eq!(restored.deposits().unwrap(), Vec::new(), "{what}");
     }
-    // As they were asked, both are found: the close, by its hub's root.
+    // As they were asked, both are found: the close, by its hub's root and
+    // the coin, found again, that opened its contract.
     let (restored, _) = restored_behind(&net, "alice", "told.sqlite", changed(|_| ()));
+    found_spent(&net.dir.path().join("told.sqlite"), opening_coin());
     restored.add_hub(HUB).await.unwrap();
     let found = restored.deposits().unwrap();
     let mut got: Vec<_> = found.iter().map(|d| (d.hash.clone(), d.amount)).collect();
@@ -1186,6 +1202,85 @@ async fn a_number_asked_again_of_a_hub_that_hid_its_deposit_is_under_another_has
     assert!(
         matches!(&again.state, DepositState::Canceled(why) if why.contains("refund key")),
         "{again:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_coin_asks_a_close_deposit_again_under_an_attempt_neither_wallet_nor_hub_knows() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    // Her opening asked again of the same coin: another deposit.
+    let (first, until) = close_deposit(&net, &alice).await;
+    let again = alice.close_deposit(HUB, opening_coin(), 3_000, until).await;
+    let again = again.unwrap();
+    assert_ne!(again.hash, first.hash);
+    drop(alice);
+    // Her file lost, the coin found again: both found at her hub, and the
+    // next asked under neither.
+    let (restored, _) = restored_behind(&net, "alice", "restored.sqlite", changed(|_| ()));
+    found_spent(&net.dir.path().join("restored.sqlite"), opening_coin());
+    restored.add_hub(HUB).await.unwrap();
+    let mut found: Vec<_> = (restored.deposits().unwrap().into_iter())
+        .map(|d| (d.hash, d.close))
+        .collect();
+    found.sort();
+    let mut want = vec![(first.hash.clone(), true), (again.hash.clone(), true)];
+    want.sort();
+    assert_eq!(found, want);
+    let third = restored
+        .close_deposit(HUB, opening_coin(), 3_000, until)
+        .await;
+    let third = third.unwrap();
+    assert!(![&first.hash, &again.hash].contains(&&third.hash));
+    // Another coin's first is another deposit still.
+    let other = OutPoint::new(opening_coin().txid, 2);
+    let other = restored.close_deposit(HUB, other, 3_000, until).await;
+    assert!(![&first.hash, &again.hash, &third.hash].contains(&&other.unwrap().hash));
+
+    // A hub hiding hers has her ask again what she first asked of the coin:
+    // the same deposit, shared by no other coin's contract.
+    let hidden: Stands = Box::new(|_| {
+        let problem = Problem::new(Code::UnknownLock, "no deposit under this refund key");
+        licash_wallet::Response {
+            status: problem.code.status(),
+            body: serde_json::to_vec(&problem).unwrap(),
+        }
+    });
+    let (hiding, _) = restored_behind(&net, "alice", "hidden.sqlite", hidden);
+    hiding.add_hub(HUB).await.unwrap();
+    let same = hiding
+        .close_deposit(HUB, opening_coin(), 3_000, until)
+        .await;
+    assert_eq!(same.unwrap().hash, first.hash);
+    // One answering a deposit for each attempt has her give up the coin
+    // after a few.
+    let stands = Local(net.app.clone())
+        .request(&licash_api::deposit_state(&[0; 32]), None)
+        .await
+        .unwrap();
+    let first_body = net.asked("alice", &first.hash).1;
+    let refund: [u8; 32] = first_body.refund.0.clone().try_into().unwrap();
+    let known = Local(net.app.clone())
+        .request(&licash_api::deposit_state(&refund), None)
+        .await
+        .unwrap();
+    assert_ne!(stands.status, 200);
+    assert_eq!(known.status, 200);
+    let every: Stands = Box::new(move |_| licash_wallet::Response {
+        status: 200,
+        body: known.body.clone(),
+    });
+    let (crowded, asked) = restored_behind(&net, "alice", "crowded.sqlite", every);
+    crowded.add_hub(HUB).await.unwrap();
+    let before = asked.load(Ordering::SeqCst);
+    let given_up = crowded
+        .close_deposit(HUB, opening_coin(), 3_000, until)
+        .await;
+    let reason = given_up.unwrap_err().to_string();
+    assert!(reason.contains("another coin"), "{reason}");
+    assert_eq!(
+        asked.load(Ordering::SeqCst) - before,
+        u32::from(licash_wallet::CLOSE_ATTEMPTS)
     );
 }
 
@@ -1819,13 +1914,19 @@ async fn a_deposit_whose_notes_its_hub_keeps_is_owed_and_claimed_again_inside_th
     assert_eq!(held, 3_000);
 }
 
+/// The coin a contract's opening spends, in the tests of close deposits.
+fn opening_coin() -> OutPoint {
+    OutPoint::new(Txid::from_byte_array([42; 32]), 1)
+}
+
 /// A deposit that returns a contract's reserve, asked by `wallet` for
-/// 3 000 sat, timing out 100 blocks on: its script and fee, and the
-/// contract a hub of ours binds it to.
+/// 3 000 sat for the contract [`opening_coin`] opens, timing out 100 blocks
+/// on: its script and fee, and the contract a hub of ours binds it to.
 async fn close_deposit(net: &Net, wallet: &Wallet<Local>) -> (licash_wallet::CloseDeposit, u32) {
     let timeout = net.height() + 100;
-    let close = wallet.close_deposit(HUB, 3_000, timeout).await.unwrap();
-    (close, timeout)
+    let coin = opening_coin();
+    let close = wallet.close_deposit(HUB, coin, 3_000, timeout).await;
+    (close.unwrap(), timeout)
 }
 
 #[tokio::test]
@@ -2136,8 +2237,16 @@ async fn a_wallet_restored_from_its_seed_alone_takes_back_a_close_deposit_the_hu
     let regtest = ChainProfile::Core30DefaultRegtest;
     let restored = Wallet::create(&path, &seed, regtest, Gone).unwrap();
     let chain = Blocks(net.source.clone());
+    // Her coins not found again, and none named: nothing to look for.
+    let none = restored.find_close_payments(&hub_address, &root, &[], &chain, 0);
+    assert!(none.await.unwrap().is_empty());
+    // Found again as a scan of her payments finds it, the coin that opened
+    // her contract need not be named.
+    found_spent(&path, opening_coin());
+    let own = restored.find_close_payments(&hub_address, &root, &[], &chain, 0);
+    assert_eq!(own.await.unwrap().len(), 1);
     let found = restored
-        .find_close_payments(&hub_address, &root, 10, &chain, 0)
+        .find_close_payments(&hub_address, &root, &[opening_coin()], &chain, 0)
         .await
         .unwrap();
     assert_eq!(found.len(), 1, "{found:?}");
@@ -2164,14 +2273,14 @@ async fn a_wallet_restored_from_its_seed_alone_takes_back_a_close_deposit_the_hu
     )
     .unwrap();
     assert!(stranger
-        .find_close_payments(&hub_address, &root, 10, &chain, 0)
+        .find_close_payments(&hub_address, &root, &[opening_coin()], &chain, 0)
         .await
         .unwrap()
         .is_empty());
     // Nor does another hub's root name her deposit's address.
     let wrong = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&[2; 32]).unwrap();
     assert!(restored
-        .find_close_payments(&hub_address, &wrong, 10, &chain, 0)
+        .find_close_payments(&hub_address, &wrong, &[opening_coin()], &chain, 0)
         .await
         .unwrap()
         .is_empty());
@@ -2190,7 +2299,7 @@ async fn a_wallet_restored_from_its_seed_alone_takes_back_a_close_deposit_the_hu
     assert_eq!(refund.lock_time, bitcoin::absolute::LockTime::ZERO);
     net.mine(u32::from(CLOSE_WAIT), vec![refund.clone()]);
     let after = restored
-        .find_close_payments(&hub_address, &root, 10, &chain, 0)
+        .find_close_payments(&hub_address, &root, &[opening_coin()], &chain, 0)
         .await
         .unwrap();
     assert_eq!(after[0].spent_by, Some(refund.compute_txid()));

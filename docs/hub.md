@@ -229,7 +229,11 @@ the wallet asks (`POST /v1/deposit/{refund}/lock`, once the payment is seen),
 when it comes back after the close, and a deposit nobody asked for is given
 up once its payer may take the coins back.
 
-Its address is of the payer's seed and the hub's published root alone. The
+Its address is of the payer's seed, the coin that opens the contract (with a
+small attempt number, for an opening asked again) and the hub's published
+root alone. A coin is spent whole in the contract's funding, so it funds at
+most one contract: two contracts' defaults never pay one deposit, even when
+a hub hides a restored wallet's earlier deposits from it. The
 hub's info names a deposit root (`deposits.close_root`, an x-only key; none,
 and no contract opens), the hub claims such a deposit under that root tweaked
 by the deposit's hash and its payer's refund key (`close_claim_key`), and the
