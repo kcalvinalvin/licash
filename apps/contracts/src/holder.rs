@@ -851,7 +851,12 @@ pub fn fit(
             }
         }
         for funded in (1..=low).rev() {
-            if coin - pays(funded) >= dust {
+            // A hub's interest may fall faster than her part rises: a
+            // smaller part may cost more than her coin.
+            let Some(left) = coin.checked_sub(pays(funded)) else {
+                continue;
+            };
+            if left >= dust {
                 // Less of her part leaves more of her coin: a larger
                 // contract may take what is left.
                 break;
@@ -923,8 +928,13 @@ fn wanted(offer: &Offer, tip: u32, blocks: u32) -> Result<Wanted> {
         bounds.lock
     );
     // The hub counts from its tip, at its checkpoint or past it.
-    let latest = offer.quote.chain.checkpoint.height() + bounds.lock;
-    let close_height = (tip + blocks).min(latest);
+    let latest = offer
+        .quote
+        .chain
+        .checkpoint
+        .height()
+        .saturating_add(bounds.lock);
+    let close_height = tip.saturating_add(blocks).min(latest);
     let response_window = RESPONSE_WINDOW
         .max(bounds.response_window)
         .max(offer.quote.graph.publication_window.saturating_add(2));
@@ -1100,6 +1110,26 @@ mod tests {
     /// What her coin pays in a contract: her part and the price.
     fn pays(range: &licash_api::ContractRange, fit: Fit) -> u64 {
         u64::from(fit.funded) + range.price(fit.cap, 52_560, fit.funded)
+    }
+
+    /// Interest on her part and on the hub's that all but cancel her part
+    /// out: rounded down, what her coin pays goes up and down by a sat as
+    /// her part rises. Never taken past her coin.
+    #[test]
+    fn a_price_not_rising_with_her_part_never_takes_more_than_her_coin() {
+        let range = licash_api::ContractRange {
+            ppm_year: 1_299_900,
+            ppm_year_funded: 300_000,
+            ..range()
+        };
+        let year = licash_api::YEAR_BLOCKS;
+        let cap = 131_071;
+        let pays = |funded| u64::from(funded) + range.price(cap, year, funded);
+        let coin = 193_378;
+        assert!(pays(4_096) <= coin && pays(7) > coin);
+        // No notes make her part: each looked at, down from the most.
+        let fitted = fit(&Pricing::Range(&range), year, coin, 330, (&[1 << 40], 1), 0);
+        assert_eq!(fitted, None);
     }
 
     #[test]
@@ -1457,6 +1487,10 @@ mod tests {
                 quote,
             };
             offer.quote.check(profile).unwrap();
+            // Bounds past any height: refused, never overflowed.
+            let mut endless = offer.clone();
+            endless.bounds.lock = u32::MAX;
+            assert!(wanted(&endless, u32::MAX - 1, u32::MAX).is_err());
             let wanted = wanted(&offer, tip, timing.lock()).unwrap();
             offer.bounds.check(&wanted, tip).unwrap();
             let (g, c) = (&offer.quote.graph, &offer.quote.chain);
