@@ -331,7 +331,7 @@ fn points(keyset: &Keyset, message: &Message, signature: &Point) -> Result<[Pt; 
 }
 
 impl Session {
-    /// Blind the issuer's commitment of `note`, an issuance-linked note under
+    /// Blind the issuer's commitment of `note`, a note the issuer can still link, under
     /// `keyset`, which `output` derived.
     pub fn start(keyset: &Keyset, note: &Note, output: &Derivation) -> Result<Self, Error> {
         if note.keyset_id() != keyset.id() {
@@ -340,11 +340,16 @@ impl Session {
         if note.message() != output.message() {
             return Err(bad("derivation of another note"));
         }
-        let Evidence::Linked {
+        // Opened from a grant's packet or issued, the hub kept what links
+        // it: both unlink the same way.
+        let (Evidence::Linked {
             blinding, commit, ..
-        } = note.evidence()
+        }
+        | Evidence::Granted {
+            blinding, commit, ..
+        }) = note.evidence()
         else {
-            return Err(bad("only issuance-linked notes unlink"));
+            return Err(bad("only notes the issuer can still link unlink"));
         };
         if blinding != output.blinding() {
             return Err(bad("derivation of another issuance"));
@@ -403,5 +408,61 @@ impl Session {
             self.signature,
             Evidence::Unlinked(dleq),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use k256::Scalar;
+
+    use super::*;
+    use crate::{
+        address::{Ephemeral, OwnerKeys},
+        claim::Branch,
+        crypto,
+        note::{IssuerKeys, MintResponse},
+        spend::Output,
+    };
+
+    /// A note whose evidence is `Granted`, a grant's packet kept as it is
+    /// (nothing opens one so, but a note may be decoded so), unlinks as
+    /// one issued does.
+    #[test]
+    fn a_note_of_granted_evidence_unlinks() {
+        let keys = IssuerKeys::random(3).unwrap();
+        let keyset = keys.keyset().unwrap();
+        let owner = OwnerKeys::from_seed(&[1; 32]).unwrap();
+        let d = Ephemeral::random()
+            .derive(&owner.address(), 4, Branch::Pay, 0)
+            .unwrap();
+        let nonce = Nonce::new(&keyset, &Output::from_derivation(&d).unwrap()).unwrap();
+        let bytes = nonce.issue(&keys).unwrap().to_bytes();
+        let issued = MintResponse::from_bytes(&keyset, &bytes)
+            .unwrap()
+            .open(&keyset, &d)
+            .unwrap();
+        // The packet's evidence: the issuer's key masked by an unlock.
+        let unlock = Scalar::from(41u64);
+        let masked = keys.denomination_secret(4).unwrap() + unlock;
+        let blinded = d.blinded().unwrap().to_projective().unwrap();
+        let granted = Evidence::Granted {
+            dleq: crypto::dleq_prove(&masked, &blinded, &crypto::blind_sign(&masked, &blinded)),
+            blinding: *d.blinding(),
+            commit: nonce.commit().unwrap(),
+            unlock: ScalarBytes::from_scalar(&unlock),
+        };
+        let note = Note::from_parts(
+            &keyset,
+            *keyset.id(),
+            d.message().clone(),
+            issued.signature(),
+            granted,
+        )
+        .unwrap();
+        let session = Session::start(&keyset, &note, &d).unwrap();
+        let answered = nonce.answer(&keys, session.request()).unwrap();
+        let unlinked = session.finish(&keyset, &answered.answer()).unwrap();
+        assert!(matches!(unlinked.evidence(), Evidence::Unlinked(_)));
+        unlinked.verify(&keyset).unwrap();
     }
 }
