@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use bitcoin::{Amount, FeeRate, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-use licash::claim::{self, Branch, Item, UnsignedClaim};
+use licash::claim::{self, Branch, Item, Source, UnsignedClaim};
 use licash::recovery::{Filing, Format, Publication, Witness as FilingWitness};
 use licash::request::Request;
 use licash::spend::ChainProfile;
@@ -1143,13 +1143,16 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
     /// The notes she funded it with that her wallet never received are
     /// claimed first ([`super::funded`]), then the branches of her locks
     /// there owed on Bitcoin ([`LockClaim`]), within its cap: the refunds
-    /// of those she made that expired at depth unsettled, and the pay
+    /// of those she made that expired at depth unsettled (certified by
+    /// the hub or not: those it never certified on their own inputs), and
+    /// the pay
     /// branches of those paying her whose activation its statement shows
     /// ([`activation::shown`]).
     ///
     /// Nothing of it is published before its statement would owe it whole
     /// ([`owed_whole`]): a claim that would not be is made again without
-    /// the locks paying her, then without any lock, and one of her notes
+    /// the locks its hub never certified, then without the locks paying
+    /// her, then without any lock, and one of her notes
     /// alone that still would not be gives her recovery up, nothing spent.
     async fn claim(&self, state: &mut State, tip: u32) -> Result<Next> {
         // Before any note of hers is taken.
@@ -1163,27 +1166,33 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             let shown = activation::shown(self.wallet, self.chain, &self.o.base, tip).await?;
             let pays = |p: &LockClaim| shown.contains(&p.id);
             let slots = self.slots(tip, &funded)?;
-            (notes, locks) = self
-                .wallet
-                .claim_with_locks(&self.id, &slots, tip, Some(&pays))?;
-            // Narrowed while a lock is left to leave out: those paying
-            // her, then every one.
-            for _ in 0..2 {
+            (notes, locks) =
+                self.wallet
+                    .claim_with_locks(&self.id, &slots, tip, Some(&pays), true)?;
+            // Narrowed while a lock is left to leave out: those its hub
+            // never certified, then those paying her, then every one.
+            for _ in 0..3 {
                 if locks.is_empty() {
                     break;
                 }
                 let Err(why) = self.sound(&notes, &funded, &locks, tip).await? else {
                     break;
                 };
+                let own = |r: &LockClaim| matches!(r.source, Source::OwnInputs { .. });
+                let uncertified = locks.iter().any(own);
                 let paying = locks.iter().any(|r| r.branch == Branch::Pay);
                 tracing::warn!(
-                    id = %crate::hex_id(&self.id), paying,
+                    id = %crate::hex_id(&self.id), uncertified, paying,
                     "a claim filed without locks of hers: {why}"
                 );
                 self.wallet.unclaim_notes(&self.id)?;
-                (notes, locks) = match paying {
-                    true => (self.wallet).claim_with_locks(&self.id, &slots, tip, None)?,
-                    false => (self.wallet.claim_notes(&self.id, &slots)?, vec![]),
+                let wallet = self.wallet;
+                (notes, locks) = match (uncertified, paying) {
+                    (true, _) => {
+                        wallet.claim_with_locks(&self.id, &slots, tip, Some(&pays), false)?
+                    }
+                    (false, true) => wallet.claim_with_locks(&self.id, &slots, tip, None, false)?,
+                    (false, false) => (wallet.claim_notes(&self.id, &slots)?, vec![]),
                 };
             }
             self.took

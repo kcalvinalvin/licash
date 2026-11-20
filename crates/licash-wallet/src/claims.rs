@@ -21,7 +21,14 @@
 //! the pay branch of each lock paying the wallet that the hub did not
 //! issue, once activated on Bitcoin at depth ([`LockClaim`]): first, within
 //! its cap, before its share of the notes. Taken as the notes are, under
-//! its id, given back with them.
+//! its id, given back with them. So is the refund of a lock signed whose
+//! certificate its hub never gave, nor refused, on its own inputs, once
+//! expired at depth: until then, its inputs stay the lock's, out of any
+//! claim.
+//!
+//! A force close gives up the payments of its keyset's notes that the
+//! wallet never asked its hub to sign, which no hub can release, to claim
+//! their notes as any.
 
 use std::cmp::Reverse;
 use std::collections::{hash_map::Entry, BTreeSet, HashMap};
@@ -49,6 +56,10 @@ use crate::{held, invalid, Error, Held, Transport, Wallet};
 /// - the pay branch of a lock paying it, its hub not issuing it, once
 ///   activated on Bitcoin ([`OwedLock`]): its payer's owner signatures are
 ///   the witness, its activation filed with it.
+///
+/// Or, of a lock this wallet made that its hub never certified, its
+/// refund on its own inputs ([`Source::OwnInputs`]), its signed body the
+/// witness and each input's hold key authorizing the claim too.
 #[derive(Clone)]
 pub struct LockClaim {
     pub id: ProposalId,
@@ -56,7 +67,8 @@ pub struct LockClaim {
     pub items: Vec<Item>,
     pub source: Source,
     pub witness: SourceWitness,
-    /// Each item's message and hold key.
+    /// Each item's message and hold key, then each of its own inputs',
+    /// of a refund on them.
     pub keys: Vec<(Message, ScalarBytes)>,
     /// What its items are worth.
     pub value: u64,
@@ -288,7 +300,7 @@ impl<T: Transport> Wallet<T> {
                 };
                 let keep = |l: &LockClaim| pays.is_some_and(|p| p(&slot.id, l));
                 let keep: Option<&dyn Fn(&LockClaim) -> bool> = pays.is_some().then_some(&keep);
-                let mut due = self.due_locks(c, keyset, tip, keep)?;
+                let mut due = self.due_locks(c, keyset, tip, keep, true)?;
                 due.retain(|l| !taken.contains(&l.id));
                 let (cap, max, locks) = fit(slot, due);
                 taken.extend(locks.into_iter().map(|l| l.id));
@@ -328,13 +340,18 @@ impl<T: Transport> Wallet<T> {
     /// and, given `pays`, the pay branches of the locks paying it, unpaid,
     /// whose activation is at depth by `tip`, of those `pays` keeps: an
     /// activation the claim's chain would not show voids it all, so the
-    /// caller checks each against it.
+    /// caller checks each against it. With `uncertified`, the refunds of
+    /// the wallet's locks its hub never certified too, on their own inputs.
+    ///
+    /// The payments of the keyset's notes never signed are given up first,
+    /// for good, their notes claimed as any: their hub can release none.
     pub fn claim_with_locks(
         &self,
         id: &[u8; 32],
         slots: &[ClaimSlot],
         tip: u32,
         pays: Option<&dyn Fn(&LockClaim) -> bool>,
+        uncertified: bool,
     ) -> Result<(Vec<ClaimNote>, Vec<LockClaim>), Error> {
         let slot = *slot_of(id, slots)?;
         let keyset = self.keyset_of(&slot.keyset)?;
@@ -344,7 +361,8 @@ impl<T: Transport> Wallet<T> {
                     "this recovery took its notes already".into(),
                 ));
             }
-            let due = self.due_locks(t, &keyset, tip, pays)?;
+            give_up_unsigned(t, keyset.id())?;
+            let due = self.due_locks(t, &keyset, tip, pays, uncertified)?;
             let (cap, max, locks) = fit(&slot, due);
             let left: Vec<_> = (slots.iter())
                 .map(|s| match s.id == *id {
@@ -377,25 +395,28 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// The lock branches under `keyset` owed by `tip`, unclaimed, the
-    /// largest first, as [`Wallet::claim_with_locks`] reads them.
+    /// largest first, as [`Wallet::claim_with_locks`] reads them: with
+    /// `uncertified`, the refunds of locks never certified too, each whose
+    /// inputs are all still its own.
     fn due_locks(
         &self,
         c: &rusqlite::Connection,
         keyset: &Keyset,
         tip: u32,
         pays: Option<&dyn Fn(&LockClaim) -> bool>,
+        uncertified: bool,
     ) -> Result<Vec<LockClaim>, Error> {
         let mut stmt = c.prepare(
             "SELECT id, request, certificate, expiry_height FROM locks
-             WHERE certificate IS NOT NULL AND id NOT IN (SELECT id FROM lock_settlements)
+             WHERE (certificate IS NOT NULL OR ?2) AND id NOT IN (SELECT id FROM lock_settlements)
                 AND abandoned IS NULL AND claimed_by IS NULL AND expiry_height <= ?1",
         )?;
         let rows = stmt
-            .query_map([tip], |r| {
+            .query_map(params![tip, uncertified], |r| {
                 Ok((
                     r.get::<_, [u8; 32]>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -403,7 +424,7 @@ impl<T: Transport> Wallet<T> {
         let mut due = Vec::new();
         for (lock, request, certificate) in rows {
             // One the wallet can't read back is left to its hub.
-            match self.lock_refund(keyset, &request, &certificate) {
+            match self.lock_refund(c, keyset, &lock, &request, certificate.as_deref()) {
                 Ok(Some((refund, expired))) if expired <= tip => due.push(refund),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(
@@ -430,20 +451,28 @@ impl<T: Transport> Wallet<T> {
     /// ([`Wallet::claim_with_locks`]), of the keyset of id `keyset`, by id.
     pub fn claimed_locks(&self, id: &[u8; 32], keyset: &[u8; 32]) -> Result<Vec<LockClaim>, Error> {
         let keyset = self.keyset_of(keyset)?;
-        let (rows, owed): (Vec<(String, Vec<u8>)>, _) = self.store.read(|c| {
+        let (refunds, owed) = self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT request, certificate FROM locks WHERE claimed_by = ?1 ORDER BY id",
+                "SELECT id, request, certificate FROM locks WHERE claimed_by = ?1 ORDER BY id",
             )?;
-            let rows = stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            let rows = rows.collect::<Result<_, _>>()?;
-            Ok((rows, owed_rows(c, OWED_CLAIMED, params![id])?))
-        })?;
-        let mut locks = Vec::with_capacity(rows.len() + owed.len());
-        for (request, certificate) in rows {
-            if let Some((refund, _)) = self.lock_refund(&keyset, &request, &certificate)? {
-                locks.push(refund);
+            let rows = stmt.query_map([id], |r| {
+                Ok((
+                    r.get::<_, [u8; 32]>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            })?;
+            let rows = rows.collect::<Result<Vec<_>, _>>()?;
+            let mut refunds = Vec::with_capacity(rows.len());
+            for (lock, request, certificate) in rows {
+                let refund =
+                    self.lock_refund(c, &keyset, &lock, &request, certificate.as_deref())?;
+                refunds.extend(refund.map(|(refund, _)| refund));
             }
-        }
+            Ok((refunds, owed_rows(c, OWED_CLAIMED, params![id])?))
+        })?;
+        let mut locks = Vec::with_capacity(refunds.len() + owed.len());
+        locks.extend(refunds);
         for (_, row) in &owed {
             if let Some(pay) = self.lock_pay(&keyset, row)? {
                 locks.push(pay);
@@ -650,14 +679,18 @@ impl<T: Transport> Wallet<T> {
         }))
     }
 
-    /// The refund of the lock of `request`, certified by `certificate`,
-    /// under `keyset`, and the height at which it is owed, its expiry at
-    /// depth: none if under another keyset or paying the wallet nothing.
+    /// The refund of the lock `id` of `request`, certified by
+    /// `certificate`, under `keyset`, and the height at which it is owed,
+    /// its expiry at depth: none if under another keyset or paying the
+    /// wallet nothing. Never certified, on its own inputs, each still the
+    /// lock's; refused if one is not.
     fn lock_refund(
         &self,
+        c: &rusqlite::Connection,
         keyset: &Keyset,
+        id: &[u8; 32],
         request: &str,
-        certificate: &[u8],
+        certificate: Option<&[u8]>,
     ) -> Result<Option<(LockClaim, u32)>, Error> {
         let request: licash_api::Lock = serde_json::from_str(request).map_err(invalid)?;
         if request.keyset.0 != keyset.id() {
@@ -665,8 +698,53 @@ impl<T: Transport> Wallet<T> {
         }
         let lookup = |id: &[u8; 32]| (id == keyset.id()).then_some(keyset);
         let (signed, notes) = request.decode(lookup).map_err(invalid)?;
-        let certificate = Certificate::from_bytes(keyset, certificate)?;
         let proposal = signed.proposal();
+        if proposal.id().as_bytes() != id {
+            return Err(Error::Invalid("a lock's request of another lock".into()));
+        }
+        let (source, inputs) = match certificate {
+            Some(certificate) => (
+                Source::Admitted(Certificate::from_bytes(keyset, certificate)?),
+                vec![],
+            ),
+            None => {
+                let mut ys = signed.verify(keyset, &notes)?;
+                ys.sort_unstable();
+                let mut keys = Vec::with_capacity(notes.len());
+                for note in &notes {
+                    let y = note.message().identifier()?;
+                    let own: bool = c.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM notes
+                         WHERE y = ?1 AND spent_by = ?2 AND gone_at IS NULL)",
+                        params![y.0, id],
+                        |r| r.get(0),
+                    )?;
+                    if !own {
+                        return Err(Error::Invalid(
+                            "an input of a lock never certified is no longer its own".into(),
+                        ));
+                    }
+                    let derivation = self.derivation(&held(c, keyset, &y.0)?)?;
+                    if derivation.message() != note.message() {
+                        return Err(Error::Invalid(
+                            "a lock's input not of this wallet's keys".into(),
+                        ));
+                    }
+                    keys.push((
+                        note.message().clone(),
+                        derivation.hold_key(self.owner.hold_root())?,
+                    ));
+                }
+                let lock =
+                    (proposal.lock()).ok_or_else(|| Error::Invalid("a lock of no terms".into()))?;
+                let source = Source::OwnInputs {
+                    id: proposal.id(),
+                    inputs: ys,
+                    terms: lock.terms().clone(),
+                };
+                (source, keys)
+            }
+        };
         let lock = (proposal.lock()).ok_or_else(|| Error::Invalid("a lock of no terms".into()))?;
         let terms = lock.terms();
         let owed = (terms.expiry())
@@ -702,11 +780,12 @@ impl<T: Transport> Wallet<T> {
         if items.is_empty() {
             return Ok(None);
         }
+        keys.extend(inputs);
         let refund = LockClaim {
             id: proposal.id(),
             branch: Branch::Refund,
             items,
-            source: Source::Admitted(certificate),
+            source,
             witness: SourceWitness::Signed { signed, notes },
             keys,
             value,
@@ -838,6 +917,36 @@ fn took(c: &rusqlite::Connection, id: &[u8; 32]) -> Result<bool, Error> {
         [id],
         |r| r.get(0),
     )?)
+}
+
+/// Give up the payments spending notes of `keyset` that the wallet never
+/// signed (their release unrecorded, as it is recorded before it is sent),
+/// freeing their notes: no hub can release them. Those of a lock are
+/// signed before they are recorded.
+fn give_up_unsigned(t: &rusqlite::Transaction<'_>, keyset: &[u8; 32]) -> Result<(), Error> {
+    let ids = {
+        let mut stmt = t.prepare(
+            "SELECT DISTINCT s.id FROM sends s JOIN notes n ON n.spent_by = s.id
+             WHERE n.keyset = ?1 AND n.spent_kind = ?2
+                AND s.release IS NULL AND s.done_at IS NULL AND s.abandoned IS NULL",
+        )?;
+        let ids = stmt.query_map(params![keyset, crate::Spender::Send.name()], |r| {
+            r.get::<_, Vec<u8>>(0)
+        })?;
+        ids.collect::<Result<Vec<_>, _>>()?
+    };
+    for id in ids {
+        t.execute(
+            "UPDATE sends SET abandoned = ?2 WHERE id = ?1 AND release IS NULL",
+            params![id, "given up for a contract's recovery of its notes"],
+        )?;
+        t.execute(
+            "UPDATE notes SET spent_by = NULL, spent_kind = NULL WHERE spent_by = ?1",
+            [&id],
+        )?;
+        tracing::warn!(id = %hex::encode(&id), "an unsigned payment given up for a recovery");
+    }
+    Ok(())
 }
 
 /// Take for the recovery of contract `id`, one of `slots`, its share of

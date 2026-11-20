@@ -2801,6 +2801,123 @@ async fn a_force_close_claims_an_unsettled_locks_refund_once_expired_at_depth() 
     Ok(())
 }
 
+/// A transport that loses every request to make a lock: its hub never
+/// sees one, nor certifies it.
+struct NoLock(Http);
+
+impl licash_wallet::Transport for NoLock {
+    async fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<licash_wallet::Response, String> {
+        if body.is_some() && url.ends_with(licash_api::LOCK) {
+            return Err("lost".into());
+        }
+        self.0.request(url, body).await
+    }
+}
+
+/// A lock of hers whose request never reached the hub, so never
+/// certified, is refunded on Bitcoin all the same: her force close past
+/// its expiry at depth claims its refund on its own inputs, which she
+/// signed, beside her notes, and the hub, which never saw it, finds it
+/// owed all she asks: her timeout pays it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_force_close_claims_the_refund_of_a_lock_its_hub_never_certified() -> Result<()> {
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let range = Range {
+        max_cap: 50_000_000,
+        max_blocks: 5_000,
+        per_coin: 2,
+        ppm_year: 10_000,
+        ppm_year_funded: 0,
+    };
+    let (url, source, hub, openings) = hub_answering_with(&rt, &at, Some(range)).await?;
+    let chain = Node(source.clone());
+    let (mine, wallet) = holder_wallet_over(
+        &rt,
+        &chain,
+        &dir.path().join("wallet"),
+        &url,
+        [18; 32],
+        &[COIN, COIN],
+        NoLock(Http::new(None)?),
+    )
+    .await?;
+    let chosen = Ask {
+        cap: Some(131_071),
+        blocks: 1_000,
+        ..ask()
+    };
+    let opened = holder::open(&wallet, &chain, &mine.join("wallet.sqlite"), &url, chosen).await?;
+    for _ in 0..3 {
+        let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 2_048)?;
+        wallet.receive(&payment)?;
+    }
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine.join("wallet.sqlite")).await?;
+    ensure!(available(&wallet)? == 6_144);
+
+    // A lock to Bob the hub never hears of.
+    while !watch::step(&hub, &source).await? {}
+    let expiry = rt.height()? + 6;
+    let bob = licash::address::OwnerKeys::from_seed(&[0xbb; 32])?.address();
+    let hash = licash::spend::lock_hash(&[7; 32]);
+    let lost = wallet.lock(&url, &bob, 1_000, hash, Some(expiry)).await;
+    ensure!(
+        matches!(&lost, Err(licash_wallet::Error::Pending { .. })),
+        "{lost:?}"
+    );
+    let left = available(&wallet)?;
+    ensure!(left == 4_096, "{left} left");
+    rt.mine_to_height(expiry + 12)?;
+    while !watch::step(&hub, &source).await? {}
+
+    let rate = bitcoin::FeeRate::from_sat_per_vb(2).context("a rate")?;
+    let forced = recovery::force_close(
+        &wallet,
+        &chain,
+        &mine.join("wallet.sqlite"),
+        &opened.id,
+        rate,
+    )
+    .await?;
+    // Her two notes, and the lock's refund less the hub's fee.
+    let refund = forced.claimed - 4_096 - opened.funded;
+    ensure!(
+        forced.notes == 2 && refund > 1_000 && refund <= 2_048,
+        "{forced:?}"
+    );
+    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
+    recovery::advance(&wallet, &chain, &mine.join("wallet.sqlite"), rate).await?;
+    let mut done = None;
+    for _ in 0..800 {
+        rt.mine(1)?;
+        while !watch::step(&hub, &source).await? {}
+        let round = openings.answer_requests().await?;
+        ensure!(round.failed == 0, "{round:?}");
+        let r =
+            recovery::advance(&wallet, &chain, &mine.join("wallet.sqlite"), rate).await?[0].clone();
+        ensure!(r.stage != Stage::Lost, "{r:?}");
+        if r.stage == Stage::Done {
+            done = Some(r);
+            break;
+        }
+    }
+    let done = done.context("never paid")?;
+    ensure!(
+        done.response.is_none() && done.timeout.is_some() && done.payout == done.timeout,
+        "{done:?}"
+    );
+    Ok(())
+}
+
 /// A transport that loses every request to settle a lock: its hub never
 /// learns a preimage from the wallet.
 struct NoSettle(Http);

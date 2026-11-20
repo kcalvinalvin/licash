@@ -3,7 +3,7 @@ mod net;
 
 use std::sync::Arc;
 
-use licash::claim::{Branch, Item};
+use licash::claim::{Branch, Item, Source};
 use licash::spend::{lock_hash, ChainProfile};
 use licash_api::{Code, Fee};
 use licash_wallet::{ClaimSlot, Error, LockState, PartTo, Wallet};
@@ -147,11 +147,11 @@ async fn a_recovery_claims_an_unsettled_locks_refund_once_expired_at_depth() {
     let (first, second) = ([7; 32], [8; 32]);
     // At its expiry, short of its depth: owed nothing on Bitcoin yet.
     let (notes, refunds) = alice
-        .claim_with_locks(&first, &[slot(first)], 8, None)
+        .claim_with_locks(&first, &[slot(first)], 8, None, false)
         .unwrap();
     assert!(notes.is_empty() && refunds.is_empty());
     let (_, refunds) = alice
-        .claim_with_locks(&first, &[slot(first)], 100, None)
+        .claim_with_locks(&first, &[slot(first)], 100, None, false)
         .unwrap();
     assert_eq!(refunds.len(), 1);
     let refund = &refunds[0];
@@ -171,7 +171,7 @@ async fn a_recovery_claims_an_unsettled_locks_refund_once_expired_at_depth() {
     assert_eq!(again[0].id, refund.id);
     // Taken: no other recovery claims it.
     let (_, none) = alice
-        .claim_with_locks(&second, &[slot(second)], 100, None)
+        .claim_with_locks(&second, &[slot(second)], 100, None, false)
         .unwrap();
     assert!(none.is_empty());
     // Settled on Bitcoin, not asked of its hub.
@@ -221,7 +221,9 @@ async fn a_refund_owed_takes_its_part_of_a_recoverys_cap_before_notes() {
     let each = recoverable(&both, 100);
     assert_eq!((each[&first], each[&second]), (0, 32));
     // As the recovery takes them.
-    let (notes, refunds) = alice.claim_with_locks(&first, &alone, 100, None).unwrap();
+    let (notes, refunds) = alice
+        .claim_with_locks(&first, &alone, 100, None, false)
+        .unwrap();
     let face: u64 = notes.iter().map(|n| n.note.message().denomination()).sum();
     assert_eq!((refunds.len(), refunds[0].value), (1, 62));
     assert_eq!(face.min(70 - 62), 8);
@@ -302,7 +304,7 @@ async fn a_recovery_claims_an_owed_locks_pay_once_activated_at_depth() {
     let any = |_: &licash_wallet::LockClaim| true;
     // Not activated: nothing to claim.
     let (_, none) = bob
-        .claim_with_locks(&first, &[slot(first)], 100, Some(&any))
+        .claim_with_locks(&first, &[slot(first)], 100, Some(&any), false)
         .unwrap();
     assert!(none.is_empty());
     bob.unclaim_notes(&first).unwrap();
@@ -326,7 +328,7 @@ async fn a_recovery_claims_an_owed_locks_pay_once_activated_at_depth() {
     let depth = o.depth;
     // Short of its depth, or refused by the caller: not claimed.
     let (_, none) = bob
-        .claim_with_locks(&first, &[slot(first)], 10 + depth - 2, Some(&any))
+        .claim_with_locks(&first, &[slot(first)], 10 + depth - 2, Some(&any), false)
         .unwrap();
     assert!(none.is_empty());
     bob.unclaim_notes(&first).unwrap();
@@ -336,17 +338,18 @@ async fn a_recovery_claims_an_owed_locks_pay_once_activated_at_depth() {
             &[slot(first)],
             100,
             Some(&|_: &licash_wallet::LockClaim| false),
+            false,
         )
         .unwrap();
     assert!(none.is_empty());
     bob.unclaim_notes(&first).unwrap();
     let (_, none) = bob
-        .claim_with_locks(&first, &[slot(first)], 100, None)
+        .claim_with_locks(&first, &[slot(first)], 100, None, false)
         .unwrap();
     assert!(none.is_empty());
     bob.unclaim_notes(&first).unwrap();
     let (_, pays) = bob
-        .claim_with_locks(&first, &[slot(first)], 10 + depth - 1, Some(&any))
+        .claim_with_locks(&first, &[slot(first)], 10 + depth - 1, Some(&any), false)
         .unwrap();
     assert_eq!(pays.len(), 1);
     let pay = &pays[0];
@@ -367,7 +370,7 @@ async fn a_recovery_claims_an_owed_locks_pay_once_activated_at_depth() {
     assert!(bob.owed_locks().unwrap()[0].claimed);
     // Claimed: by no other recovery, its activation kept as filed.
     let (_, none) = bob
-        .claim_with_locks(&second, &[slot(second)], 100, Some(&any))
+        .claim_with_locks(&second, &[slot(second)], 100, Some(&any), false)
         .unwrap();
     assert!(none.is_empty());
     assert!(bob.record_activation(&o.id, None).is_err());
@@ -377,7 +380,7 @@ async fn a_recovery_claims_an_owed_locks_pay_once_activated_at_depth() {
     bob.claim(HUB, &lock.id, &PREIMAGE).await.unwrap();
     assert!(bob.owed_locks().unwrap().is_empty());
     let (_, none) = bob
-        .claim_with_locks(&first, &[slot(first)], 100, Some(&any))
+        .claim_with_locks(&first, &[slot(first)], 100, Some(&any), false)
         .unwrap();
     assert!(none.is_empty());
 }
@@ -727,5 +730,97 @@ async fn a_payee_sees_what_a_lock_pays_it_before_revealing_anything() {
     assert_eq!(
         (paid.settled, paid.preimage, paid.height),
         (Some(licash_api::Settled::Pay), Some(PREIMAGE), 4)
+    );
+}
+
+/// A lock its hub never answered for, its signed request kept: once
+/// expired at depth, a recovery claims its refund on its own inputs, which
+/// her claim's keys authorize, whether or not the hub ever admitted it.
+/// Left out where the caller leaves such locks out.
+#[tokio::test]
+async fn a_recovery_claims_the_refund_of_a_lock_its_hub_never_certified() {
+    let (net, alice, bob) = parties().await;
+    net.fail(licash_api::LOCK, Fault::Lost);
+    let Err(Error::Pending { id, .. }) = alice.lock(HUB, &bob.address(), 10, hash(), Some(8)).await
+    else {
+        panic!("not pending");
+    };
+    let keyset = *net.hub(HUB).info().keysets[0].id();
+    let slot = |id: [u8; 32]| ClaimSlot {
+        id,
+        keyset,
+        cap: 1_000,
+        max: 32,
+    };
+    let (first, second) = ([7; 32], [8; 32]);
+    // Short of its expiry at depth, or such locks left out: none.
+    let (notes, refunds) = alice
+        .claim_with_locks(&first, &[slot(first)], 8, None, true)
+        .unwrap();
+    assert!(notes.is_empty() && refunds.is_empty());
+    let (notes, refunds) = alice
+        .claim_with_locks(&first, &[slot(first)], 100, None, false)
+        .unwrap();
+    assert!(notes.is_empty() && refunds.is_empty());
+    let (notes, refunds) = alice
+        .claim_with_locks(&first, &[slot(first)], 100, None, true)
+        .unwrap();
+    assert!(notes.is_empty());
+    assert_eq!(refunds.len(), 1);
+    let refund = &refunds[0];
+    assert_eq!(hex::encode(refund.id.as_bytes()), id);
+    assert!(matches!(&refund.source, Source::OwnInputs { inputs, .. } if inputs.len() == 1));
+    assert_eq!(refund.value, 62);
+    // Its items' keys, and its input's.
+    assert_eq!(refund.keys.len(), refund.items.len() + 1);
+    let input = refund.source.inputs()[0];
+    assert!(refund
+        .keys
+        .iter()
+        .any(|(m, _)| m.identifier().unwrap() == input));
+    let again = alice.claimed_locks(&first, &keyset).unwrap();
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].id, refund.id);
+    // Taken: no other recovery claims it, nor its input as a note.
+    let (notes, none) = alice
+        .claim_with_locks(&second, &[slot(second)], 100, None, true)
+        .unwrap();
+    assert!(notes.is_empty() && none.is_empty());
+    // Given back: the lock is the wallet's to follow again.
+    alice.unclaim_notes(&first).unwrap();
+    assert!(alice.claimed_locks(&first, &keyset).unwrap().is_empty());
+    assert_eq!(alice.locks().unwrap()[0].state, LockState::Requested);
+}
+
+/// A recovery's claim gives up the payments its hub was never asked to
+/// sign, to claim their notes: a payment its hub could release is kept.
+#[tokio::test]
+async fn a_recovery_takes_the_notes_of_a_payment_its_hub_never_signed() {
+    let (net, alice, bob) = parties().await;
+    net.fail(licash_api::OFFER, Fault::Lost);
+    let Err(Error::Pending { id, .. }) = alice.send(HUB, &bob.address(), 10).await else {
+        panic!("not pending");
+    };
+    let keyset = *net.hub(HUB).info().keysets[0].id();
+    let slot = ClaimSlot {
+        id: [7; 32],
+        keyset,
+        cap: 1_000,
+        max: 32,
+    };
+    let offered = alice.sends().unwrap();
+    assert_eq!(offered[0].state, licash_wallet::State::Offered);
+    let (notes, locks) = alice
+        .claim_with_locks(&slot.id, &[slot], 100, None, true)
+        .unwrap();
+    assert!(locks.is_empty());
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].note.message().denomination(), 64);
+    let send = alice.sends().unwrap();
+    let send = send.iter().find(|s| s.id == id).unwrap();
+    assert!(
+        matches!(&send.state, licash_wallet::State::Abandoned(_)),
+        "{:?}",
+        send.state
     );
 }
