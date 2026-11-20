@@ -341,10 +341,10 @@ hub first saw it, or once F may no longer fund its contract, the hub
 spends one of its own coins F spends back to its wallet, then gives the
 opening up once that is deep. At most 16 signed openings may wait unfunded
 like this; past that, new openings are refused as unavailable, and the
-operator is alerted once. This version quotes contracts of graph id 8,
-whose graph returns the hub its reserve if it never responds: apps older
-than this version open no contract at an upgraded hub until they are
-updated, while contracts opened before keep their terms. Openings are kept in `hub.sqlite`, as sensitive as the seed. Each
+operator is alerted once. Since graph id 8, a contract's graph returns
+the hub its reserve if it never responds. Apps older than the graph id a
+hub quotes open no contract at it until they are updated, while contracts
+opened before keep their terms (see [Upgrading](#upgrading)). Openings are kept in `hub.sqlite`, as sensitive as the seed. Each
 opening receives the kept garbled instances from
 the holder's wallet, kept in `<data>/opening-instances/`. The hub takes one opening's step, or
 builds one instance, at a time, the others waiting their turn: each opening
@@ -705,3 +705,19 @@ docker build -f apps/hub/Dockerfile -t licash-hub .
 docker run --rm -v licash-hub:/data licash-hub init
 docker run -d -p 8338:8338 -v licash-hub:/data licash-hub
 ```
+
+## Upgrading
+
+Stop the hub, back up `<data>` (see the backups above), replace the binary and start it
+again. Before starting it:
+
+- Install every program of `r0/programs/` (see `docs/r0.md`): a contract
+  keeps the program it opened under for as long as it lives, and a prover
+  lacking one responds to none of its contested claims.
+- Expect no migration: a database or file of an earlier layout is refused
+  by name, never read nor replaced.
+
+Contracts opened before keep their graph, program and reserve; only new openings take the new
+graph, and apps older than it open none until they are updated. Read the
+notes of each paragraph above that names a graph id or a release for what
+else an upgrade changes (fees, the header chain, the gateway's records).

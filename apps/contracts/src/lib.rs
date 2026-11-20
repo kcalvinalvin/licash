@@ -394,7 +394,9 @@ pub const CHAIN: [u8; 32] =
     hex!("67ace32269c9edb8882aefa75f81b974b506d74a1b11bcff1879197a4c61e77e");
 
 /// The programs signet's (and Mutinynet's) contracts opened under before [`SIGNET`], newest
-/// first: no contract opens under them, those that did are played still.
+/// first: no contract opens under them, and those that did are played still
+/// if of a Base this build reads, the sixth form only: one opened on an
+/// earlier form (under `ce4d7a00…` or before) is no longer read nor played.
 /// `83642842…` reads the sixth form of a Base and every header of the exit (graph
 /// id 10): its contracts' proofs grow with their age, where those of [`SIGNET`]
 /// (graph id 11, the exit read on the hub's header chain) do not.
@@ -425,7 +427,7 @@ pub const SIGNET_BEFORE: [[u8; 32]; 8] = [
 ];
 
 /// The programs contracts on `profile` opened under before the one they
-/// open under now ([`trust`]): played still.
+/// open under now ([`trust`]): played still, of a Base this build reads.
 pub fn programs_before(profile: ChainProfile) -> &'static [[u8; 32]] {
     match profile {
         ChainProfile::Core30Signet | ChainProfile::Mutinynet => &SIGNET_BEFORE,
