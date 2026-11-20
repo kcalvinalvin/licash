@@ -514,7 +514,11 @@ async fn a_hub_added_stays_the_one_it_proved_it_is() {
             "{result:?}"
         );
     };
-    unavailable(bob.lock(HUB, &bob.address(), 1, [0; 32], None).await.map(drop));
+    unavailable(
+        bob.lock(HUB, &bob.address(), 1, [0; 32], None)
+            .await
+            .map(drop),
+    );
     unavailable(bob.add_hub(HUB).await.map(drop));
     let kept = bob.hubs().unwrap();
     assert_eq!(kept.len(), 1);
