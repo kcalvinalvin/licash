@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +34,9 @@ type Config struct {
 	ConnectPeers []string
 	// AddPeers are used along with the ones discovered.
 	AddPeers []string
+	// FixedSeeds are peers of the network reached when no other peer
+	// answers for a while: without ConnectPeers only.
+	FixedSeeds []string
 	// Mempool bounds what peers can make the node hold.
 	Mempool mempool.Limits
 	// CDN, if set, is the base URL of a block-dn server following the same
@@ -63,10 +67,11 @@ type Mempool interface {
 
 // Node is a running light client.
 type Node struct {
-	cs    *neutrino.ChainService
-	db    walletdb.DB
-	relay *relay
-	cdn   *cdn
+	cs     *neutrino.ChainService
+	db     walletdb.DB
+	relay  *relay
+	cdn    *cdn
+	upkeep *upkeep
 
 	stopOnce sync.Once
 	stopErr  error
@@ -95,7 +100,7 @@ func Start(cfg Config) (*Node, error) {
 			log.Warn("block-dn unusable, syncing from peers", "err", err)
 		}
 	}
-	n, err := start(cfg)
+	n, err := start(cfg, log)
 	if err != nil {
 		return nil, err
 	}
@@ -125,7 +130,8 @@ func peerDirectory(base string) (string, error) {
 }
 
 // start runs the node using only the peers for block and filter headers.
-func start(cfg Config) (*Node, error) {
+func start(cfg Config, log *slog.Logger) (*Node, error) {
+	began := time.Now()
 	db, err := walletdb.Create(
 		"bdb", filepath.Join(cfg.DataDir, "neutrino.db"), true,
 		time.Minute, false,
@@ -168,12 +174,75 @@ func start(cfg Config) (*Node, error) {
 		ticker.Stop()
 		unsubscribe()
 	}()
+
+	// Told its peers, the node reaches no others: no book, no seeds.
+	var book *peerBook
+	seeds := cfg.FixedSeeds
+	if len(cfg.ConnectPeers) == 0 {
+		if book, err = openPeerBook(cfg.DataDir); err != nil {
+			log.Warn("starting without the peers remembered", "err", err)
+		}
+	} else {
+		seeds = nil
+	}
+	usable := func(addr string) bool { return cfg.Proxy != nil || !isOnion(addr) }
+	n.upkeep = newUpkeep(chainNet{cs}, book, seeds, usable, log, began)
+	n.upkeep.reconnect(began)
+	beat := time.NewTicker(upkeepEvery)
+	n.upkeep.run(beat.C)
+	go func() {
+		<-n.upkeep.quit
+		beat.Stop()
+	}()
 	return n, nil
 }
+
+// isOnion is whether addr, a host:port, is a Tor onion service's.
+func isOnion(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	return strings.HasSuffix(strings.ToLower(host), ".onion")
+}
+
+// chainNet is the network as upkeep sees it, through cs.
+type chainNet struct{ cs *neutrino.ChainService }
+
+func (c chainNet) handshaken() []string {
+	var addrs []string
+	for _, sp := range c.cs.Peers() {
+		if !sp.Inbound() && sp.Connected() && sp.VerAckReceived() {
+			addrs = append(addrs, sp.Addr())
+		}
+	}
+	return addrs
+}
+
+func (c chainNet) connect(addr string) error { return c.cs.ConnectNode(addr, false) }
+
+func (c chainNet) headers() int32 {
+	_, height, err := c.cs.BlockHeaders.ChainTip()
+	if err != nil {
+		return 0
+	}
+	return int32(height)
+}
+
+func (c chainNet) peerHeight() int32 {
+	var best int32
+	for _, sp := range c.cs.Peers() {
+		best = max(best, sp.LastBlock())
+	}
+	return best
+}
+
+func (c chainNet) current() bool { return c.cs.IsCurrent() }
 
 // Stop shuts the node down and closes its data. It is safe to call twice.
 func (n *Node) Stop() error {
 	n.stopOnce.Do(func() {
+		n.upkeep.stop()
 		n.relay.stop()
 		n.stopErr = n.cs.Stop()
 		if err := n.db.Close(); n.stopErr == nil {
@@ -201,13 +270,7 @@ func (n *Node) Headers() (int32, error) {
 
 // PeerHeight is the highest block a connected peer told of: 0 with none.
 func (n *Node) PeerHeight() int32 {
-	var best int32
-	for _, sp := range n.cs.Peers() {
-		if h := sp.LastBlock(); h > best {
-			best = h
-		}
-	}
-	return best
+	return chainNet{n.cs}.peerHeight()
 }
 
 // Synced reports whether the node believes it has caught up with its peers.
