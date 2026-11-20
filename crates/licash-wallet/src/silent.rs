@@ -643,17 +643,24 @@ impl<T: Transport> Wallet<T> {
                 "block {hash} does not match its header"
             )));
         }
-        // Which transaction each output key is in.
-        let mut keys: HashMap<XOnlyPublicKey, usize> = HashMap::new();
+        // The transactions each output key is in: anyone may pay a key
+        // seen again, in a transaction of its own.
+        let mut keys: HashMap<XOnlyPublicKey, Vec<usize>> = HashMap::new();
         for (i, tx) in block.txdata.iter().enumerate() {
             for key in silent::taproot_outputs(tx) {
-                keys.insert(key, i);
+                keys.entry(key).or_default().push(i);
             }
         }
         let mut paying: HashMap<usize, Vec<&PublicKey>> = HashMap::new();
         for (point, candidates) in points.iter().zip(&candidates) {
-            if let Some(i) = candidates.iter().find_map(|c| keys.get(c)) {
-                paying.entry(*i).or_default().push(point);
+            let txs: HashSet<usize> = candidates
+                .iter()
+                .filter_map(|c| keys.get(c))
+                .flatten()
+                .copied()
+                .collect();
+            for i in txs {
+                paying.entry(i).or_default().push(point);
             }
         }
         // In the block's order: a coin may be paid and spent in one block.
@@ -670,16 +677,19 @@ impl<T: Transport> Wallet<T> {
             for point in points.chain(own.as_ref()) {
                 let outputs = silent::taproot_outputs(tx);
                 for found in finder.scanner.scan(point, &outputs) {
-                    let vout = tx
-                        .output
-                        .iter()
-                        .position(|o| o.script_pubkey == p2tr(found.output));
-                    let Some(vout) = vout else { continue };
-                    let outpoint = OutPoint::new(txid, vout as u32);
-                    if seen.insert(outpoint) {
-                        let value = tx.output[vout].value.to_sat();
-                        coins.insert(outpoint, found.output);
-                        batch.found.push((outpoint, value, found, at));
+                    // Each output paying its key, should it pay it twice.
+                    let script = p2tr(found.output);
+                    for (vout, output) in tx.output.iter().enumerate() {
+                        if output.script_pubkey != script {
+                            continue;
+                        }
+                        let outpoint = OutPoint::new(txid, vout as u32);
+                        if seen.insert(outpoint) {
+                            coins.insert(outpoint, found.output);
+                            batch
+                                .found
+                                .push((outpoint, output.value.to_sat(), found, at));
+                        }
                     }
                 }
             }

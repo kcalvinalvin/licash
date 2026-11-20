@@ -1159,6 +1159,32 @@ async fn a_replacement_given_up_takes_what_it_replaced_with_it() {
     assert_eq!(s.wallet.silent_spend(&bumped.compute_txid()).unwrap(), None);
 }
 
+/// A key paid again, twice in its transaction or in another of the same
+/// block: each coin found.
+#[tokio::test]
+async fn every_output_paying_a_key_found_is_found() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let mut paying = s.pay(&[s.address()], &[20_000]);
+    let script = paying.output[0].script_pubkey.clone();
+    paying.output.push(TxOut {
+        value: Amount::from_sat(5_000),
+        script_pubkey: script.clone(),
+    });
+    let again = s.pay_plain(&script, 7_000);
+    s.mine(vec![paying, again]);
+    let mut values: Vec<u64> = s
+        .scan()
+        .await
+        .unwrap()
+        .found
+        .iter()
+        .map(|c| c.value)
+        .collect();
+    values.sort();
+    assert_eq!(values, [5_000, 7_000, 20_000]);
+}
+
 #[tokio::test]
 async fn a_spend_a_block_conflicts_with_is_given_up() {
     let s = setup().await;
