@@ -39,6 +39,10 @@ pub enum Fault {
     Dropped,
     /// The hub does not serve it, and answers with this problem.
     Refused(Code),
+    /// The hub serves it, and answers with this problem all the same, as
+    /// a hub lying to its payer would.
+    #[allow(dead_code)]
+    Belied(Code),
     /// An inquiry the hub answers with no evidence of any note, as a hub
     /// that says nothing and shows nothing would.
     Hushed,
@@ -293,8 +297,16 @@ impl Net {
             (path, Some(body)) => post(&hub, path, &body),
             _ => Err(Problem::invalid("no such route")),
         };
-        if let Some(Fault::Dropped) = fault {
-            return Err("connection reset".into());
+        match fault {
+            Some(Fault::Dropped) => return Err("connection reset".into()),
+            Some(Fault::Belied(code)) => {
+                let problem = Problem::new(code, "refused, served all the same");
+                return Ok(Response {
+                    status: code.status(),
+                    body: serde_json::to_vec(&problem).unwrap(),
+                });
+            }
+            _ => {}
         }
         Ok(match answer {
             Ok(body) => Response { status: 200, body },

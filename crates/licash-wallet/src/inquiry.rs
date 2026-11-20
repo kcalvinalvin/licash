@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use licash::{
     inquiry,
-    note::Keyset,
+    note::{Keyset, Note},
     recovery::{voids_note, Evidence},
     spend::ProposalId,
 };
@@ -128,22 +128,64 @@ impl<T: Transport> Wallet<T> {
                         continue;
                     }
                 }
-                if let Evidence::Spend {
+                let Evidence::Spend {
                     signed,
                     notes,
-                    unlock: Some(unlock),
+                    unlock,
                 } = e
-                {
-                    let id = signed.proposal().id();
-                    if spends.insert(*id.as_bytes()) {
+                else {
+                    continue;
+                };
+                let id = signed.proposal().id();
+                if !spends.insert(*id.as_bytes()) {
+                    continue;
+                }
+                match unlock {
+                    Some(unlock) => {
                         let payment = Payment::new(url, signed, notes, unlock);
                         shown.payments.push((id, payment));
                     }
+                    // Perhaps a lock of the wallet's given up on its hub's
+                    // word, which it served all the same.
+                    None => self.revive_lock(&id, notes)?,
                 }
             }
             if spent {
                 shown.spent.push(*y);
             }
+        }
+        Ok(())
+    }
+
+    /// Take the lock `id` on again, if the wallet gave it up uncertified,
+    /// its hub having shown its signed request spending `inputs`: the
+    /// hub's refusal was a lie. Those of its inputs still free are its own
+    /// again, not dropped as spent; a lock its hub certified or settled is
+    /// as it was.
+    fn revive_lock(&self, id: &ProposalId, inputs: &[Note]) -> Result<(), Error> {
+        let ys = (inputs.iter())
+            .map(|n| Ok(n.message().identifier()?.0))
+            .collect::<Result<Vec<_>, Error>>()?;
+        let revived = self.store.write(|tx| {
+            let revived = tx.execute(
+                "UPDATE locks SET abandoned = NULL
+                 WHERE id = ?1 AND abandoned IS NOT NULL AND certificate IS NULL",
+                [id.as_bytes()],
+            )? == 1;
+            if revived {
+                for y in &ys {
+                    tx.execute(
+                        "UPDATE notes SET spent_by = ?1, spent_kind = ?3
+                         WHERE y = ?2 AND spent_by IS NULL AND gone_at IS NULL",
+                        params![id.as_bytes(), y, crate::Spender::Lock.name()],
+                    )?;
+                }
+            }
+            Ok(revived)
+        })?;
+        if revived {
+            let id = hex::encode(id.as_bytes());
+            tracing::warn!(%id, "a lock given up on its hub's refusal, shown made, taken on again");
         }
         Ok(())
     }

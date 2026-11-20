@@ -824,3 +824,37 @@ async fn a_recovery_takes_the_notes_of_a_payment_its_hub_never_signed() {
         send.state
     );
 }
+
+/// A lock its hub refused while serving it is given up, its notes freed,
+/// until its hub shows the wallet's own lock spent them: then it is the
+/// wallet's lock again, followed to its end, its notes not dropped.
+#[tokio::test]
+async fn a_lock_its_hub_refused_but_served_is_taken_on_again_once_shown() {
+    let (net, alice, bob) = parties().await;
+    net.fail(licash_api::LOCK, Fault::Belied(Code::Timing));
+    let refused = alice.lock(HUB, &bob.address(), 10, hash(), None).await;
+    assert!(
+        matches!(&refused, Err(Error::Refused { .. })),
+        "{refused:?}"
+    );
+    let id = alice.locks().unwrap()[0].id.clone();
+    assert!(matches!(
+        &alice.locks().unwrap()[0].state,
+        LockState::Abandoned(_)
+    ));
+    assert_eq!(available(&alice), (64, 0));
+    // Asked of its hub: spent by her own lock, which she takes on again.
+    let checked = alice.check().await.unwrap();
+    assert_eq!(checked.dropped, 0);
+    assert_eq!(alice.locks().unwrap()[0].state, LockState::Requested);
+    assert_eq!(available(&alice).0, 0);
+    let resumed = alice.resume().await.unwrap();
+    assert_eq!(resumed.locks.len(), 1);
+    assert_eq!(resumed.locks[0].state, LockState::Locked);
+    assert_eq!(bob.claim(HUB, &id, &PREIMAGE).await.unwrap().amount, 10);
+    assert_eq!(
+        alice.follow_lock(&id).await.unwrap().state,
+        LockState::Paid(PREIMAGE)
+    );
+    assert_eq!(available(&alice), (52, 0));
+}
