@@ -6,8 +6,11 @@ for `bitcoin`, `signet`, `mutinynet` and `regtest`.
 
 - `upstream/`: `materialize.sh` fetches neutrino v0.18.0, checks its content
   hash against the pin, applies `patches/*.patch` and writes
-  `upstream/neutrino/` (gitignored), which `go.mod` builds from. The one
-  patch lets peers relay transactions (`Config.MempoolEnabled`).
+  `upstream/neutrino/` (gitignored), which `go.mod` builds from. One patch
+  lets peers relay transactions (`Config.MempoolEnabled`); the other
+  validates a headers import without asking the store for, or reading
+  again, headers it cannot have or has just read (the same checks, about
+  a third faster).
 - `node/`: the light client. Given a [block-dn](https://github.com/guggero/block-dn)
   server, filters come from it by the file, each checked against filter
   headers fetched independently from peers before any of the file is

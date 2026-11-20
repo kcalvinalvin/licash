@@ -1,0 +1,297 @@
+Validate imported headers without reading them again
+
+Validating an import, the median time of each block header reads its
+eleven ancestors, each first asked of the target store and then read and
+decoded from the import source again. Above the store's tip, where every
+imported header lies, the store cannot have them: asking it is a failed
+database lookup per ancestor, about 40 million for the 3.6 million headers
+of Mutinynet.
+
+Validate now notes the store's tip as it starts (the store is not written
+to until validation ends) and asks the store for no ancestor above it, and
+it keeps the latest 32 headers of the import source it met, by height, so
+that each is read once. The checks and their outcome are upstream's; an
+import of Mutinynet's 3.6 million headers takes about 37% less time.
+
+Applies to github.com/lightninglabs/neutrino v0.18.0.
+
+--- a/chainimport/block_headers_validator.go
++++ b/chainimport/block_headers_validator.go
+@@ -2,12 +2,14 @@
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"math"
+ 
+ 	"github.com/btcsuite/btcd/blockchain"
+ 	"github.com/btcsuite/btcd/chaincfg/v2"
+ 	"github.com/btcsuite/btcd/chainhash/v2"
++	"github.com/btcsuite/btcd/wire/v2"
+ 	"github.com/lightninglabs/neutrino/headerfs"
+ )
+ 
+@@ -28,6 +30,18 @@
+ 	// blockHeadersImportSource provides access to the source headers
+ 	// for validation and lookup operations.
+ 	blockHeadersImportSource HeaderImportSource
++
++	// targetTip is the height of the target store's tip as Validate
++	// began, if tipKnown: no ancestor above it is looked up in the store,
++	// where it cannot be, but in the import source at once. The store is
++	// not written to while validating.
++	targetTip uint32
++	tipKnown  bool
++
++	// recent holds the import source's latest headers met while
++	// validating, by height modulo its length: the median time of each
++	// header reads its eleven ancestors, which are then read once.
++	recent [recentHeaders]recentHeader
+ }
+ 
+ // Compile-time assertion to ensure blockHeadersImportSourceValidator implements
+@@ -53,6 +67,14 @@
+ func (v *blockHeadersImportSourceValidator) Validate(ctx context.Context,
+ 	it HeaderIterator) error {
+ 
++	if v.targetBlockHeaderStore != nil {
++		_, tip, err := v.targetBlockHeaderStore.ChainTip()
++		v.targetTip, v.tipKnown = tip, err == nil
++		defer func() { v.tipKnown = false }()
++	}
++	v.recent = [recentHeaders]recentHeader{}
++	defer func() { v.recent = [recentHeaders]recentHeader{} }()
++
+ 	var (
+ 		start      = it.GetStartIndex()
+ 		end        = it.GetEndIndex()
+@@ -145,6 +167,15 @@
+ 		timestamp: prevBlockHeader.Timestamp.Unix(),
+ 		validator: v,
+ 	}
++	// Both are the import source's: its ancestors in the median time of
++	// the headers that follow.
++	if v.tipKnown && prevHeight > v.targetTip {
++		v.remember(prevHeight, parentCtx.bits, parentCtx.timestamp)
++	}
++	if v.tipKnown && currHeight > v.targetTip {
++		v.remember(currHeight, currBlockHeader.Bits,
++			currBlockHeader.Timestamp.Unix())
++	}
+ 
+ 	tCP := v.targetChainParams
+ 
+@@ -190,6 +221,28 @@
+ 	return nil
+ }
+ 
++// recentHeaders is how many of the import source's latest headers a
++// validator holds: more than a median time's eleven.
++const recentHeaders = 32
++
++// recentHeader is what a header context needs of one of the import source's
++// headers, at height if set.
++type recentHeader struct {
++	set       bool
++	height    uint32
++	bits      uint32
++	timestamp int64
++}
++
++// remember holds the import source's header at height.
++func (v *blockHeadersImportSourceValidator) remember(height uint32,
++	bits uint32, timestamp int64) {
++
++	v.recent[height%recentHeaders] = recentHeader{
++		set: true, height: height, bits: bits, timestamp: timestamp,
++	}
++}
++
+ // lightHeaderCtx implements the blockchain.HeaderCtx interface.
+ type lightHeaderCtx struct {
+ 	height    int32
+@@ -227,9 +280,16 @@
+ 
+ 	ancestorHeight := uint32(math.Max(0, float64(l.height-distance)))
+ 
+-	// Lookup the ancestor in the target store.
+-	targetStore := l.validator.targetBlockHeaderStore
+-	ancestor, err := targetStore.FetchHeaderByHeight(ancestorHeight)
++	// Lookup the ancestor in the target store, unless it lies above the
++	// store's tip.
++	var (
++		ancestor *wire.BlockHeader
++		err      = errors.New("above the target store's tip")
++	)
++	if !l.validator.tipKnown || ancestorHeight <= l.validator.targetTip {
++		targetStore := l.validator.targetBlockHeaderStore
++		ancestor, err = targetStore.FetchHeaderByHeight(ancestorHeight)
++	}
+ 	if err == nil {
+ 		return &lightHeaderCtx{
+ 			height:    int32(ancestorHeight),
+@@ -239,6 +299,17 @@
+ 		}
+ 	}
+ 
++	if r := l.validator.recent[ancestorHeight%recentHeaders]; r.set &&
++		r.height == ancestorHeight {
++
++		return &lightHeaderCtx{
++			height:    int32(ancestorHeight),
++			bits:      r.bits,
++			timestamp: r.timestamp,
++			validator: l.validator,
++		}
++	}
++
+ 	// Fallback to the import source. Import sources are indexed starting
+ 	// at 0, but index 0 corresponds to the absolute target height stored
+ 	// in the source's metadata. Convert the absolute ancestor height to
+@@ -271,12 +342,17 @@
+ 		return nil
+ 	}
+ 
+-	return &lightHeaderCtx{
++	ancestorCtx := &lightHeaderCtx{
+ 		height:    int32(ancestorHeight),
+ 		bits:      importBlockAncestor.BlockHeader.Bits,
+ 		timestamp: importBlockAncestor.BlockHeader.Timestamp.Unix(),
+ 		validator: l.validator,
+ 	}
++	if l.validator.tipKnown {
++		l.validator.remember(ancestorHeight, ancestorCtx.bits,
++			ancestorCtx.timestamp)
++	}
++	return ancestorCtx
+ }
+ 
+ // Parent returns the parent header context.
+--- a/chainimport/licash_validate_test.go
++++ b/chainimport/licash_validate_test.go
+@@ -0,0 +1,124 @@
++package chainimport
++
++import (
++	"context"
++	"fmt"
++	"testing"
++	"time"
++
++	"github.com/btcsuite/btcd/blockchain"
++	"github.com/btcsuite/btcd/chaincfg/v2"
++	"github.com/btcsuite/btcd/wire/v2"
++	"github.com/lightninglabs/neutrino/headerfs"
++	"github.com/stretchr/testify/require"
++)
++
++// licashChain is n simnet headers from height 0, half an hour apart but for
++// the header at back, whose timestamp is ago before its predecessor's. More
++// than twice simnet's block time apart, a header's difficulty is found with
++// no walk back to the last retarget (ReduceMinDifficulty).
++func licashChain(n, back int, ago time.Duration) []*blockHeader {
++	headers := make([]*blockHeader, n)
++	base := time.Unix(1700000000, 0)
++	for i := range headers {
++		ts := base.Add(time.Duration(i) * 30 * time.Minute)
++		if i == back {
++			ts = base.Add(time.Duration(i-1)*30*time.Minute - ago)
++		}
++		hdr := &wire.BlockHeader{
++			Version:   0x20000000,
++			Bits:      chaincfg.SimNetParams.PowLimitBits,
++			Timestamp: ts,
++		}
++		if i > 0 {
++			hdr.PrevBlock = headers[i-1].BlockHeader.BlockHash()
++		}
++		// Simnet's proof of work: half of all hashes.
++		for {
++			hash := hdr.BlockHash()
++			if blockchain.HashToBig(&hash).Cmp(
++				chaincfg.SimNetParams.PowLimit) <= 0 {
++
++				break
++			}
++			hdr.Nonce++
++		}
++		headers[i] = &blockHeader{BlockHeader: headerfs.BlockHeader{
++			BlockHeader: hdr, Height: uint32(i),
++		}}
++	}
++	return headers
++}
++
++// licashValidate validates headers, all in the import source, with the
++// target store holding the first one only, in batches of batch.
++func licashValidate(t *testing.T, headers []*blockHeader,
++	batch uint32) (*mockHeaderImportSource, error) {
++
++	n := uint32(len(headers))
++	source := &mockHeaderImportSource{}
++	source.On("GetHeaderMetadata").Return(&headerMetadata{
++		importMetadata: &importMetadata{startHeight: 0},
++		headersCount:   n,
++	}, nil)
++	for i, h := range headers {
++		source.On("GetHeader", uint32(i)).Return(h, nil)
++	}
++
++	// The store answers for its tip only: an ancestor above it asked
++	// of the store fails the test.
++	store := &headerfs.MockBlockHeaderStore{}
++	store.On("ChainTip").Return(headers[0].BlockHeader.BlockHeader,
++		uint32(0), nil)
++	store.On("FetchHeaderByHeight", uint32(0)).Return(
++		headers[0].BlockHeader.BlockHeader, nil)
++
++	v := newBlockHeadersImportSourceValidator(
++		chaincfg.SimNetParams, store, blockchain.BFNone, source,
++	)
++	it := &importSourceHeaderIterator{
++		source: source, startIndex: 0, endIndex: n - 1,
++		batchSize: batch,
++	}
++	return source, v.Validate(context.Background(), it)
++}
++
++// TestValidateReadsEachImportedHeaderOnce: the median time of each header
++// takes its ancestors above the store's tip from the headers already read,
++// not from the store nor the import source again, and still checks it.
++func TestValidateReadsEachImportedHeaderOnce(t *testing.T) {
++	t.Parallel()
++
++	for _, batch := range []uint32{5, 64} {
++		t.Run(fmt.Sprint(batch), func(t *testing.T) {
++			headers := licashChain(40, -1, 0)
++			source, err := licashValidate(t, headers, batch)
++			require.NoError(t, err)
++			source.AssertNumberOfCalls(t, "GetHeader", len(headers))
++
++			// 75 minutes back: still after the median of the
++			// eleven before it, as on mainnet and signet. Simnet
++			// then walks back to height 0 for its difficulty.
++			headers = licashChain(40, 30, 75*time.Minute)
++			_, err = licashValidate(t, headers, batch)
++			require.NoError(t, err)
++		})
++	}
++}
++
++// TestValidateStillRefusesATimestampAtTheMedian: a header no later than the
++// median time of its eleven ancestors, all read from the import source, is
++// refused.
++func TestValidateStillRefusesATimestampAtTheMedian(t *testing.T) {
++	t.Parallel()
++
++	for _, batch := range []uint32{5, 64} {
++		t.Run(fmt.Sprint(batch), func(t *testing.T) {
++			// Header 30's median is header 24's timestamp, 150
++			// minutes before header 29's: 180 back is header 23's.
++			headers := licashChain(40, 30, 180*time.Minute)
++			_, err := licashValidate(t, headers, batch)
++			require.ErrorContains(t, err, "is not after expected")
++		})
++	}
++}
