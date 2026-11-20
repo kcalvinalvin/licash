@@ -26,6 +26,18 @@ type Proxy struct {
 	Password string
 }
 
+// lane is p for streams on circuits of their own, apart from its others
+// to the same host: its username followed by "." and lane, which Tor
+// tells apart, as the app's proxy does. p itself without a username.
+func (p *Proxy) lane(lane int) *Proxy {
+	if p == nil || p.Username == "" {
+		return p
+	}
+	q := *p
+	q.Username = fmt.Sprintf("%s.%d", p.Username, lane)
+	return &q
+}
+
 // Dial is a stream to addr, a host:port, through the proxy: the host
 // resolved at the proxy's end.
 func (p *Proxy) Dial(addr string) (net.Conn, error) {

@@ -22,7 +22,7 @@ func TestAClientDownloadingPinnedHeadersIsHandedOverAtOnce(t *testing.T) {
 			return
 		}
 		asked <- r.URL.Path
-		w.Header().Set("Content-Length", "80010") // 10 + 80 * 1000, as pinned
+		w.Header().Set("Content-Length", "80000") // 80 * 1000, as pinned
 		_, _ = w.Write(make([]byte, 1000))
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
@@ -39,7 +39,7 @@ func TestAClientDownloadingPinnedHeadersIsHandedOverAtOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := <-asked; got != "/headers/import/1000" {
+	if got := <-asked; got != "/headers/0" && got != "/filter-headers/0" {
 		t.Fatalf("asked %s", got)
 	}
 	if p := c.Importing(); p < 0 || p > 100 {

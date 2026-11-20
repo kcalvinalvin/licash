@@ -41,6 +41,7 @@ func TestRegtestPinnedHeadersAreImportedThenPeersTakeOver(t *testing.T) {
 	}
 	blocks := coreChain(t)
 	tip := uint32(len(blocks) - 1)
+	smallFiles(t, 50)
 	fake := &fakeCDN{params: &chaincfg.RegressionNetParams, blocks: blocks, perHeaders: 50, perFilters: 20}
 	server := httptest.NewServer(fake)
 	defer server.Close()
@@ -62,9 +63,8 @@ func TestRegtestPinnedHeadersAreImportedThenPeersTakeOver(t *testing.T) {
 			t.Errorf("stop: %v", err)
 		}
 	}()
-	end := fmt.Sprint(pin.Height + 1)
 	asked := fake.taken()
-	if !slices.Contains(asked, "/headers/import/"+end) || !slices.Contains(asked, "/filter-headers/import/"+end) {
+	if !slices.Contains(asked, "/headers/0") || !slices.Contains(asked, "/filter-headers/200") {
 		t.Fatalf("asked %v", asked)
 	}
 	if !strings.Contains(logged.String(), "phase: pinned headers imported") {
@@ -93,6 +93,7 @@ func TestRegtestPinnedHeadersAreImportedThenPeersTakeOver(t *testing.T) {
 func TestRegtestFilesOtherThanThePinnedLeavePeersToSync(t *testing.T) {
 	blocks := coreChain(t)
 	tip := uint32(len(blocks) - 1)
+	smallFiles(t, 50)
 	fake := &fakeCDN{params: &chaincfg.RegressionNetParams, blocks: blocks, perHeaders: 50,
 		perFilters: 20, badHeaders: true}
 	server := httptest.NewServer(fake)
@@ -131,6 +132,7 @@ func TestRegtestFilesOtherThanThePinnedLeavePeersToSync(t *testing.T) {
 func TestRegtestAnImportRefusedByNeutrinoLeavesPeersToSync(t *testing.T) {
 	blocks := coreChain(t)
 	tip := uint32(len(blocks) - 1)
+	smallFiles(t, 50)
 	fake := &fakeCDN{params: &chaincfg.RegressionNetParams, blocks: blocks, perHeaders: 50,
 		perFilters: 20, badHeaders: true}
 	server := httptest.NewServer(fake)

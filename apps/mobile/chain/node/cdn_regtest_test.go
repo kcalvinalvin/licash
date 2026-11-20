@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
@@ -119,6 +120,22 @@ func (f *fakeCDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.importFile(&body, 1, end, func(b coreBlock, _ uint32) []byte {
 			return b.filterHeader[:]
 		})
+	} else if first, ok := number("/headers/"); ok && first%f.perHeaders == 0 && first <= tip {
+		for h := first; h < min(first+f.perHeaders, tip+1); h++ {
+			header := slices.Clone(f.blocks[h].header)
+			if badHeaders && h == 10 {
+				header[4] ^= 1
+			}
+			body.Write(header)
+		}
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body.Bytes()))
+		return
+	} else if first, ok := number("/filter-headers/"); ok && first%f.perHeaders == 0 && first <= tip {
+		for h := first; h < min(first+f.perHeaders, tip+1); h++ {
+			body.Write(f.blocks[h].filterHeader[:])
+		}
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body.Bytes()))
+		return
 	} else if first, ok := number("/filters/"); ok && first%f.perFilters == 0 &&
 		first+f.perFilters <= tip+1 {
 		for h := first; h < first+f.perFilters; h++ {

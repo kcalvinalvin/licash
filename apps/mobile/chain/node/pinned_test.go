@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -12,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -22,11 +22,14 @@ import (
 	"github.com/btcsuite/btcd/wire/v2"
 )
 
-// pinnedServer serves import files of a made-up chain of height blocks,
-// as block-dn does, and what was asked of it.
+// pinnedServer serves files of headers of a made-up chain of height
+// blocks, as block-dn does, and what was asked of it: blocks and filters
+// are the import files the pin vouches for, the files are of their
+// entries, per of them each (importEntries if unset).
 type pinnedServer struct {
 	blocks, filters []byte
 	pin             Pin
+	per             int
 
 	mu    sync.Mutex
 	asked []string
@@ -68,15 +71,47 @@ func (p *pinnedServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if serve != nil && serve(w, r) {
 		return
 	}
-	end := fmt.Sprint(p.pin.Height + 1)
-	switch r.URL.Path {
-	case "/headers/import/" + end:
-		_, _ = w.Write(p.blocks)
-	case "/filter-headers/import/" + end:
-		_, _ = w.Write(p.filters)
-	default:
-		http.NotFound(w, r)
+	per := p.per
+	if per == 0 {
+		per = int(importEntries)
 	}
+	for prefix, kind := range map[string]struct {
+		file  []byte
+		entry int
+	}{"/headers/": {p.blocks, 80}, "/filter-headers/": {p.filters, 32}} {
+		start, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, prefix))
+		if !strings.HasPrefix(r.URL.Path, prefix) || err != nil {
+			continue
+		}
+		entries := kind.file[importMeta:]
+		from := start * kind.entry
+		if start%per != 0 || from >= len(entries) {
+			http.NotFound(w, r)
+			return
+		}
+		file := entries[from:min(from+per*kind.entry, len(entries))]
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(file))
+		return
+	}
+	http.NotFound(w, r)
+}
+
+// smallFiles has the client and the servers of the test at hand split
+// headers into files of entries, 16 if not given: a chain of 40 into 3.
+func smallFiles(t *testing.T, entries ...uint32) {
+	before := importEntries
+	importEntries = 16
+	if len(entries) > 0 {
+		importEntries = entries[0]
+	}
+	t.Cleanup(func() { importEntries = before })
+}
+
+// asked is what of p's files were asked for, each once.
+func (p *pinnedServer) files() []string {
+	asked := p.taken()
+	slices.Sort(asked)
+	return slices.Compact(asked)
 }
 
 func (p *pinnedServer) taken() []string {
@@ -88,11 +123,17 @@ func (p *pinnedServer) taken() []string {
 }
 
 func TestAnEmptyStoreGetsThePinnedFilesChecked(t *testing.T) {
+	smallFiles(t)
 	p, server := newPinnedServer(t, 40)
 	dir := t.TempDir()
 	var told [][2]int64
 	imp := pinnedImport(context.Background(), dir, server.URL+"/", wire.TestNet, &p.pin, nil,
-		func(done, total int64) { told = append(told, [2]int64{done, total}) }, quiet())
+		func(done, total int64) {
+			if len(told) > 0 && done < told[len(told)-1][0] {
+				t.Errorf("progress back from %v to %d", told[len(told)-1], done)
+			}
+			told = append(told, [2]int64{done, total})
+		}, quiet())
 	if imp == nil {
 		t.Fatal("nothing to import")
 	}
@@ -106,42 +147,148 @@ func TestAnEmptyStoreGetsThePinnedFilesChecked(t *testing.T) {
 	if p.pin.Bytes() != all || len(told) == 0 || told[len(told)-1] != [2]int64{all, all} {
 		t.Fatalf("progress %v of %d", told, all)
 	}
-	if asked := p.taken(); !slices.Equal(asked, []string{"/headers/import/41", "/filter-headers/import/41"}) {
+	want := []string{"/filter-headers/0", "/filter-headers/16", "/filter-headers/32",
+		"/headers/0", "/headers/16", "/headers/32"}
+	if asked := p.files(); !slices.Equal(asked, want) {
 		t.Fatalf("asked %v", asked)
 	}
-	// Once tried, never again: the store fills from peers then.
-	if pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
-		t.Fatal("imported twice")
+	// Downloaded and checked, though not imported yet, as a start killed
+	// before importing them leaves them: never asked for again.
+	again := pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet())
+	if again == nil || *again != *imp {
+		t.Fatalf("imported again %v", again)
 	}
 	if asked := p.taken(); len(asked) != 0 {
 		t.Fatalf("asked again %v", asked)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "import")); !os.IsNotExist(err) {
+	entries, _ := os.ReadDir(filepath.Join(dir, "import"))
+	for _, entry := range entries {
+		if name := entry.Name(); name != "state" && name != "block_headers.bin" && name != "filter_headers.bin" {
+			t.Errorf("left behind: %s", name)
+		}
+	}
+}
+
+// A start that downloaded some files before failing leaves them for the
+// next, which asks for the rest only: not marked tried meanwhile.
+func TestAStartResumesWhereTheLastLeftOff(t *testing.T) {
+	smallFiles(t)
+	p, server := newPinnedServer(t, 40)
+	p.serve = func(w http.ResponseWriter, r *http.Request) bool {
+		if strings.HasPrefix(r.URL.Path, "/filter-headers/") {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return true
+		}
+		return false
+	}
+	dir := t.TempDir()
+	if pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
+		t.Fatal("imported")
+	}
+	if _, err := os.Stat(triedMark(dir, &p.pin)); !os.IsNotExist(err) {
+		t.Fatalf("marked tried: %v", err)
+	}
+	if !importDue(dir, server.URL, &p.pin) {
+		t.Fatal("not due")
+	}
+	_ = p.taken()
+	p.serve = nil
+	var told []int64
+	imp := pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil,
+		func(done, _ int64) { told = append(told, done) }, quiet())
+	if imp == nil {
+		t.Fatal("nothing to import")
+	}
+	if asked := p.files(); !slices.Equal(asked, []string{"/filter-headers/0", "/filter-headers/16", "/filter-headers/32"}) {
+		t.Fatalf("asked %v", asked)
+	}
+	// Progress from the files kept on.
+	if len(told) == 0 || told[0] <= int64(len(p.blocks)-importMeta) {
+		t.Fatalf("progress %v", told)
+	}
+	got, err := os.ReadFile(imp.BlockHeadersSource)
+	if err != nil || !bytes.Equal(got, p.blocks) {
+		t.Fatalf("block headers: %v", err)
+	}
+}
+
+// A file a lane stalls on is asked for on another once none is left to
+// ask for, the first whole kept: never waited on for importStall.
+func TestAFileStalledOnIsAskedForOnAnotherLane(t *testing.T) {
+	smallFiles(t)
+	p, server := newPinnedServer(t, 40)
+	var stalled sync.Once
+	p.serve = func(w http.ResponseWriter, r *http.Request) bool {
+		first := false
+		if r.URL.Path == "/headers/16" {
+			stalled.Do(func() { first = true })
+		}
+		if first {
+			w.Header().Set("Content-Length", "1280")
+			_, _ = w.Write(make([]byte, 100))
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		}
+		return first
+	}
+	began := time.Now()
+	imp := pinnedImport(context.Background(), t.TempDir(), server.URL, wire.TestNet, &p.pin, nil, nil, quiet())
+	if imp == nil {
+		t.Fatal("nothing to import")
+	}
+	if took := time.Since(began); took > importStall/2 {
+		t.Fatalf("took %v", took)
+	}
+	if asked := p.taken(); len(slices.DeleteFunc(asked, func(path string) bool { return path != "/headers/16" })) != 2 {
+		t.Fatalf("asked for the stalled file %d times", len(asked))
+	}
+	got, err := os.ReadFile(imp.BlockHeadersSource)
+	if err != nil || !bytes.Equal(got, p.blocks) {
+		t.Fatalf("block headers: %v", err)
+	}
+}
+
+// What an older release, or another pin, left in the import directory is
+// deleted unasked, but for its tried mark: peers then.
+func TestFilesLeftBehindAreNeverTrusted(t *testing.T) {
+	smallFiles(t)
+	p, server := newPinnedServer(t, 40)
+	dir := t.TempDir()
+	files := filepath.Join(dir, "import")
+	_ = os.MkdirAll(files, 0o700)
+	other := p.pin
+	other.Headers[0] ^= 1
+	_ = writeState(files, stateOf(&other))
+	_ = os.WriteFile(filepath.Join(files, "headers-0"), make([]byte, 16*80), 0o600)
+	_ = os.WriteFile(filepath.Join(files, "block_headers.bin.part"), make([]byte, 100), 0o600)
+	imp := pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet())
+	if imp == nil {
+		t.Fatal("nothing to import")
+	}
+	if asked := p.files(); len(asked) != 6 {
+		t.Fatalf("asked %v", asked)
+	}
+	got, err := os.ReadFile(imp.BlockHeadersSource)
+	if err != nil || !bytes.Equal(got, p.blocks) {
+		t.Fatalf("block headers: %v", err)
+	}
+	// Marked tried by an older release, before downloading: peers.
+	legacy := t.TempDir()
+	_ = os.WriteFile(triedMark(legacy, &p.pin), nil, 0o600)
+	_ = os.MkdirAll(filepath.Join(legacy, "import"), 0o700)
+	if importDue(legacy, server.URL, &p.pin) ||
+		pinnedImport(context.Background(), legacy, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
+		t.Fatal("imported though tried")
+	}
+	if asked := p.taken(); len(asked) != 0 {
+		t.Fatalf("asked %v", asked)
+	}
+	if _, err := os.Stat(filepath.Join(legacy, "import")); !os.IsNotExist(err) {
 		t.Fatalf("the files left behind: %v", err)
 	}
 }
 
 // Genesis alone, as neutrino writes it on a first start, is empty too.
-// A server naming another network's magic in its files' headers, as
-// Mutinynet's names signet's, serves the node's files under its own.
-func TestAServerNamingAnotherMagicServesTheNodesFiles(t *testing.T) {
-	p, server := newPinnedServer(t, 40)
-	blocks, filters := slices.Clone(p.blocks), slices.Clone(p.filters)
-	signet := binary.LittleEndian.AppendUint32(nil, uint32(wire.SigNet))
-	copy(p.blocks, signet)
-	copy(p.filters, signet)
-	imp := pinnedImport(context.Background(), t.TempDir(), server.URL, wire.TestNet, &p.pin, nil, nil, quiet())
-	if imp == nil {
-		t.Fatal("nothing to import")
-	}
-	for source, want := range map[string][]byte{imp.BlockHeadersSource: blocks, imp.FilterHeadersSource: filters} {
-		got, err := os.ReadFile(source)
-		if err != nil || !bytes.Equal(got, want) {
-			t.Fatalf("%s: %v", source, err)
-		}
-	}
-}
-
 func TestAStoreOfGenesisAloneIsEmpty(t *testing.T) {
 	dir := t.TempDir()
 	if !emptyStore(dir) {
@@ -198,24 +345,23 @@ func TestNoPinOrNoServerNeverAsks(t *testing.T) {
 // Whatever differs from the pin is refused, nothing of it kept, and the
 // next start does not try again.
 func TestFilesOtherThanThePinnedAreRefused(t *testing.T) {
+	smallFiles(t)
 	cases := map[string]func(p *pinnedServer){
 		"a byte changed": func(p *pinnedServer) { p.blocks[500] ^= 1 },
 		"filter headers changed": func(p *pinnedServer) {
 			p.filters[len(p.filters)-1] ^= 1
 		},
 		"shorter": func(p *pinnedServer) { p.blocks = p.blocks[:len(p.blocks)-80] },
-		"longer": func(p *pinnedServer) {
-			p.filters = append(p.filters, make([]byte, 32)...)
-		},
-		"another first height": func(p *pinnedServer) { p.blocks[6] ^= 1 },
-		"pinned elsewhere":     func(p *pinnedServer) { p.pin.Block[0] ^= 1 },
+		// Files of more entries than the client asks for each.
+		"longer":           func(p *pinnedServer) { p.per = 17 },
+		"pinned elsewhere": func(p *pinnedServer) { p.pin.Block[0] ^= 1 },
 		"another filter header pinned": func(p *pinnedServer) {
 			p.pin.FilterHeader[0] ^= 1
 		},
 		"not served": func(p *pinnedServer) {
 			p.serve = func(w http.ResponseWriter, r *http.Request) bool {
 				if strings.HasPrefix(r.URL.Path, "/filter-headers/") {
-					http.Error(w, "gone", http.StatusServiceUnavailable)
+					http.NotFound(w, r)
 					return true
 				}
 				return false
@@ -273,7 +419,7 @@ func TestADownloadGivenUpOnStops(t *testing.T) {
 }
 
 // Given up on by the caller, the download is tried again on the next start;
-// cut off by the server, it is not.
+// failing, on importStarts starts in all, each counted as it begins.
 func TestOnlyADownloadGivenUpOnIsTriedAgain(t *testing.T) {
 	p, server := newPinnedServer(t, 40)
 	dir := t.TempDir()
@@ -300,10 +446,24 @@ func TestOnlyADownloadGivenUpOnIsTriedAgain(t *testing.T) {
 		http.Error(w, "gone", http.StatusServiceUnavailable)
 		return true
 	}
-	if pinnedImport(context.Background(), filepath.Join(dir, "peer-headers-v1"), server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
+	store := filepath.Join(dir, "peer-headers-v1")
+	starts := 1
+	for ; ImportDue(cfg); starts++ {
+		if pinnedImport(context.Background(), store, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
+			t.Fatal("imported")
+		}
+	}
+	if starts != importStarts {
+		t.Fatalf("tried on %d starts", starts)
+	}
+	_ = p.taken()
+	if pinnedImport(context.Background(), store, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
 		t.Fatal("imported")
 	}
-	if ImportDue(cfg) {
-		t.Fatal("due again after failing")
+	if asked := p.taken(); len(asked) != 0 {
+		t.Fatalf("asked %v", asked)
+	}
+	if _, err := os.Stat(triedMark(store, &p.pin)); err != nil {
+		t.Fatalf("not marked tried: %v", err)
 	}
 }

@@ -115,11 +115,7 @@ func StartContext(ctx context.Context, cfg Config) (*Node, error) {
 	}
 	imp := pinnedImport(ctx, dir, cfg.CDN, cfg.Params.Net, cfg.Pin, cfg.Proxy, cfg.Progress, log)
 	if err := ctx.Err(); err != nil {
-		// Given up on rather than failed: tried again on the next start.
-		_ = os.RemoveAll(filepath.Join(dir, "import"))
-		if cfg.Pin != nil {
-			_ = os.Remove(triedMark(dir, cfg.Pin))
-		}
+		// Given up on rather than failed: resumed on the next start.
 		return nil, err
 	}
 	n, err := start(cfg, imp, log, began)
@@ -127,6 +123,7 @@ func StartContext(ctx context.Context, cfg Config) (*Node, error) {
 		// Checked against the pin, the files should never fail to import:
 		// peers serve if they do.
 		log.Error("pinned headers not imported, syncing from peers", "err", err)
+		_ = os.WriteFile(triedMark(dir, cfg.Pin), nil, 0o600)
 		n, err = start(cfg, nil, log, began)
 	} else if err == nil && imp != nil {
 		log.Info("phase: pinned headers imported", "height", cfg.Pin.Height,
