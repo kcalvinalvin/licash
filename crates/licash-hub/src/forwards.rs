@@ -208,13 +208,15 @@ impl Hub {
     /// the hub ([`LOCAL`]) left nothing.
     pub fn forwarded_since(&self, since: i64) -> Result<u64, Error> {
         self.store.read(|c| {
-            let sum: i64 = c.query_row(
-                "SELECT coalesce(sum(amount), 0) FROM forwards
+            // Summed here, not by SQL: its sum of values near `i64::MAX`
+            // overflows, an error where the amount only saturates.
+            let mut stmt = c.prepare(
+                "SELECT amount FROM forwards
                  WHERE state IN ('pending', 'paid') AND node != ?1 AND created_at >= ?2",
-                params![LOCAL, since],
-                |r| r.get(0),
             )?;
-            Ok(sum as u64)
+            let rows = stmt.query_map(params![LOCAL, since], |r| r.get::<_, i64>(0))?;
+            let amounts = rows.collect::<Result<Vec<_>, _>>()?;
+            Ok(total(amounts))
         })
     }
 
@@ -390,4 +392,26 @@ fn forward(r: &Row<'_>) -> rusqlite::Result<Forward> {
         state,
         created_at: r.get(9)?,
     })
+}
+
+/// The sum of `amounts`, saturating at `u64::MAX`; a negative one counts
+/// for nothing.
+fn total(amounts: impl IntoIterator<Item = i64>) -> u64 {
+    (amounts.into_iter())
+        .map(|a| u64::try_from(a).unwrap_or(0))
+        .fold(0, u64::saturating_add)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::total;
+
+    #[test]
+    fn amounts_add_up_past_i64_and_saturate_at_u64() {
+        assert_eq!(total([]), 0);
+        assert_eq!(total([4, 4]), 8);
+        assert_eq!(total([i64::MAX, i64::MAX]), u64::MAX - 1);
+        assert_eq!(total([i64::MAX, i64::MAX, 2]), u64::MAX);
+        assert_eq!(total([-5, 3]), 3);
+    }
 }
