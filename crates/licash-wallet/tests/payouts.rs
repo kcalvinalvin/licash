@@ -1196,6 +1196,7 @@ async fn notes_past_the_threshold_are_withdrawn_to_cold_storage_never_to_an_addr
     );
     let claims = eco.client.payout_claims().unwrap();
     eco.net.confirm(A, claims.clone());
+    let claimed = eco.view.height();
     assert_eq!(eco.follow(&payout).await.unwrap().state, PayoutState::Done);
     eco.desk.settle(&claims[0], coin).await;
     let cold = eco
@@ -1216,6 +1217,13 @@ async fn notes_past_the_threshold_are_withdrawn_to_cold_storage_never_to_an_addr
     assert_eq!(again, cold);
     // Below the threshold now: nothing due.
     assert_eq!(eco.client.cold_due().unwrap(), None);
+    // Its block replaced while the wallet is blocks behind: looked in
+    // again all the same, the coin gone.
+    eco.net.reorg(A, claimed - 1);
+    eco.mine(12);
+    let gone = eco.client.scan_cold(&eco.view, 1).await.unwrap().unwrap();
+    assert_eq!((gone.balance, gone.coins), (0, 0));
+    assert_eq!(gone.scanned, Some(cold.scanned.unwrap() + 1));
     eco.client.clear_cold().unwrap();
     assert_eq!(eco.client.cold().unwrap(), None);
 }

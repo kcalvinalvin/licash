@@ -394,10 +394,10 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Look in the blocks of `chain` for what cold storage's addresses hold,
-    /// from the block after the last looked in (the last `AGAIN` again,
-    /// as a reorganization may have changed them), at most `max` blocks,
-    /// if the chain has new ones: where it stands then. None if not
-    /// configured.
+    /// from the block after the last looked in, at most `max` blocks, and
+    /// the last `AGAIN` looked in again, as a reorganization may have
+    /// changed them, if the chain has new ones: where it stands then. None
+    /// if not configured.
     pub async fn scan_cold(&self, chain: &impl Blocks, max: u32) -> Result<Option<Cold>, Error> {
         let Some(config) = self.cold_config()? else {
             return Ok(None);
@@ -407,15 +407,12 @@ impl<T: Transport> Wallet<T> {
         if config.scanned.is_some_and(|s| s >= tip) {
             return self.cold();
         }
-        let from = match config.scanned {
-            Some(scanned) => (scanned + 1).min(tip.saturating_sub(AGAIN - 1)),
-            None => config.birthday,
-        }
-        .max(config.birthday);
-        if from > tip {
+        let next = config.scanned.map_or(config.birthday, |s| s + 1);
+        let from = next.saturating_sub(AGAIN).max(config.birthday);
+        if next > tip {
             return self.cold();
         }
-        let end = tip.min(from.saturating_add(max.max(1) - 1));
+        let end = tip.min(next.saturating_add(max.max(1) - 1));
         // Looked in again: as if never seen.
         self.store.write(|tx| {
             tx.execute("DELETE FROM cold_coins WHERE height >= ?1", [from])?;
