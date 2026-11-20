@@ -166,6 +166,8 @@ pub struct Openings {
     /// Whether more contracts are open than its prover can contest the
     /// exits of at once, as last told.
     over_capacity: std::sync::atomic::AtomicBool,
+    /// The error each contract last failed to play with, told once.
+    failing: Mutex<HashMap<[u8; 32], String>>,
     /// Whether [`MAX_UNFUNDED`] was told reached, not since left.
     unfunded_full: std::sync::atomic::AtomicBool,
     /// The most contracts live at once: [`MAX_LIVE`] unless set.
@@ -417,6 +419,7 @@ impl Openings {
             withheld: Mutex::default(),
             proof_scale: std::sync::OnceLock::new(),
             over_capacity: Default::default(),
+            failing: Mutex::default(),
             unfunded_full: Default::default(),
             max_live: std::sync::atomic::AtomicUsize::new(MAX_LIVE),
             load_told: Default::default(),
@@ -823,6 +826,19 @@ impl Openings {
             .push(message);
     }
 
+    /// Whether contract `id` failing to play with `error` is news: not if
+    /// it failed with it last, which was told.
+    fn newly_failing(&self, id: &[u8; 32], error: &str) -> bool {
+        let mut failing = self.failing.lock().unwrap_or_else(PoisonError::into_inner);
+        failing.insert(*id, error.to_owned()).as_deref() != Some(error)
+    }
+
+    /// Contract `id` played a round: a failure after is news.
+    fn played(&self, id: &[u8; 32]) {
+        let mut failing = self.failing.lock().unwrap_or_else(PoisonError::into_inner);
+        failing.remove(id);
+    }
+
     /// Play each signed opening's exit, if any, one step
     /// (`dispute`). Each opening's error is reported independently.
     pub async fn answer_requests(&self) -> Result<ResponseRound> {
@@ -830,10 +846,14 @@ impl Openings {
         let ids = self.store().signed_ids()?;
         self.keep_loaded(&ids);
         let round_open = ids.len();
+        // Of those no longer played, nothing more to tell.
+        (self.failing.lock().unwrap_or_else(PoisonError::into_inner))
+            .retain(|id, _| ids.contains(id));
         let mut round = ResponseRound::default();
         for id in ids {
             match self.play(&id).await {
                 Ok(Played::Posted(what)) => {
+                    self.played(&id);
                     match what {
                         "sweep" => round.swept += 1,
                         "default" => round.closed += 1,
@@ -841,10 +861,18 @@ impl Openings {
                     }
                     tracing::info!(id = %crate::hex_id(&id), what, "contract exit played");
                 }
-                Ok(Played::Idle) => {}
+                Ok(Played::Idle) => self.played(&id),
                 Err(e) => {
                     round.failed += 1;
-                    tracing::error!(id = %crate::hex_id(&id), "playing a contract exit: {e:#}")
+                    let e = format!("{e:#}");
+                    match self.newly_failing(&id, &e) {
+                        true => {
+                            tracing::error!(id = %crate::hex_id(&id), "playing a contract exit: {e}")
+                        }
+                        false => {
+                            tracing::debug!(id = %crate::hex_id(&id), "playing a contract exit: {e}")
+                        }
+                    }
                 }
             }
         }
@@ -1205,6 +1233,7 @@ mod tests {
             withheld: Mutex::default(),
             proof_scale: std::sync::OnceLock::new(),
             over_capacity: Default::default(),
+            failing: Mutex::default(),
             unfunded_full: Default::default(),
             max_live: std::sync::atomic::AtomicUsize::new(MAX_LIVE),
             load_told: Default::default(),
@@ -1240,6 +1269,24 @@ mod tests {
         // Stepped then, not 202: refused here, of no chain to ask.
         let answer = instance.await.unwrap();
         assert!(answer.is_err(), "{answer:?}");
+    }
+
+    /// A contract failing each round the same way is told of once, not
+    /// each round: again once its error changes, or once it fails anew
+    /// after a round played.
+    #[test]
+    fn a_contract_failing_alike_each_round_is_told_of_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let openings = test_openings(dir.path());
+        let (a, b) = ([1; 32], [2; 32]);
+        assert!(openings.newly_failing(&a, "no node"));
+        assert!(!openings.newly_failing(&a, "no node"));
+        assert!(openings.newly_failing(&b, "no node"));
+        assert!(openings.newly_failing(&a, "no proof"));
+        assert!(!openings.newly_failing(&a, "no proof"));
+        openings.played(&a);
+        assert!(openings.newly_failing(&a, "no proof"));
+        assert!(!openings.newly_failing(&b, "no node"));
     }
 
     #[test]
