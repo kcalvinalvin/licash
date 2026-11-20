@@ -1451,6 +1451,47 @@ mod tests {
         );
     }
 
+    /// An opening refused before it was stored gives up the deposit bound
+    /// to it; not one stored, nor one another task steps.
+    #[test]
+    fn a_refused_opening_unbinds_its_deposit_only_if_never_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let openings = test_openings(dir.path());
+        let released = Arc::new(Mutex::new(Vec::new()));
+        let told = released.clone();
+        openings.close_with(
+            Arc::new(|_: &[u8], _, _, _, _| Ok(())),
+            Arc::new(move |id: &[u8; 32]| told.lock().unwrap().push(*id)),
+        );
+        let (stored, busy, refused) = ([1; 32], [2; 32], [3; 32]);
+        openings
+            .store()
+            .insert(&stored, 0, true, &deposit(0), &[0; 32], funded())
+            .unwrap();
+        openings.busy().insert(busy);
+        for id in [stored, busy, refused] {
+            openings.unbind(&id);
+        }
+        assert_eq!(*released.lock().unwrap(), vec![refused]);
+    }
+
+    /// The openings under way, or signed and not funded, are counted at
+    /// the store: one started meanwhile counts against the next.
+    #[test]
+    fn openings_are_admitted_only_below_both_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let openings = test_openings(dir.path());
+        for n in 0..MAX_UNDER_WAY as u8 {
+            let store = openings.store();
+            assert!(run::admits(&store).is_ok());
+            store
+                .insert(&[n; 32], 0, true, &deposit(n.into()), &[0; 32], funded())
+                .unwrap();
+        }
+        let why = run::admits(&openings.store()).unwrap_err().reason;
+        assert!(why.contains("under way"), "{why}");
+    }
+
     #[test]
     fn abandonment_rechecks_activity_and_returns_only_the_coins_actually_abandoned() {
         let dir = tempfile::tempdir().unwrap();

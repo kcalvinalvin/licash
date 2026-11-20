@@ -11,6 +11,7 @@ use licash_contract::wire::{self, Envelope, Kind, Writer};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
+use super::store::Store;
 use super::{prover, terms, Answer, Openings, Refused, MAX_UNDER_WAY, MAX_UNFUNDED, WAIT};
 use crate::{Frame, Opening};
 
@@ -62,16 +63,7 @@ impl Openings {
         // whichever it started at.
         let steps = match new {
             true => {
-                let store = self.store();
-                if store.under_way().map_err(Refused::unavailable)? >= MAX_UNDER_WAY {
-                    return Err(Refused::unavailable("too many openings under way: later"));
-                }
-                if store.unfunded_count().map_err(Refused::unavailable)? >= MAX_UNFUNDED {
-                    return Err(Refused::unavailable(
-                        "too many openings signed and not funded: later",
-                    ));
-                }
-                drop(store);
+                admits(&self.store())?;
                 let step = self.step_now()?;
                 step..=step
             }
@@ -115,7 +107,32 @@ impl Openings {
             quote: Box::new(opening.quote),
             deposit: open.deposit,
         };
-        self.take(envelope.id, opening.open, start, false).await
+        let answer = self.take(envelope.id, opening.open, start, false).await;
+        if answer.is_err() {
+            self.unbind(&envelope.id);
+        }
+        answer
+    }
+
+    /// Give up the deposit bound to opening `id`, refused before it was
+    /// stored: no opening is given up for it later. Not while another
+    /// task steps it, as [`Self::abandon_idle`].
+    pub(super) fn unbind(&self, id: &[u8; 32]) {
+        let busy = self.busy();
+        if busy.contains(id) {
+            return;
+        }
+        match self.store().row(id) {
+            Ok(None) => {
+                if let Some((_, release)) = self.closer.get() {
+                    release(id);
+                }
+            }
+            Ok(Some(_)) => {}
+            Err(e) => {
+                tracing::warn!(id = %crate::hex_id(id), "a refused opening's deposit kept: {e:#}")
+            }
+        }
     }
 
     /// The holder's next message of opening `id`. An instance, large and
@@ -239,9 +256,7 @@ impl Openings {
             }
             (None, Start::Stored) => return Err(not_found()),
             (None, Start::New { quote, deposit }) => {
-                if self.store().under_way().map_err(Refused::unavailable)? >= MAX_UNDER_WAY {
-                    return Err(Refused::unavailable("too many openings under way: later"));
-                }
+                admits(&self.store())?;
                 self.step_now()?;
                 let bounds = self.timing().bounds(&quote);
                 let payout = self
@@ -252,10 +267,15 @@ impl Openings {
                 let (hub, out) = stepped(&self.heavy, hub, Input::Message(message), ctx).await?;
                 let out = self.keep(&id, out)?;
                 let state = hub.to_bytes();
-                let inserted = self
-                    .store()
-                    .insert(&id, phase(&hub), ctx.trust.mock, &deposit, &last, &state)
-                    .map_err(Refused::unavailable)?;
+                // Counted again as stored, in one hold of the store: others
+                // started meanwhile.
+                let inserted = {
+                    let store = self.store();
+                    admits(&store)?;
+                    store
+                        .insert(&id, phase(&hub), ctx.trust.mock, &deposit, &last, &state)
+                        .map_err(Refused::unavailable)?
+                };
                 if !inserted {
                     return Err(Refused::bad("her deposit is another opening's"));
                 }
@@ -465,6 +485,20 @@ async fn heavy<T: Send + 'static>(
         work()
     });
     done.await.map_err(Refused::unavailable)
+}
+
+/// Refused if `store` holds as many openings under way as the hub takes,
+/// or signed and not funded.
+pub(super) fn admits(store: &Store) -> Result<(), Refused> {
+    if store.under_way().map_err(Refused::unavailable)? >= MAX_UNDER_WAY {
+        return Err(Refused::unavailable("too many openings under way: later"));
+    }
+    if store.unfunded_count().map_err(Refused::unavailable)? >= MAX_UNFUNDED {
+        return Err(Refused::unavailable(
+            "too many openings signed and not funded: later",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
