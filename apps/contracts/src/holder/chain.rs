@@ -109,6 +109,7 @@ pub async fn fate(
         .map(|o| o.script_pubkey.as_bytes())
         .collect();
     let tip = chain.height().await.map_err(|e| anyhow!(e))?;
+    let tip_hash = chain.hash(tip).await.map_err(|e| anyhow!(e))?;
     let mut spent: HashMap<OutPoint, (Txid, u32)> = HashMap::new();
     let mut found = None;
     for height in since..=tip {
@@ -140,11 +141,25 @@ pub async fn fate(
             }
         }
     }
+    // Block by block, a reorganization meanwhile mixes the chains: a fate
+    // of neither. Looked at again next time.
+    still_best(chain, tip, tip_hash).await?;
     let fate = match holder.fate(|o| Ok::<_, std::convert::Infallible>(spent.get(&o).copied())) {
         Ok(fate) => fate,
         Err(e) => match e {},
     };
     Ok(fate.map(|fate| (fate, found.filter(|_| fate == Fate::Live))))
+}
+
+/// Refused unless the block of `hash` at `height` is still the best
+/// chain's: what was read of it since is of one chain.
+async fn still_best(chain: &impl Chain, height: u32, hash: BlockHash) -> Result<()> {
+    let now = chain.hash(height).await.map_err(|e| anyhow!(e))?;
+    anyhow::ensure!(
+        now == hash,
+        "the chain was reorganized while its blocks were read: block {height} is {now}, was {hash}"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -175,6 +190,46 @@ mod tests {
             header: bitcoin::constants::genesis_block(network).header,
             txdata,
         }
+    }
+
+    /// A chain whose block at every height is `now`, changed at will.
+    struct Drifting(std::sync::Mutex<BlockHash>);
+
+    impl Blocks for Drifting {
+        async fn height(&self) -> Result<u32, String> {
+            Ok(7)
+        }
+        async fn hash(&self, _: u32) -> Result<BlockHash, String> {
+            Ok(*self.0.lock().unwrap())
+        }
+        async fn filter(&self, _: &BlockHash) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+        async fn block(&self, _: &BlockHash) -> Result<Block, String> {
+            Err("not asked".into())
+        }
+    }
+
+    impl Chain for Drifting {
+        async fn checkpoint(&self, _: u32) -> Result<Checkpoint, String> {
+            Err("not asked".into())
+        }
+        async fn broadcast(&self, _: &Transaction) -> Result<(), String> {
+            Err("not asked".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chain_reorganized_while_it_was_read_is_refused() {
+        let (a, b) = (
+            BlockHash::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([1; 32])),
+            BlockHash::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([2; 32])),
+        );
+        let chain = Drifting(std::sync::Mutex::new(a));
+        still_best(&chain, 7, a).await.unwrap();
+        *chain.0.lock().unwrap() = b;
+        let e = still_best(&chain, 7, a).await.unwrap_err().to_string();
+        assert!(e.contains("reorganized"), "{e}");
     }
 
     #[test]
