@@ -579,7 +579,8 @@ async fn restored(phone: &Phone, hub: &str, silent: &str) -> anyhow::Result<()> 
     for few in words.chunks(6) {
         phone.type_text(&format!("{} ", few.join(" "))).await?;
     }
-    phone.hide_keyboard().await?;
+    // The keyboard left as it is: the words are in a sheet, which Escape
+    // closes, back to the first screen, unless a keyboard shown takes it.
     phone.wait("24 of 24", 10).await?;
     phone.tap_id("restore").await?;
     // Its keys only: no hub until one is added again.
