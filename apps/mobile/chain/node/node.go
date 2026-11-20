@@ -113,7 +113,7 @@ func StartContext(ctx context.Context, cfg Config) (*Node, error) {
 			log.Warn("block-dn unusable, syncing from peers", "err", err)
 		}
 	}
-	imp := pinnedImport(ctx, dir, cfg.CDN, cfg.Pin, cfg.Proxy, cfg.Progress, log)
+	imp := pinnedImport(ctx, dir, cfg.CDN, cfg.Params.Net, cfg.Pin, cfg.Proxy, cfg.Progress, log)
 	if err := ctx.Err(); err != nil {
 		// Given up on rather than failed: tried again on the next start.
 		_ = os.RemoveAll(filepath.Join(dir, "import"))

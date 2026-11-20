@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -90,7 +91,7 @@ func TestAnEmptyStoreGetsThePinnedFilesChecked(t *testing.T) {
 	p, server := newPinnedServer(t, 40)
 	dir := t.TempDir()
 	var told [][2]int64
-	imp := pinnedImport(context.Background(), dir, server.URL+"/", &p.pin, nil,
+	imp := pinnedImport(context.Background(), dir, server.URL+"/", wire.TestNet, &p.pin, nil,
 		func(done, total int64) { told = append(told, [2]int64{done, total}) }, quiet())
 	if imp == nil {
 		t.Fatal("nothing to import")
@@ -109,7 +110,7 @@ func TestAnEmptyStoreGetsThePinnedFilesChecked(t *testing.T) {
 		t.Fatalf("asked %v", asked)
 	}
 	// Once tried, never again: the store fills from peers then.
-	if pinnedImport(context.Background(), dir, server.URL, &p.pin, nil, nil, quiet()) != nil {
+	if pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
 		t.Fatal("imported twice")
 	}
 	if asked := p.taken(); len(asked) != 0 {
@@ -121,6 +122,26 @@ func TestAnEmptyStoreGetsThePinnedFilesChecked(t *testing.T) {
 }
 
 // Genesis alone, as neutrino writes it on a first start, is empty too.
+// A server naming another network's magic in its files' headers, as
+// Mutinynet's names signet's, serves the node's files under its own.
+func TestAServerNamingAnotherMagicServesTheNodesFiles(t *testing.T) {
+	p, server := newPinnedServer(t, 40)
+	blocks, filters := slices.Clone(p.blocks), slices.Clone(p.filters)
+	signet := binary.LittleEndian.AppendUint32(nil, uint32(wire.SigNet))
+	copy(p.blocks, signet)
+	copy(p.filters, signet)
+	imp := pinnedImport(context.Background(), t.TempDir(), server.URL, wire.TestNet, &p.pin, nil, nil, quiet())
+	if imp == nil {
+		t.Fatal("nothing to import")
+	}
+	for source, want := range map[string][]byte{imp.BlockHeadersSource: blocks, imp.FilterHeadersSource: filters} {
+		got, err := os.ReadFile(source)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("%s: %v", source, err)
+		}
+	}
+}
+
 func TestAStoreOfGenesisAloneIsEmpty(t *testing.T) {
 	dir := t.TempDir()
 	if !emptyStore(dir) {
@@ -152,7 +173,7 @@ func TestAStoreHoldingHeadersNeverAsks(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "block_headers.bin"), make([]byte, 80*7), 0o600)
 	_ = os.WriteFile(filepath.Join(dir, "reg_filter_headers.bin"), make([]byte, 32), 0o600)
-	if pinnedImport(context.Background(), dir, server.URL, &p.pin, nil, nil, quiet()) != nil {
+	if pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
 		t.Fatal("imported over headers")
 	}
 	if asked := p.taken(); len(asked) != 0 {
@@ -165,8 +186,8 @@ func TestAStoreHoldingHeadersNeverAsks(t *testing.T) {
 
 func TestNoPinOrNoServerNeverAsks(t *testing.T) {
 	p, server := newPinnedServer(t, 40)
-	if pinnedImport(context.Background(), t.TempDir(), server.URL, nil, nil, nil, quiet()) != nil ||
-		pinnedImport(context.Background(), t.TempDir(), "", &p.pin, nil, nil, quiet()) != nil {
+	if pinnedImport(context.Background(), t.TempDir(), server.URL, wire.TestNet, nil, nil, nil, quiet()) != nil ||
+		pinnedImport(context.Background(), t.TempDir(), "", wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
 		t.Fatal("imported")
 	}
 	if asked := p.taken(); len(asked) != 0 {
@@ -186,7 +207,8 @@ func TestFilesOtherThanThePinnedAreRefused(t *testing.T) {
 		"longer": func(p *pinnedServer) {
 			p.filters = append(p.filters, make([]byte, 32)...)
 		},
-		"pinned elsewhere": func(p *pinnedServer) { p.pin.Block[0] ^= 1 },
+		"another first height": func(p *pinnedServer) { p.blocks[6] ^= 1 },
+		"pinned elsewhere":     func(p *pinnedServer) { p.pin.Block[0] ^= 1 },
 		"another filter header pinned": func(p *pinnedServer) {
 			p.pin.FilterHeader[0] ^= 1
 		},
@@ -207,7 +229,7 @@ func TestFilesOtherThanThePinnedAreRefused(t *testing.T) {
 			dir := t.TempDir()
 			var logged bytes.Buffer
 			log := slog.New(slog.NewTextHandler(&logged, nil))
-			if pinnedImport(context.Background(), dir, server.URL, &p.pin, nil, nil, log) != nil {
+			if pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil, nil, log) != nil {
 				t.Fatal("imported")
 			}
 			if _, err := os.Stat(filepath.Join(dir, "import")); !os.IsNotExist(err) {
@@ -238,7 +260,7 @@ func TestADownloadGivenUpOnStops(t *testing.T) {
 	dir := t.TempDir()
 	done := make(chan bool)
 	go func() {
-		done <- pinnedImport(ctx, dir, server.URL, &p.pin, nil, nil, quiet()) == nil
+		done <- pinnedImport(ctx, dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) == nil
 	}()
 	select {
 	case refused := <-done:
@@ -278,7 +300,7 @@ func TestOnlyADownloadGivenUpOnIsTriedAgain(t *testing.T) {
 		http.Error(w, "gone", http.StatusServiceUnavailable)
 		return true
 	}
-	if pinnedImport(context.Background(), filepath.Join(dir, "peer-headers-v1"), server.URL, &p.pin, nil, nil, quiet()) != nil {
+	if pinnedImport(context.Background(), filepath.Join(dir, "peer-headers-v1"), server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
 		t.Fatal("imported")
 	}
 	if ImportDue(cfg) {

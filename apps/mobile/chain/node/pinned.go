@@ -19,6 +19,11 @@ package node
 //
 // Any failure falls back to peers, logged. The files are deleted once
 // imported or refused.
+//
+// A file's first bytes name its network's magic, as its server's Bitcoin
+// Core knows it: Mutinynet's server runs as signet, naming signet's. Each
+// file is written and checked with the node's own (cmd/pin's), the rest
+// of its header as served.
 
 import (
 	"bytes"
@@ -70,12 +75,12 @@ func (p *Pin) size(entry int64) int64 { return importMeta + entry*(int64(p.Heigh
 // Bytes is all the pinned import downloads.
 func (p *Pin) Bytes() int64 { return p.size(80) + p.size(32) }
 
-// pinnedImport is what the node in dir imports from server before
-// starting, downloaded and checked against pin now: nothing if the
-// table above says peers serve. progress, if set, is told the bytes
-// downloaded of all.
-func pinnedImport(ctx context.Context, dir, server string, pin *Pin, proxy *Proxy,
-	progress func(done, total int64), log *slog.Logger) *neutrino.HeadersImportConfig {
+// pinnedImport is what the node of a network of magic in dir imports from
+// server before starting, downloaded and checked against pin now: nothing
+// if the table above says peers serve. progress, if set, is told the
+// bytes downloaded of all.
+func pinnedImport(ctx context.Context, dir, server string, magic wire.BitcoinNet, pin *Pin,
+	proxy *Proxy, progress func(done, total int64), log *slog.Logger) *neutrino.HeadersImportConfig {
 
 	if pin == nil || server == "" {
 		return nil
@@ -98,7 +103,7 @@ func pinnedImport(ctx context.Context, dir, server string, pin *Pin, proxy *Prox
 		return nil
 	}
 	began := time.Now()
-	imp, err := downloadPinned(ctx, files, strings.TrimRight(server, "/"), pin, proxy, progress)
+	imp, err := downloadPinned(ctx, files, strings.TrimRight(server, "/"), magic, pin, proxy, progress)
 	if err != nil {
 		_ = os.RemoveAll(files)
 		if errors.Is(err, errDigest) {
@@ -155,9 +160,9 @@ func emptyStore(dir string) bool {
 var errDigest = errors.New("not the pinned file")
 
 // downloadPinned fetches both files of pin from server into files, each
-// checked whole before it is named as complete.
-func downloadPinned(ctx context.Context, files, server string, pin *Pin, proxy *Proxy,
-	progress func(done, total int64)) (*neutrino.HeadersImportConfig, error) {
+// checked whole, under magic, before it is named as complete.
+func downloadPinned(ctx context.Context, files, server string, magic wire.BitcoinNet, pin *Pin,
+	proxy *Proxy, progress func(done, total int64)) (*neutrino.HeadersImportConfig, error) {
 
 	ctx, cancel := context.WithTimeout(ctx, importDeadline)
 	defer cancel()
@@ -178,23 +183,25 @@ func downloadPinned(ctx context.Context, files, server string, pin *Pin, proxy *
 	end := pin.Height + 1
 	parts := []struct {
 		path, name string
+		kind       byte
 		size       int64
 		digest     [32]byte
 		last       func([]byte) bool
 	}{
-		{fmt.Sprintf("/headers/import/%d", end), "block_headers", pin.size(80), pin.Headers,
+		{fmt.Sprintf("/headers/import/%d", end), "block_headers", 0, pin.size(80), pin.Headers,
 			func(tail []byte) bool {
 				var header wire.BlockHeader
 				return header.Deserialize(bytes.NewReader(tail[len(tail)-80:])) == nil &&
 					header.BlockHash() == pin.Block
 			}},
-		{fmt.Sprintf("/filter-headers/import/%d", end), "filter_headers", pin.size(32), pin.FilterHeaders,
+		{fmt.Sprintf("/filter-headers/import/%d", end), "filter_headers", 1, pin.size(32), pin.FilterHeaders,
 			func(tail []byte) bool { return bytes.Equal(tail[len(tail)-32:], pin.FilterHeader[:]) }},
 	}
 	imp := &neutrino.HeadersImportConfig{}
 	for _, p := range parts {
 		final := filepath.Join(files, p.name+".bin")
-		if err := fetchChecked(ctx, client, server+p.path, final, p.size, p.digest, p.last, tell); err != nil {
+		meta := importMetaOf(magic, p.kind)
+		if err := fetchChecked(ctx, client, server+p.path, final, meta, p.size, p.digest, p.last, tell); err != nil {
 			return nil, fmt.Errorf("%s: %w", p.path, err)
 		}
 		if p.name == "block_headers" {
@@ -207,9 +214,10 @@ func downloadPinned(ctx context.Context, files, server string, pin *Pin, proxy *
 }
 
 // fetchChecked writes url's body to final only once it is size bytes of
-// SHA-256 digest whose last entry passes last.
-func fetchChecked(ctx context.Context, client *http.Client, url, final string, size int64,
-	digest [32]byte, last func([]byte) bool, tell func(int64)) error {
+// SHA-256 digest whose last entry passes last, its header meta: the
+// network's magic as served replaced, the rest of it as served.
+func fetchChecked(ctx context.Context, client *http.Client, url, final string, meta []byte,
+	size int64, digest [32]byte, last func([]byte) bool, tell func(int64)) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -249,6 +257,14 @@ func fetchChecked(ctx context.Context, client *http.Client, url, final string, s
 		n, err := body.Read(buf)
 		if n > 0 {
 			stall.Reset(importStall)
+			// The header's magic, its first 4 bytes, the node's: the rest
+			// as served.
+			for i := int64(0); i < int64(n) && read+i < int64(len(meta)); i++ {
+				if at := read + i; at >= 4 && buf[i] != meta[at] {
+					return fmt.Errorf("%w: its header names another file", errDigest)
+				}
+				buf[i] = meta[read+i]
+			}
 			read += int64(n)
 			if read > size {
 				return fmt.Errorf("%w: longer than %d bytes", errDigest, size)
