@@ -1388,6 +1388,34 @@ async fn a_payment_reorganized_away_locks_nothing_and_one_locked_alerts() {
     let alerts = alerts(&net.hub);
     assert_eq!(alerts.len(), 1, "{alerts:?}");
     assert!(alerts[0].contains("left the best chain"), "{alerts:?}");
+    // Forgotten, and claimed by nothing meanwhile: no coin to claim.
+    let status = net.deposits.deposit_status(&hash).unwrap();
+    assert_eq!(
+        (status.status.state, status.funding),
+        (ReceiveState::Settled, None)
+    );
+    net.backend.lock().unwrap().mempool.clear();
+    net.deposits.round().await;
+    assert!(net.sent().is_empty(), "{:?}", net.sent());
+    // Paid again, by another transaction: found, and its coins claimed.
+    let again = payment(&address, 3_100, 2);
+    let outpoint = OutPoint::new(again.compute_txid(), 0);
+    let paid_at = net.height() + 1;
+    net.mine(1, vec![again]);
+    net.deposits.round().await;
+    let funding = net.deposits.deposit_status(&hash).unwrap().funding.unwrap();
+    assert_eq!(
+        (funding.txid, funding.vout),
+        (outpoint.txid.to_string(), outpoint.vout)
+    );
+    assert_eq!(funding.height, paid_at);
+    net.deposits.round().await;
+    let sent = net.sent();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].input[0].previous_output, outpoint);
+    net.confirm_sent();
+    net.deposits.round().await;
+    assert!(net.sent().is_empty());
 }
 
 /// A reorganization that takes even the oldest block scanned is scanned

@@ -181,7 +181,8 @@ CREATE TABLE deposits (
 ) STRICT;
 CREATE INDEX live_deposits ON deposits (state) WHERE done_at IS NULL;
 -- Its payment, once confirmed: forgotten again if its block leaves the best
--- chain before the deposit is locked.
+-- chain before the hub's claim of it confirms, to be found again in the
+-- block it confirms in next, perhaps another transaction.
 CREATE TABLE deposit_fundings (
     hash BLOB PRIMARY KEY REFERENCES deposits (hash),
     txid BLOB NOT NULL,
@@ -731,11 +732,6 @@ impl Store {
             )?;
         }
         tx.execute(
-            "DELETE FROM deposit_fundings WHERE height >= ?1 AND hash IN
-                (SELECT hash FROM deposits WHERE state = 'open' AND done_at IS NULL)",
-            [height],
-        )?;
-        tx.execute(
             "UPDATE deposits SET done_at = NULL
              WHERE state = 'settled'
                AND hash IN (SELECT hash FROM deposit_spends WHERE height >= ?1)",
@@ -750,6 +746,19 @@ impl Store {
             )?
             .query_map([height], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
+        // Payments that left the best chain, of deposits not done: found
+        // again wherever they confirm next, the hub's claims of them made
+        // anew, those made spending a coin perhaps gone.
+        let gone = "SELECT f.hash FROM deposit_fundings f JOIN deposits d ON d.hash = f.hash
+                    WHERE f.height >= ?1 AND d.done_at IS NULL";
+        tx.execute(
+            &format!("DELETE FROM deposit_sweeps WHERE hash IN ({gone})"),
+            [height],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM deposit_fundings WHERE hash IN ({gone})"),
+            [height],
+        )?;
         tx.commit()?;
         Ok(unbacked)
     }
@@ -1429,6 +1438,10 @@ impl Gateway {
     /// operator if another spend did, or once the timeout nears.
     async fn claim(&self, record: &Record, scanned: u32) -> Result<(), Failure> {
         let name = hex::encode(record.hash);
+        // Its payment left the best chain: claimed once found again.
+        if record.funding.is_none() {
+            return Ok(());
+        }
         if let Some(by) = record.spent_by {
             let message = format!(
                 "The payment of deposit {name} was spent by {by}, not by the hub's claim, after \
