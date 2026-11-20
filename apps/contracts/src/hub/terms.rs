@@ -498,7 +498,8 @@ mod tests {
     /// holders choose prices the fixed terms by its rate as well, at 1% a
     /// year 24 sat more; one that doesn't, at its fixed fee alone. Regtest's
     /// mock decides the lean filing, so it quotes the graph of its id (10);
-    /// signet's program reads the exit on the hub's header chain, and quotes 11.
+    /// signet's program reads the exit on the hub's header chain and owes a claim
+    /// of the same contract no evidence against another, and quotes 12.
     #[test]
     fn the_fixed_quote_is_pinned() {
         let parts = Hub::peek(funded()).unwrap().base.parts().clone();
@@ -508,7 +509,7 @@ mod tests {
                 None,
                 [
                     "324adaaaaa576156dbafdd687f717e2396057dd0fa17a3e420b08a0b00edffe0",
-                    "f684aaa3f59ed9669777a376420207df35219378aa87e1bf51958f1f4e8306c2",
+                    "6030e7a05ce6772e85587fc2f3373e6958dbbb47f18e202e045f200cdff47639",
                 ],
                 3_000,
             ),
@@ -516,7 +517,7 @@ mod tests {
                 Some(RANGE),
                 [
                     "a78b216fcd816f1412c2f31088579ac25c7c019ab834445041e3de8b7c046e61",
-                    "3be85c8791a1ebe153adfdaa2369f1e17c7877eeb7cb524852e849f4013b159c",
+                    "8a8dae12c770b4dee00a43b631664bd6da04c349c15d3691b17d856fafce61a1",
                 ],
                 3_024,
             ),
@@ -535,6 +536,9 @@ mod tests {
             assert_eq!((bounds.lock, bounds.response_window), (1_000, 2));
             let (signet, bounds) = quoted(ChainProfile::Core30Signet);
             assert_eq!(signet, signet_digest);
+            let at = Timing::of(ChainProfile::Core30Signet, range).unwrap();
+            let graph = at.quote(keyset.clone(), checkpoint.clone()).graph.id;
+            assert_eq!(graph, licash::recovery::OWN_CLAIMS_FROM);
             assert_eq!((bounds.lock, bounds.response_window), (1_000, 12));
         }
     }

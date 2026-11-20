@@ -367,7 +367,7 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
 /// proven with it alone, so none named here or in [`SIGNET_BEFORE`] is
 /// ever to go. A contract keeps its program when this one changes.
 pub const SIGNET: [u8; 32] =
-    hex!("48b9bedfefa1edf9566ee9e7b5d35482e268cdc0bdc2602a40a1d46a12886bad");
+    hex!("493d2f799f14ef9980e933837d14578643e9a51c5d5e8c8f16a9e0b7eabe52da");
 
 /// Whether [`SIGNET`] decides the compact filing: true only for a program
 /// built from a tree whose `licash::recovery` reads it, and set in the
@@ -392,9 +392,10 @@ pub const SIGNET_CHAINED: bool = true;
 /// [`SIGNET_CHAINED`] says of the chain: set in the same change as the
 /// program that does, rebuilt from a tree whose `licash::recovery` has the
 /// rule, and the old program moved to [`SIGNET_BEFORE`]. Hubs quote a graph
-/// of id [`licash::recovery::OWN_CLAIMS_FROM`] only when it is. False until
-/// then: the program in use judges the rule as graph id 11 did.
-pub const SIGNET_OWN_CLAIMS: bool = false;
+/// of id [`licash::recovery::OWN_CLAIMS_FROM`] only when it is. It reads the
+/// chain program [`CHAIN`], kept as it was: that program's sources did not
+/// change, only the bytes it builds to, and a hub keeps one chain.
+pub const SIGNET_OWN_CLAIMS: bool = true;
 
 /// The chain program (`r0/chain-guest`) whose receipts [`SIGNET`]'s statement
 /// verifies: the image id kept in `r0/hp-guest/chain.id`, which a build of it
@@ -410,6 +411,9 @@ pub const CHAIN: [u8; 32] =
 /// `83642842…` reads the sixth form of a Base and every header of the exit (graph
 /// id 10): its contracts' proofs grow with their age, where those of [`SIGNET`]
 /// (graph id 11, the exit read on the hub's header chain) do not.
+/// `48b9bedf…` is the program of graph id 11 as it stood before a claim of
+/// the same contract stopped voiding her notes (graph id 12, [`SIGNET`]): the
+/// same chain program, [`CHAIN`], and the same statement for graphs up to 11.
 /// `ce4d7a00…` reads the Bases of earlier forms too (v3 to v5), and judges a
 /// lock's activation unanchored under v3: the program after it reads the
 /// sixth form of a Base only, whose default returns her reserve to a script
@@ -425,7 +429,8 @@ pub const CHAIN: [u8; 32] =
 /// statement (of v3 Bases) checks no signature of her request, reads a
 /// request's digits above 15 as Bitcoin doesn't, and owes a lock's Refund
 /// before it expired: a trial's exposure, left to its contracts' end.
-pub const SIGNET_BEFORE: [[u8; 32]; 8] = [
+pub const SIGNET_BEFORE: [[u8; 32]; 9] = [
+    hex!("48b9bedfefa1edf9566ee9e7b5d35482e268cdc0bdc2602a40a1d46a12886bad"),
     hex!("836428422619ff8ad43d37899a7206396ae13115a67df459e0a4b748768d9d11"),
     hex!("ce4d7a006e422b7e73a37b6f5d9c9290a2af7e7c0451662504ce4799bfadcf2c"),
     hex!("a2458fdbd126c100b82bb50e8934fe4f5f4c2a5a80e981f4ca63c6f189dfab8d"),
@@ -541,12 +546,13 @@ mod tests {
     fn the_hub_statement_image_is_pinned() {
         assert_eq!(
             SIGNET,
-            hex!("48b9bedfefa1edf9566ee9e7b5d35482e268cdc0bdc2602a40a1d46a12886bad"),
+            hex!("493d2f799f14ef9980e933837d14578643e9a51c5d5e8c8f16a9e0b7eabe52da"),
             "keep every funded contract's pinned guest available when changing opening trust"
         );
         assert_eq!(
             SIGNET_BEFORE,
             [
+                hex!("48b9bedfefa1edf9566ee9e7b5d35482e268cdc0bdc2602a40a1d46a12886bad"),
                 hex!("836428422619ff8ad43d37899a7206396ae13115a67df459e0a4b748768d9d11"),
                 hex!("ce4d7a006e422b7e73a37b6f5d9c9290a2af7e7c0451662504ce4799bfadcf2c"),
                 hex!("a2458fdbd126c100b82bb50e8934fe4f5f4c2a5a80e981f4ca63c6f189dfab8d"),
