@@ -174,6 +174,24 @@ fn bytes32(hex_text: &str) -> Result<[u8; 32], String> {
     Ok(bytes)
 }
 
+/// The state of a payment as LND tracks it: in flight only while LND
+/// says so, as initiated or in flight. A status it does not know is an
+/// error, which the caller asks again on, rather than a payment awaited
+/// for good.
+fn status_of(payment: &Value) -> Result<Status, String> {
+    Ok(match payment["status"].as_str().unwrap_or_default() {
+        "SUCCEEDED" => Status::Succeeded(bytes32(&text(payment, "payment_preimage")?)?),
+        "FAILED" => Status::Failed(
+            payment["failure_reason"]
+                .as_str()
+                .unwrap_or("FAILURE_REASON_UNKNOWN")
+                .to_owned(),
+        ),
+        "IN_FLIGHT" | "INITIATED" => Status::InFlight,
+        other => return Err(format!("LND answered a payment of status {other:?}")),
+    })
+}
+
 impl Node for Lnd {
     fn info(&self) -> Call<'_, NodeInfo> {
         Box::pin(async move {
@@ -249,16 +267,7 @@ impl Node for Lnd {
                 Err(fault) if fault.says(&["isn't initiated", "not found"]) => return Ok(None),
                 Err(fault) => return Err(fault.into()),
             };
-            let status = match payment["status"].as_str().unwrap_or_default() {
-                "SUCCEEDED" => Status::Succeeded(bytes32(&text(&payment, "payment_preimage")?)?),
-                "FAILED" => Status::Failed(
-                    payment["failure_reason"]
-                        .as_str()
-                        .unwrap_or("FAILURE_REASON_UNKNOWN")
-                        .to_owned(),
-                ),
-                _ => Status::InFlight,
-            };
+            let status = status_of(&payment)?;
             let created_ns = num(&payment["creation_time_ns"]).ok_or("LND answered no time")?;
             Ok(Some(Attempt { status, created_ns }))
         })
@@ -401,5 +410,32 @@ impl ServerCertVerifier for Pinned {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_payment_is_in_flight_only_while_lnd_says_so() {
+        let of = |v: Value| status_of(&v);
+        assert_eq!(of(json!({"status": "IN_FLIGHT"})), Ok(Status::InFlight));
+        assert_eq!(of(json!({"status": "INITIATED"})), Ok(Status::InFlight));
+        assert_eq!(
+            of(json!({"status": "SUCCEEDED", "payment_preimage": "11".repeat(32)})),
+            Ok(Status::Succeeded([0x11; 32]))
+        );
+        assert_eq!(
+            of(json!({"status": "FAILED", "failure_reason": "FAILURE_REASON_NO_ROUTE"})),
+            Ok(Status::Failed("FAILURE_REASON_NO_ROUTE".into()))
+        );
+        for unknown in [
+            json!({"status": "UNKNOWN"}),
+            json!({"status": "LOST"}),
+            json!({}),
+        ] {
+            assert!(of(unknown.clone()).is_err(), "{unknown}");
+        }
     }
 }
