@@ -830,39 +830,38 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
 }
 
 /// Protection at its hub, a recovery contract, set up as its user would:
-/// with no coin on Bitcoin to pay its price, notes cashed out to itself
-/// for it first, as the quote offers; then of the size and length it
-/// chooses, its price itemized, signed, confirmed and protecting the
-/// notes there, on credit no longer. Its price paid of a coin of the
-/// price exactly, none of it funded by her: nothing left on Bitcoin.
-/// Ending it, it is told to cash out instead.
+/// with no coin on Bitcoin to pay its price, told to cash out to itself
+/// first; then, a coin cashed out, of the length it chooses, the smallest
+/// cover that takes the coin whole: its price itemized, the rest of the
+/// coin its own part, issued back as notes. Signed, confirmed and
+/// protecting the notes there, on credit no longer, nothing left on
+/// Bitcoin. Ending it, it is told to cash out instead.
 async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     /// The most keeping its notes few costs while it is set up, in sat.
     const NOTES_UPKEEP: u64 = 50;
     // hub1's reserve and opening fee, and over them 1% a year of the part
-    // of the cover it funds (licash-hub's --contracts-rate by default).
+    // of the cover it funds (licash-hub's --contracts-rate by default),
+    // none of hers.
     const FIXED: u64 = 23_000;
     // Its sizes, 2^n - 1 sat: the least.
     const LEAST: u64 = 131_071;
-    let price = |cap: u64, blocks: u32| {
+    // The coin cashed out for it: the price, and a few hundred sat of its
+    // own part.
+    const COIN: u64 = 23_300;
+    // What a coin spent whole may leave unpaid: less than an output is
+    // worth.
+    const DUST: u64 = 330;
+    /// What a mock contract is worth, said wherever one shows.
+    const MOCK: &str = "Test only: protects nothing";
+    let price = |cap: u64, funded: u64, blocks: u32| {
         FIXED
             + licash_api::rate(
                 10_000,
-                u32::try_from(cap).unwrap_or(u32::MAX),
+                u32::try_from(cap - funded).unwrap_or(u32::MAX),
                 blocks,
                 licash_api::YEAR_BLOCKS,
             )
     };
-    let choose_minimum = || async {
-        until("the minimum contract cap", 20, || async {
-            phone.slide_id("contract-cap", 0.0).await?;
-            let cap = phone.by_id("quote-cap", 5).await?;
-            Ok((amount(&cap.text) == LEAST).then_some(()))
-        })
-        .await
-    };
-    /// What a mock contract is worth, said wherever one shows.
-    const MOCK: &str = "Test only: protects nothing";
     // Enough in notes to pay for it, and to pay with after.
     let code: PaymentCode = phone.bitcoin_code().await?.parse()?;
     let fallback = code.address.context("a fallback address")?;
@@ -881,32 +880,36 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     })
     .await?;
 
-    // No coin on Bitcoin pays its price: cashed out to itself first.
+    // No coin on Bitcoin pays its price: told to cash out to itself first,
+    // its cover the least of hub1's, nothing to pay or choose.
     at_hub(phone, eco.hub(1)).await?;
     phone.tap_id("open-contract").await?;
-    // Its terms chosen all the same, of hub1's sizes: at first covering
-    // the notes there, here the least; the largest, 2^21 - 1.
-    let all = amount(&phone.by_id("quote-cap", 60).await?.text);
-    ensure!(all == LEAST, "a cap of {all} offered on the notes held");
-    phone.slide_id("contract-cap", 1.0).await?;
-    phone.tagged("quote-cap", "2,097,151 sat", 10).await?;
-    choose_minimum().await?;
-    // Itemized: the hub's fee, its interest by the year, her reserve.
-    phone.tagged("quote-price", "23,024 sat", 10).await?;
+    let least = amount(&phone.by_id("quote-cap", 60).await?.text);
+    ensure!(least == LEAST, "a cap of {least} offered with no coin");
     phone
-        .tagged("contract-opening-fee", "3,000 sat", 10)
+        .wait("Paid from Bitcoin you hold, and you hold none yet", 10)
         .await?;
-    let interest = phone.by_id("contract-interest", 10).await?.text;
-    ensure!(
-        interest.starts_with("24 sat") && interest.contains("1% a year of 131,071"),
-        "{interest:?} for its interest"
-    );
-    phone.tagged("contract-reserve", "20,000 sat", 10).await?;
     phone.tagged("worth", MOCK, 10).await?;
-    phone.tap_id("cash-out-first").await?;
+    for gone in [
+        "protect",
+        "quote-price",
+        "contract-funded",
+        "contract-cap",
+        "contract-funding",
+        "cash-out-first",
+    ] {
+        ensure!(!phone.has(gone).await?, "{gone:?} with no coin");
+    }
+    phone.back().await?;
+    phone.gone("quote-cap", 10).await?;
+
+    // Cashed out to itself, as anyone does.
+    phone.tap_id("cash-out").await?;
+    phone.tap_id("to-own").await?;
+    phone.tagged("to", "To this wallet", 30).await?;
+    phone.fill_id("amount", &COIN.to_string()).await?;
+    phone.tap_id("continue").await?;
     phone.tagged("to", "This wallet", 120).await?;
-    // The price exactly: a coin of it, no change.
-    phone.tagged("paying", "23,024 sat", 10).await?;
     reviewed(phone, 10).await?;
     phone.tap_id("confirm").await?;
     phone.tagged("result", "Sending", 60).await?;
@@ -920,8 +923,8 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     .await?;
     let coin = amount(&coin.text);
     ensure!(
-        coin == price(LEAST, 1_000),
-        "a coin of {coin} cashed out for {LEAST}"
+        (COIN..COIN + 1_000).contains(&coin),
+        "a coin of {coin} cashed out for {COIN}"
     );
     phone.back_to("onchain").await?;
     let credit = amount(&phone.by_id("credit", 10).await?.text);
@@ -929,44 +932,73 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let before = phone.balance().await?;
     eprintln!("a coin of {coin} kept, {before} held, {credit} on credit");
 
-    // Paid from it now, over the longest hub1 allows, priced as hub1
-    // prices it as it changes: the least, all the coin pays, none of it
-    // left to fund herself.
+    // Paid from it now: the least cover that takes it whole, its price as
+    // hub1 prices it, all the rest of the coin her part, less than dust
+    // left. Neither the cover nor her part is hers to choose.
     at_hub(phone, eco.hub(1)).await?;
     phone.tap_id("open-contract").await?;
     let cap = amount(&phone.by_id("quote-cap", 60).await?.text);
     ensure!(cap == LEAST, "a cap of {cap} offered on {coin}");
-    ensure!(
-        !phone.has("contract-cap").await? && !phone.has("contract-funded").await?,
-        "a choice of cover, or of her part, on {coin}"
-    );
-    let costs = |cap: u64, blocks: u32| async move {
-        let want = price(cap, blocks);
-        until(&format!("{want} for {blocks} blocks"), 10, || async {
-            let views = phone.views().await?;
-            let shown = views.into_iter().find(|v| v.id == "quote-price");
-            Ok(shown.filter(|v| amount(&v.text) == want).map(|_| ()))
-        })
+    for gone in ["contract-cap", "contract-funding", "cash-out-first"] {
+        ensure!(!phone.has(gone).await?, "{gone:?} on {coin}");
+    }
+    // Its fit over `blocks`, as shown: her part and its price.
+    let fit = |blocks: u32| async move {
+        until(
+            &format!("the fit of {coin} over {blocks} blocks"),
+            10,
+            || async {
+                let views = phone.views().await?;
+                let of = |id: &str| views.iter().find(|v| v.id == id).map(|v| amount(&v.text));
+                let (Some(funded), Some(paid)) = (of("contract-funded"), of("quote-price")) else {
+                    return Ok(None);
+                };
+                let whole = funded > 0
+                    && paid == price(cap, funded, blocks)
+                    && (funded + paid..funded + paid + DUST).contains(&coin);
+                Ok(whole.then_some((funded, paid)))
+            },
+        )
         .await
     };
-    costs(cap, 1_000).await?;
-    // Not refused: nothing to say against it.
+    let (funded, paid) = fit(1_000).await?;
+    eprintln!("{coin} pays {paid} and funds {funded} of {cap}");
+    // Itemized: the hub's fee, its interest by the year on its own part,
+    // her reserve.
+    phone
+        .tagged("contract-opening-fee", "3,000 sat", 10)
+        .await?;
+    let interest = phone.by_id("contract-interest", 10).await?.text;
+    let of = interest.rsplit("a year of").next().map(amount);
     ensure!(
-        !phone.has("contract-problem").await?,
-        "a problem with {cap}"
+        interest.starts_with(&format!("{} sat", paid - FIXED))
+            && interest.contains("1% a year of")
+            && of == Some(cap - funded),
+        "{interest:?} for its interest on {} of {cap}",
+        cap - funded
     );
-    // Its shortest costs less, at once; the longest again, to protect.
+    phone.tagged("contract-reserve", "20,000 sat", 10).await?;
+    // None on her part, its only coin, nothing to say against it.
+    for gone in [
+        "contract-interest-funded",
+        "contract-coin",
+        "contract-problem",
+    ] {
+        ensure!(!phone.has(gone).await?, "{gone:?} on {coin}");
+    }
+    // Its shortest costs less, at once, and funds more of hers; the
+    // longest again, to protect.
     phone.slide_id("contract-blocks", 0.0).await?;
-    costs(cap, 200).await?;
-    phone.slide_id("contract-blocks", 1.0).await?;
-    costs(cap, 1_000).await?;
+    let (shortest, cheaper) = fit(200).await?;
     ensure!(
-        price(cap, 1_000) > price(cap, 200),
-        "the longest costs more"
+        cheaper < paid && shortest >= funded,
+        "{cheaper} for {shortest} over 200 blocks, {paid} for {funded} over 1000"
     );
-    let paid = price(cap, 1_000);
-    ensure!(paid == coin, "{paid} for {cap} of a coin of {coin}");
-    phone.gone("contract-change", 10).await?;
+    phone.slide_id("contract-blocks", 1.0).await?;
+    ensure!(
+        fit(1_000).await? == (funded, paid),
+        "another fit over 1000 blocks"
+    );
     phone.tagged("worth", MOCK, 10).await?;
     phone.tap_id("protect").await?;
     // Being set up: said at once, then the step it is at.
@@ -987,9 +1019,22 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     eprintln!("contract {:?}", protecting.text);
     // What it is worth, in sight without a tap.
     phone.tagged("worth", MOCK, 10).await?;
-    // Unfolded; in advanced mode, since onboarding: forcing it, not yet.
+    // Unfolded: her part, issued back to her once its funding is buried.
     phone.tap_view(&protecting).await?;
-    // Below its details: scrolled to, as often as the page moves.
+    let issued = until("her part in the balance", 600, || async {
+        mine(eco).await?;
+        let views = phone.views().await?;
+        let shown = views.into_iter().find(|v| v.id == "contract-funded");
+        Ok(shown.filter(|v| v.text.ends_with("in your balance")))
+    })
+    .await?;
+    ensure!(
+        amount(issued.text.split('·').next().unwrap_or_default()) == funded,
+        "{:?} funded of {funded}",
+        issued.text
+    );
+    // In advanced mode, since onboarding: forcing it, not yet. Below its
+    // details: scrolled to, as often as the page moves.
     phone.scroll_to_id("force-close").await?;
     let end = phone.scroll_to_id("close-contract").await?;
     phone.tap_view(&end).await?;
@@ -1002,8 +1047,7 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.scroll_to_id("close-contract").await?;
     phone.back_to("onchain").await?;
 
-    // Its notes protected; nothing left on Bitcoin, its coin the price
-    // exactly.
+    // Its notes protected; nothing left on Bitcoin, its coin spent whole.
     let protected = until("its notes protected", 30, || async {
         let views = phone.views().await?;
         let of = |id: &str| views.iter().find(|v| v.id == id).map(|v| amount(&v.text));
@@ -1014,16 +1058,18 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let now = amount(&phone.by_id("credit", 10).await?.text);
     phone.back_to("receive").await?;
     let after = phone.balance().await?;
-    // Less its price, and what keeping its notes few may have cost meanwhile
-    // (a few sat, at times).
-    let upkeep = (before - paid).checked_sub(after);
+    // Less its coin, but her part back in notes: its price and what less
+    // than dust it left, and what keeping its notes few may have cost
+    // meanwhile (a few sat, at times).
+    let spent = before.checked_sub(after);
     ensure!(
-        upkeep.is_some_and(|fee| fee <= NOTES_UPKEEP),
-        "{after} held, {before} before"
+        spent.is_some_and(|s| (coin - funded..=coin - funded + NOTES_UPKEEP).contains(&s)),
+        "{after} held, {before} before, a coin of {coin} funding {funded}"
     );
+    eprintln!("{after} held, {protected} protected, {now} on credit");
     // A claim names so many notes at most, 32 or more: the smallest past
-    // them are on credit, which the many payments before leave a few of.
-    // Nearly all of it is protected, then.
+    // them are on credit, which the many payments before, and her part's
+    // notes, leave a few of. Nearly all of it is protected, then.
     ensure!(
         now * 100 <= protected,
         "{now} on credit, {protected} protected, {credit} on credit before"
@@ -1035,7 +1081,8 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         "{:?} on Home with a contract protecting",
         share.text
     );
-    // Its price in the history, as paid once its funding confirmed.
+    // Its price in the history, as paid once its funding confirmed: not
+    // her part, which is still hers.
     opened(phone, "Protection").await?;
     let shown = amount(&phone.by_id("amount", 10).await?.text);
     ensure!(shown == paid, "{shown} paid for it in the history");
