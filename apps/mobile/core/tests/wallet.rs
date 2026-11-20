@@ -1575,6 +1575,31 @@ fn a_phone_collecting_now_answers_once_taken_and_unlinks_after() {
 }
 
 #[test]
+fn a_phone_waiting_for_mail_wakes_as_its_relays_push_a_payment() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let bob = net.wallet("bob", net.height());
+    let asked = bob.payment_code(Some(500)).unwrap();
+    // Not looked in yet: nothing pushes.
+    assert!(!bob.wait_for_mail(0));
+    assert!(bob.clone().collect_now().unwrap().is_empty());
+    // Looked in, and nothing came.
+    assert!(!bob.wait_for_mail(1));
+
+    let waiting = {
+        let bob = bob.clone();
+        std::thread::spawn(move || bob.wait_for_mail(30))
+    };
+    let paid = alice.pay(asked.qr, None).unwrap();
+    assert!(paid.delivered, "{paid:?}");
+    assert!(waiting.join().unwrap());
+    let got = bob.clone().collect_now().unwrap();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!((got[0].kind, got[0].amount), (Kind::Received, 500));
+}
+
+#[test]
 fn a_phone_keeps_contacts_by_name_one_to_each_wallet() {
     let net = Net::new(true);
     let alice = net.wallet("alice", net.height());

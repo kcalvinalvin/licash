@@ -927,6 +927,30 @@ impl Wallet {
         }
         Ok(received)
     }
+
+    /// Whether the mailbox's relays pushed mail within `seconds`, waiting
+    /// until they do: [`Wallet::collect_now`] then takes it. Pushed only
+    /// once looked in ([`Wallet::collect_now`]) and kept connected: until
+    /// then, `false` after `seconds`. A push since the last wake answers
+    /// at once.
+    pub fn wait_for_mail(&self, seconds: u32) -> bool {
+        let arrivals = (self.mailbox.lock().unwrap_or_else(PoisonError::into_inner))
+            .as_ref()
+            .map(licash_nostr::mailbox::Mailbox::arrivals);
+        let most = Duration::from_secs(seconds.into());
+        // Its timer made within the runtime.
+        self.runtime.block_on(async move {
+            match arrivals {
+                Some(arrivals) => tokio::time::timeout(most, arrivals.notified())
+                    .await
+                    .is_ok(),
+                None => {
+                    tokio::time::sleep(most).await;
+                    false
+                }
+            }
+        })
+    }
 }
 
 impl Wallet {

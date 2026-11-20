@@ -142,6 +142,8 @@ pub struct Mailbox {
     returned: Mutex<BTreeSet<Event>>,
     /// What the relays pushed since the last look, and which push.
     pushed: Arc<Mutex<Pushed>>,
+    /// Told of each push: [`Mailbox::arrivals`].
+    arrived: Arc<tokio::sync::Notify>,
     /// Taking in what the relays push, until closed.
     listening: tokio::task::JoinHandle<()>,
 }
@@ -206,12 +208,15 @@ impl Mailbox {
         let pushed = Arc::new(Mutex::new(Pushed::default()));
         let mut notifications = client.notifications();
         let into = pushed.clone();
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let telling = arrived.clone();
         let listening = tokio::spawn(async move {
             while let Some(notification) = notifications.next().await {
                 // Each the first time seen: what the looks return too.
                 if let ClientNotification::Event { event, .. } = notification {
                     if event.kind == Kind::GiftWrap {
                         lock(&into).take(*event);
+                        telling.notify_one();
                     }
                 }
             }
@@ -224,8 +229,17 @@ impl Mailbox {
             done: Mutex::default(),
             returned: Mutex::default(),
             pushed,
+            arrived,
             listening,
         })
+    }
+
+    /// Told each time the relays push mail, once looked in: one waiting
+    /// on it (`notified().await`) wakes then, or at once if pushed since
+    /// the last wake. Held apart from the mailbox, for a wait not to hold
+    /// it from the looks.
+    pub fn arrivals(&self) -> Arc<tokio::sync::Notify> {
+        self.arrived.clone()
     }
 
     /// Whether it is the mailbox of `secret` on `relays`.
@@ -445,13 +459,16 @@ mod tests {
         assert!(kept.fetch().await.unwrap().is_empty());
         let asked = kept.pushed().asked;
         assert!(asked.is_some());
+        let arrivals = kept.arrivals();
         for paid in 1..=2 {
             let content = format!(r#"{{"paid":{paid}}}"#);
             send(&to, &content, &relays, &Route::Direct).await.unwrap();
-            let waited = Instant::now();
-            while kept.pushed().events.is_empty() && waited.elapsed() < Duration::from_secs(5) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            // Told as it is pushed.
+            let told = arrivals.notified();
+            tokio::time::timeout(Duration::from_secs(5), told)
+                .await
+                .unwrap();
+            assert!(!kept.pushed().events.is_empty());
             // Taken from what was pushed: the relay not asked again.
             let mail = kept.fetch().await.unwrap();
             assert_eq!(mail.len(), 1);

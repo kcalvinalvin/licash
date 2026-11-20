@@ -221,6 +221,9 @@ class Engine(context: Context) {
     /** Looking in the mailbox apart from the rounds. */
     private val watchingMailbox = AtomicBoolean(false)
 
+    /** Waiting, in sight, for the mailbox's relays to push mail ([awaitMail]). */
+    private val awaitingMail = AtomicBoolean(false)
+
     @Volatile
     private var foreground = false
 
@@ -664,6 +667,7 @@ class Engine(context: Context) {
         while (true) {
             if (foreground || keepers.get() > 0) {
                 findProviders()
+                if (foreground) awaitMail()
                 runCatching { sync() }.onFailure { e ->
                     AppLog.warn("sync", e)
                     state.update { it.copy(problem = explain(e)) }
@@ -832,6 +836,32 @@ class Engine(context: Context) {
             }
             // Asked again as it stopped.
             if (eager && foreground) watchMailbox()
+        }
+    }
+
+    /**
+     * In sight, take the mail as the mailbox's relays push it, not at the
+     * next round: they stay connected once looked in, a wait ([PUSH_WAIT_S]
+     * at most) ending as they push. Not holding the wallet while waiting.
+     */
+    private fun awaitMail() {
+        if (!awaitingMail.compareAndSet(false, true)) return
+        scope.launch {
+            try {
+                while (foreground) {
+                    val wallet = wallet ?: break
+                    val pushed = runCatching { wallet.waitForMail(PUSH_WAIT_S) }.getOrDefault(false)
+                    if (!pushed || !foreground) continue
+                    AppLog.info("the mailbox pushed mail")
+                    try {
+                        if (collect()) refresh()
+                    } catch (e: LicashException) {
+                        AppLog.warn("the mailbox, as pushed", e)
+                    }
+                }
+            } finally {
+                awaitingMail.set(false)
+            }
         }
     }
 
@@ -1880,6 +1910,9 @@ class Engine(context: Context) {
         private const val OPENING_TICK_MS = 2_000L
         private const val EAGER_MS = 4_000L
         private const val MAIL_MS = 1_000L
+
+        /** How long a wait for pushed mail lasts at most: one on a wallet since replaced ends by then. */
+        private const val PUSH_WAIT_S = 20u
         private const val AWAY_MS = 60_000L
         private const val CATCH_UP_AFTER_MS = 15_000L
         private const val BACKUP_REST_MS = 30_000L
