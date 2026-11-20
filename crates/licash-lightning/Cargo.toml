@@ -20,3 +20,6 @@ serde_json = { workspace = true, optional = true }
 lnd = ["dep:anyhow", "dep:base64", "dep:hex", "dep:reqwest", "dep:rustls", "dep:serde_json"]
 # An in-memory Lightning node, for tests.
 fake = ["dep:bitcoin", "dep:hex"]
+
+[dev-dependencies]
+tokio = { version = "1.54", features = ["io-util", "macros", "net", "rt"] }

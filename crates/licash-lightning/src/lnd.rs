@@ -126,9 +126,15 @@ fn down(e: reqwest::Error) -> Fault {
     Fault::Other(format!("LND: {e}"))
 }
 
-async fn answer(response: Response) -> Result<Value, Fault> {
+async fn answer(mut response: Response) -> Result<Value, Fault> {
     let status = response.status();
-    let body = response.bytes().await.map_err(down)?;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(down)? {
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_ANSWER {
+            return Err(Fault::Other("an answer too long".into()));
+        }
+    }
     let value: Value = serde_json::from_slice(&body)
         .map_err(|_| Fault::Other(format!("LND answered {status} without JSON")))?;
     if status.is_success() {
@@ -416,6 +422,35 @@ impl ServerCertVerifier for Pinned {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An answer past [`MAX_ANSWER`] is refused as it is read, streamed or
+    /// not.
+    #[tokio::test]
+    async fn an_answer_too_long_is_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let serve = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = format!("{{\"alias\": \"{}\"}}", "a".repeat(MAX_ANSWER));
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+        });
+        let lnd = Lnd::new(&url, b"macaroon", None).unwrap();
+        let read = lnd.get("/v1/getinfo").await;
+        assert!(
+            matches!(&read, Err(Fault::Other(m)) if m == "an answer too long"),
+            "{:?}",
+            read.map_err(String::from)
+        );
+        serve.abort();
+    }
 
     #[test]
     fn a_payment_is_in_flight_only_while_lnd_says_so() {
