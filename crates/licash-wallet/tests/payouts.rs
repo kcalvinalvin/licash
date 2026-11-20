@@ -938,6 +938,35 @@ async fn a_claim_in_no_block_as_the_timeout_nears_pays_more_the_payee_paid_less(
     eco.desk.settle(&first, coin).await;
 }
 
+/// The preimage, public once the claim is broadcast, riding on the
+/// provider's refund (as a taproot annex may carry it): still a refund,
+/// the provider's coin back, never a claim paid out.
+#[tokio::test]
+async fn a_refund_carrying_the_preimage_is_not_a_claim() {
+    let eco = Eco::new().await;
+    let payout = eco.pay_out(1000).await;
+    let coin = eco.desk.fund(None, None);
+    eco.follow(&payout).await.unwrap();
+    let claims = eco.client.payout_claims().unwrap();
+    let htlc = eco.desk.with(|t| t.htlc);
+    let preimage = htlc.preimage_in(&claims[0], coin).expect("revealed");
+    eco.mine_to(eco.timeout() + 1);
+    let mut back = unchecked(
+        coin,
+        TxOut {
+            value: Amount::from_sat(500),
+            script_pubkey: ScriptBuf::new_op_return([1]),
+        },
+    );
+    back.input[0].witness = bitcoin::Witness::from_slice(&[preimage]);
+    assert_eq!(htlc.preimage_in(&back, coin), Some(preimage));
+    assert!(!htlc.claimed_by(&back, coin));
+    eco.net.confirm(A, vec![back]);
+    let payout = eco.follow(&payout).await.unwrap();
+    failed(&payout, "took its coin back first");
+    assert!(eco.client.payout_claims().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn a_claim_beaten_by_the_providers_refund_is_lost() {
     let eco = Eco::new().await;

@@ -644,8 +644,7 @@ impl<T: Transport> Wallet<T> {
         let kept = first_spend(chain, funding, &htlc.script_pubkey(), first..=tip)
             .await?
             .filter(|(at, spend)| {
-                (spend.compute_txid() == claim.compute_txid()
-                    || htlc.preimage_in(spend, funding).is_some())
+                (spend.compute_txid() == claim.compute_txid() || htlc.claimed_by(spend, funding))
                     && (tip + 1).saturating_sub(*at) >= need
             });
         let reopened = self.store.write(|tx| {
@@ -1030,7 +1029,7 @@ impl<T: Transport> Wallet<T> {
             .await?
             .map(|(height, spend)| {
                 let claimed = spend.compute_txid() == claim.compute_txid()
-                    || htlc.preimage_in(&spend, funding).is_some();
+                    || htlc.claimed_by(&spend, funding);
                 (height, claimed)
             });
         let need = payout_depth(self.network());
