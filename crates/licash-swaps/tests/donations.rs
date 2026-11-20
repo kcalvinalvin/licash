@@ -401,6 +401,35 @@ async fn a_payment_never_offered_by_the_deadline_is_given_up_and_the_donation_ca
     assert_eq!(eco.collected().await, 0);
 }
 
+/// A late payment the wallet fails to give up, unsigned all the same: its
+/// payer's payment is neither taken nor given back until it is.
+#[tokio::test]
+async fn a_late_payment_not_given_up_leaves_the_donation_open() {
+    let eco = Eco::new().await;
+    let (_, hash) = eco.donate(100).await;
+    eco.pay(hash, 40);
+    eco.net.fail(licash_api::OFFER, Fault::Lost);
+    eco.follow().await;
+    let db = rusqlite::Connection::open(eco.dir.path().join("wallet.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER failing BEFORE UPDATE OF abandoned ON sends
+         BEGIN SELECT RAISE(ABORT, 'disk on fire'); END;",
+    )
+    .unwrap();
+    eco.mine(40 - SETTLE_MARGIN);
+    eco.follow().await;
+    let sent = eco.provider().wallet().sent_by_key(&hash).unwrap().unwrap();
+    assert_eq!(sent.state, State::Offered);
+    assert_eq!(eco.state(&hash), DonationState::Open);
+    assert_eq!(eco.node.held(hash).unwrap().0, HeldState::Accepted);
+    // Given up once it can be: canceled, nothing taken.
+    db.execute_batch("DROP TRIGGER failing").unwrap();
+    eco.follow().await;
+    assert_eq!(eco.state(&hash), DonationState::Canceled);
+    assert_eq!(eco.node.held(hash).unwrap().0, HeldState::Canceled);
+    assert_eq!(eco.collected().await, 0);
+}
+
 #[tokio::test]
 async fn a_payment_signed_by_the_deadline_is_settled_and_followed_until_released() {
     let mut eco = Eco::new().await;

@@ -521,8 +521,25 @@ impl<T: Transport> Provider<T> {
                     self.cancel(receiver, hash, "its payment was not made in time")
                         .await
                 }
-                // Signed meanwhile: its hub may release it.
-                Err(_) => self.settle(receiver, donation, DonationState::Owed).await,
+                // As the wallet recorded it since: signed meanwhile, its hub
+                // may release it; otherwise looked at again next time.
+                Err(e) => match self.wallet.sent_by_key(hash)?.map(|s| s.state) {
+                    Some(State::Signed) => {
+                        self.settle(receiver, donation, DonationState::Owed).await
+                    }
+                    Some(State::Done) => {
+                        self.settle(receiver, donation, DonationState::Settled)
+                            .await
+                    }
+                    Some(State::Abandoned(_)) => {
+                        self.cancel(receiver, hash, "its payment was not made in time")
+                            .await
+                    }
+                    _ => {
+                        tracing::warn!(hash = %hex::encode(hash), %e, "a late donation's payment not given up");
+                        Ok(())
+                    }
+                },
             },
             State::Signed if late => self.settle(receiver, donation, DonationState::Owed).await,
             _ => Ok(()),
