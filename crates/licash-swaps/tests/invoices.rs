@@ -608,6 +608,39 @@ async fn a_wallet_pays_an_invoice_through_a_provider_once() {
     assert_eq!(node.sent().len(), 1);
 }
 
+/// A payment whose record cannot be read is told pending; the others
+/// are followed all the same.
+#[tokio::test]
+async fn a_payment_unread_holds_back_none_of_the_others() {
+    let (_net, dir, node, provider, client) = via().await;
+    let preimage = [7; 32];
+    let request = node.invoice(
+        1_000_000,
+        lock_hash(&preimage),
+        DELTA,
+        Outcome::Pay(preimage),
+    );
+    let lock = client
+        .pay_invoice_via(PROVIDER, A, &request, 100)
+        .await
+        .unwrap();
+    // A paid one, followed first, its lock unreadable.
+    let db = rusqlite::Connection::open(dir.path().join("wallet.sqlite")).unwrap();
+    db.execute(
+        "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
+             expiry_from_height, expiry_height, lock, preimage, state, created_at, updated_at,
+             kind)
+         VALUES (?1, ?1, 'a', 'b', X'00', 0, 0, 0, 0, 0, X'00', ?1, 'paid', 0, 0, 'lightning')",
+        [[9u8; 32]],
+    )
+    .unwrap();
+    let pending = provider.follow_invoices().await.unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(pending[0].0, hex::encode([9; 32]));
+    let paid = client.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(paid.state, LockState::Paid(preimage));
+}
+
 #[tokio::test]
 async fn a_payment_a_provider_gave_up_leaves_one_lock_to_expire() {
     let (_net, _dir, node, provider, client) = via().await;

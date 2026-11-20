@@ -484,9 +484,12 @@ impl<T: Transport> Provider<T> {
             };
             // Claimed whether the node answers or not: it was paid.
             let followed = match (state.as_str(), &info) {
-                ("paid", _) => match self.row(&id)? {
-                    Some(row) if row.stage == Stage::Paid => self.claim(&id, &row).await,
-                    _ => Ok(()),
+                // A row unread is pending, as a claim failed: the others
+                // are followed all the same.
+                ("paid", _) => match self.row(&id) {
+                    Ok(Some(row)) if row.stage == Stage::Paid => self.claim(&id, &row).await,
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e),
                 },
                 (_, Some(info)) => self.follow_invoice(payer, &id, info).await,
                 (_, None) => Ok(()),
