@@ -663,14 +663,11 @@ impl<T: Transport> Wallet<T> {
         let (_, info, _, view) = self.lock_view(&url, &id).await?;
         let proposal = &view.proposal;
         let outputs = proposal.outputs();
-        let amount: u64 = self
-            .owner
-            .scan_key()
-            .receive(proposal)?
-            .iter()
-            .filter(|r| r.branch == Branch::Pay)
+        let received = self.owner.scan_key().receive(proposal)?;
+        let amount = (received.iter().filter(|r| r.branch == Branch::Pay))
             .map(|r| outputs[r.position as usize].denomination())
-            .sum();
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| Error::Invalid("a lock paying more than any amount".into()))?;
         if amount == 0 {
             return Err(Error::PaysNothing);
         }

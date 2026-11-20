@@ -54,7 +54,8 @@ pub fn settle(
     let mut paid_for = 0usize;
     loop {
         let paid = fee.due(total, made.saturating_add(paid_for));
-        let Some(change) = total.checked_sub(amount.saturating_add(paid)) else {
+        // Not `amount + paid` saturated: past `u64`, that would be `total`.
+        let Some(change) = total.checked_sub(amount).and_then(|v| v.checked_sub(paid)) else {
             return Err(paid);
         };
         // The fee grows with the notes paid for until it leaves no more
@@ -227,6 +228,20 @@ mod tests {
         };
         assert_eq!(settle(16, 4, 1, &plain, bits), Ok(1));
         assert_eq!(settle(u64::MAX, 1, 1, &plain, |_| usize::MAX), Ok(1));
+    }
+
+    /// A fee past what the total leaves after the amount is never paid,
+    /// whatever the amount and the fee add up to.
+    #[test]
+    fn a_fee_past_u64_with_the_amount_is_not_paid() {
+        let huge = NoteFee {
+            fee: Fee {
+                base: u64::MAX,
+                ppm: 0,
+            },
+            output_msat: 0,
+        };
+        assert_eq!(settle(u64::MAX, 1, 1, &huge, bits), Err(u64::MAX));
     }
 
     #[test]
