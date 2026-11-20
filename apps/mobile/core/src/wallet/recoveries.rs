@@ -18,7 +18,10 @@ use super::Wallet;
 use crate::{chain::Chain, ChainSource, LicashError};
 
 /// The least rate of its fees, in sat/vB, and its rate without one of the
-/// chain's. Neither P nor the timeout's fee coin is bumped later.
+/// chain's. Her publication P starts at it, then is made again to pay more
+/// as its window runs out, whatever the chain says; her challenge's fee
+/// child is made again at the rate its deadline gives. The timeout's fee
+/// coin, sized at twice it, is never bumped.
 const RECOVERY_RATE: u64 = 2;
 
 /// The last rate read, of the best chain's block of this hash.
