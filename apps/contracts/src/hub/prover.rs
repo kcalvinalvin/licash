@@ -855,6 +855,10 @@ impl Inner {
             let (id, program) = {
                 let mut s = self.state();
                 let mut chained = false;
+                // What the disputes asked of the header chain when its batch
+                // was last looked for.
+                let demanded = || self.chain.as_ref().map(|chain| chain.demanded());
+                let mut seen = None;
                 loop {
                     if let Some(next) = self.next(&s) {
                         break next;
@@ -865,16 +869,21 @@ impl Inner {
                     if self.chain.is_some() && !chained {
                         chained = true;
                         drop(s);
+                        seen = demanded();
                         self.background();
                         s = self.state();
                         continue;
                     }
                     chained = false;
-                    s = self
-                        .wake
-                        .wait_timeout(s, RETRY)
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .0;
+                    // Not waited for if a dispute asked for more since: a
+                    // wake meanwhile, before this waits, would be lost.
+                    if demanded() == seen {
+                        s = self
+                            .wake
+                            .wait_timeout(s, RETRY)
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0;
+                    }
                 }
             };
             let ok = self.prove(&id, &program);

@@ -481,6 +481,12 @@ impl HubChain {
         s.demand = s.demand.max(height);
     }
 
+    /// The block the disputes need a receipt through, the most asked for
+    /// ([`Self::demand`]): 0 until one asks.
+    pub fn demanded(&self) -> u32 {
+        self.state().demand
+    }
+
     /// The batch to prove next, if one is due: for the blocks a dispute
     /// asked for, else for a day of them since the last receipt. At most a
     /// day's blocks of it, the next after it is made.
