@@ -542,6 +542,10 @@ impl<T: Transport> Wallet<T> {
         chain: &impl Blocks,
     ) -> Result<(Vec<Payout>, Vec<(String, String)>), Error> {
         let (mut followed, mut pending) = (Vec::new(), Vec::new());
+        let tip = chain.height().await.map_err(Error::Chain)?;
+        for hash in self.settling_payouts(tip)? {
+            self.recheck_payout(&hash, chain).await?;
+        }
         for hash in self.open_payouts()? {
             match self.payout_after(&hash, self.advance_payout(&hash, chain).await) {
                 Ok(payout) => followed.push(payout),
@@ -594,6 +598,85 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
+    /// The payouts done whose claim is in a block fewer than [`REORG`]
+    /// deep at `tip`: a reorganization could take it out still.
+    fn settling_payouts(&self, tip: u32) -> Result<Vec<[u8; 32]>, Error> {
+        self.store.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT p.hash FROM payouts p JOIN payout_claims c ON c.hash = p.hash
+                 WHERE p.done_at IS NOT NULL AND p.failed IS NULL
+                   AND c.spent_height + ?1 > ?2 + 1
+                 ORDER BY p.created_at, p.rowid",
+            )?;
+            let rows = stmt.query_map([REORG, tip], |r| r.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// Look again at the payout `hash`, done with its claim in a block
+    /// fewer than [`REORG`] deep: under way again, its claim broadcast
+    /// again, unless a claim is still in the chain as deep as a payout
+    /// needs. Whether it is under way again.
+    async fn recheck_payout(&self, hash: &[u8; 32], chain: &impl Blocks) -> Result<bool, Error> {
+        let record = self.payout_row(hash)?;
+        let spent: Option<(u32, bool)> = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT c.spent_height, p.done_at IS NOT NULL AND p.failed IS NULL
+                 FROM payouts p JOIN payout_claims c ON c.hash = p.hash WHERE p.hash = ?1",
+                [hash],
+                |r| Ok((r.get::<_, Option<u32>>(0)?, r.get::<_, bool>(1)?)),
+            )
+            .optional()?
+            .and_then(|(height, done)| height.map(|h| (h, done))))
+        })?;
+        let (Some((height, true)), Some(claim), Some((funding, funding_height, _)), Some(htlc)) =
+            (spent, &record.claim, record.funding, record.htlc()?)
+        else {
+            return Ok(false);
+        };
+        let tip = chain.height().await.map_err(Error::Chain)?;
+        if (tip + 1).saturating_sub(height) >= REORG {
+            return Ok(false);
+        }
+        let claim: Transaction = deserialize(claim).map_err(invalid)?;
+        let first = height.saturating_sub(REORG).max(funding_height) + 1;
+        let need = payout_depth(self.network());
+        let kept = first_spend(chain, funding, &htlc.script_pubkey(), first..=tip)
+            .await?
+            .filter(|(at, spend)| {
+                (spend.compute_txid() == claim.compute_txid()
+                    || htlc.preimage_in(spend, funding).is_some())
+                    && (tip + 1).saturating_sub(*at) >= need
+            });
+        let reopened = self.store.write(|tx| {
+            if let Some((at, _)) = kept {
+                tx.execute(
+                    "UPDATE payout_claims SET spent_height = ?2 WHERE hash = ?1",
+                    params![hash, at],
+                )?;
+                return Ok(false);
+            }
+            let reopened = tx.execute(
+                "UPDATE payouts SET done_at = NULL
+                 WHERE hash = ?1 AND done_at IS NOT NULL AND failed IS NULL",
+                [hash],
+            )?;
+            tx.execute(
+                "UPDATE payout_claims SET spent_height = NULL, scanned_height = ?2
+                 WHERE hash = ?1",
+                params![hash, first - 1],
+            )?;
+            Ok(reopened == 1)
+        })?;
+        if reopened {
+            tracing::warn!(
+                hash = %hex::encode(hash), height,
+                "a payout's claim left the chain: under way again"
+            );
+        }
+        Ok(reopened)
+    }
+
     /// The payouts under way, oldest first.
     pub(crate) fn open_payouts(&self) -> Result<Vec<[u8; 32]>, Error> {
         self.store.read(|c| {
@@ -620,9 +703,12 @@ impl<T: Transport> Wallet<T> {
     }
 
     async fn advance_payout(&self, hash: &[u8; 32], chain: &impl Blocks) -> Result<(), Error> {
-        let record = self.payout_row(hash)?;
+        let mut record = self.payout_row(hash)?;
         if !record.open {
-            return Ok(());
+            if !self.recheck_payout(hash, chain).await? {
+                return Ok(());
+            }
+            record = self.payout_row(hash)?;
         }
         if record.claim.is_some() {
             return self.watch_claim(hash, &record, chain).await;

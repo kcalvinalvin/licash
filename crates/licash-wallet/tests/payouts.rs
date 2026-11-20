@@ -676,6 +676,38 @@ async fn a_payouts_progress_shows_each_step_as_it_comes() {
     assert_eq!(done.claim_height, Some(eco.net.view(A).height()));
 }
 
+/// A payout done is looked at again until its claim is buried: under way
+/// again, its claim broadcast again, once a reorganization takes its
+/// block out.
+#[tokio::test]
+async fn a_payout_done_whose_claim_leaves_the_chain_is_under_way_again() {
+    let eco = Eco::new().await;
+    let payout = eco.pay_out(1000).await;
+    eco.desk.fund(None, None);
+    eco.follow(&payout).await.unwrap();
+    let claims = eco.client.payout_claims().unwrap();
+    eco.net.confirm(A, claims.clone());
+    let claimed = eco.view.height();
+    assert_eq!(eco.follow(&payout).await.unwrap().state, PayoutState::Done);
+    eco.mine(2);
+    // Still in the chain: done still, nothing to broadcast.
+    let (followed, waiting) = eco.client.follow_payouts(&eco.view).await.unwrap();
+    assert!(followed.is_empty() && waiting.is_empty(), "{waiting:?}");
+    assert!(eco.client.payout_claims().unwrap().is_empty());
+    // Its block replaced by a longer chain without it.
+    eco.net.reorg(A, claimed - 1);
+    eco.mine(4);
+    let (followed, waiting) = eco.client.follow_payouts(&eco.view).await.unwrap();
+    assert_eq!(followed.len(), 1);
+    assert_ne!(followed[0].state, PayoutState::Done);
+    assert!(waiting[0].1.contains("not confirmed yet"), "{waiting:?}");
+    assert_eq!(eco.client.payout_claims().unwrap(), claims);
+    // In a block again: done.
+    eco.net.confirm(A, claims);
+    assert_eq!(eco.follow(&payout).await.unwrap().state, PayoutState::Done);
+    assert!(eco.client.payout_claims().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn a_payout_pays_the_address_exactly_and_the_provider_its_lock() {
     let eco = Eco::new().await;
