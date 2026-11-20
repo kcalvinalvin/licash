@@ -82,8 +82,8 @@ pub fn answer_from(openings: &licash_contracts::hub::Openings, hub: Arc<Hub>) {
         Ok(ledger.evidence(claim)?)
     }));
     let ledger = hub.clone();
-    openings.claims_with(Arc::new(move |contract, publication| {
-        Ok(hub.retire_claimed(contract, publication)?)
+    openings.claims_with(Arc::new(move |contract, named| {
+        Ok(hub.retire_claimed(contract, named.held(), named.locks())?)
     }));
     let reader = ledger.clone();
     openings.folds_with(Arc::new(licash_contracts::hub::FoldLedger {

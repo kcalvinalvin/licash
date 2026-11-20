@@ -28,8 +28,11 @@ pub struct FoldLedger {
     /// Retire the notes of a claim for a contract's fold, if none was
     /// spent or claimed in another claim, all or none. Again is nothing
     /// new.
-    pub retire: Box<super::Claims>,
+    pub retire: Box<Retire>,
 }
+
+/// Retire the notes of a claim for a contract's fold ([`FoldLedger::retire`]).
+pub type Retire = dyn Fn(&[u8; 32], &Publication) -> Result<()> + Send + Sync;
 
 /// Whether notes are open to a contract's fold ([`FoldLedger::claimable`]).
 pub type Claimable = dyn Fn(&[u8; 32], &[Point]) -> Result<()> + Send + Sync;

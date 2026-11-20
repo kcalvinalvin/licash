@@ -188,6 +188,34 @@ CREATE TABLE claimed (
 CREATE INDEX claimed_y ON claimed (y);
 ";
 
+/// The locks holders' claims showed the hub, a component of their own
+/// beside the ledger's: a hub's file of before it has none, which says
+/// that none was shown it since, and nothing of the claims read before.
+/// Made empty the first time such a file is opened, and no work with it.
+pub(crate) const SHOWN: &str = "shown";
+pub(crate) const SHOWN_VERSION: i64 = 1;
+
+const SHOWN_SCHEMA: &str = "
+-- Each lock of her own notes that the hub never served and a holder's
+-- claim on Bitcoin took the refund of, as its filing showed it, signed by
+-- the owners of the notes it spends: the evidence of that spend, as cited
+-- against any other claim of them. Never deleted, never settled.
+CREATE TABLE shown_locks (
+    id BLOB PRIMARY KEY,
+    keyset BLOB NOT NULL,
+    contract BLOB NOT NULL,
+    evidence BLOB NOT NULL,
+    at INTEGER NOT NULL
+) STRICT;
+-- Each note such a claim gave up by its lock alone, its hold key having
+-- signed nothing: retired, spent by nothing else, with the first lock
+-- shown of it.
+CREATE TABLE shown_inputs (
+    y BLOB PRIMARY KEY,
+    lock BLOB NOT NULL REFERENCES shown_locks (id)
+) STRICT;
+";
+
 pub(crate) struct Store {
     inner: Mutex<Inner>,
     halted: AtomicBool,
@@ -211,6 +239,7 @@ impl Store {
         let mut conn = licash_store::create(path, Kind::Hub).map_err(setup)?;
         let created = licash_store::write(&mut conn, |tx| {
             licash_store::component_in(tx, COMPONENT, VERSION, SCHEMA).map_err(setup)?;
+            licash_store::component_in(tx, SHOWN, SHOWN_VERSION, SHOWN_SCHEMA).map_err(setup)?;
             tx.execute(
                 "INSERT INTO meta (one, seq, created_at) VALUES (1, 0, ?1)",
                 [now()],
@@ -254,8 +283,10 @@ impl Store {
             }
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
-        let conn = licash_store::open(path, Kind::Hub).map_err(setup)?;
+        let mut conn = licash_store::open(path, Kind::Hub).map_err(setup)?;
         check_version(&conn)?;
+        // A file of before claims showed locks: the tables, empty.
+        licash_store::component(&mut conn, SHOWN, SHOWN_VERSION, SHOWN_SCHEMA).map_err(setup)?;
         let seq = conn.query_row("SELECT seq FROM meta", [], |r| r.get(0))?;
         Ok(Self {
             inner: Mutex::new(Inner { conn, seq }),

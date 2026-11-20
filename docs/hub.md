@@ -443,14 +443,33 @@ closed, its request R and its publication (the claim it files) come on
 Bitcoin. Once the publication is as deep as a contract's funding, the hub
 records every note the claim names as spent in `hub.sqlite`, whatever the
 dispute pays her: no spend takes them after, and her claim of them is
-evidence against any other claim of the same notes, in any contract. Then
+evidence against any other claim of the same notes, in any contract. It
+reads her filing as the contract's statement does
+(`licash::recovery::named`): under the lean filing an item that is not valid
+(a note never issued, a hold signature not its note's) is worth nothing and
+leaves the rest a claim, which the hub answers and whose notes it records,
+each that its hold key signed for, the one never issued too. A note named
+with a signature that is not its hold key's is nobody's to give up, and is
+not recorded. One exception, of the lean filing: the statement verifies no
+hold signature of the notes a lock of hers spends, so it owes her the refund
+of a lock the hub never certified whether or not their hold keys signed her
+claim. The lock in her filing is signed by their owners all the same, so a
+hub retires each such note by it (the component `shown` of `hub.sqlite`,
+made empty when a hub of an earlier release opens its file): no spend takes
+the note after, the lock itself is never served, and it is the hub's
+evidence against any other claim of the note. Then
 it decides what the claim is owed against its ledger: the spends it retired
-the claimed notes for (owner-signed, a granted one with its unlock), other
-claims of them, and, for each timed lock the claim names, the branch it did
-not settle it on (its preimage, or its expiry). While its ledger gives it
+the claimed notes for (owner-signed, a granted one with its unlock), the locks other claims
+gave them up by, other claims of them, and, for each timed lock the claim names, the branch it did
+not settle it on (its preimage, or its expiry). A candidate its statement
+refuses, or that voids nothing but items not valid anyway, is left out
+alone, and the others cited. While its ledger gives it
 no evidence (its scan behind the claim's block, a halt), it responds
 nothing and tries again at each poll; once half the blocks it may respond
-in are gone, an alert names the contract and why. Owed all it asks, the hub lets
+in are gone, an alert names the contract and why, and the hub answers on
+what its statement decides with no evidence at all, if that is less than
+she asks (an item not valid, a refund not yet expired): less than its
+ledger would have saved it, more than no answer. Owed all it asks, the hub lets
 the holder's timeout pay her. Owed less (a claim of notes that are not the
 keyset's, or spent), it responds with what is owed, publishes in the
 response's disclose slot what that evidence needs public (a granted spend's

@@ -41,7 +41,7 @@ default = ["node"]
 node = ["dep:axum", "dep:licash-chain-client", "dep:sha2"]
 # A contract kept without opening one, for tests of what it holds a wallet to.
 testing = []
-# A dishonest hub's behaviors, for tests.
+# A dishonest hub's behaviors, and a dishonest holder's, for tests.
 faults = ["node"]
 
 [dev-dependencies]

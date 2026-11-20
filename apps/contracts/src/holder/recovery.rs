@@ -474,6 +474,24 @@ mod consensus_all {
     }
 }
 
+/// What a dishonest holder files instead of the bytes of her claim's
+/// filing ([`forge_filings`]).
+#[cfg(feature = "faults")]
+pub type Forge = Box<dyn Fn(&Filing, Vec<u8>) -> Vec<u8> + Send + Sync>;
+
+#[cfg(feature = "faults")]
+static FORGE: std::sync::RwLock<Option<Forge>> = std::sync::RwLock::new(None);
+
+/// Publish, of every claim filed from now on in this process, what `forge`
+/// makes of its filing's bytes, as a dishonest holder would to have her
+/// hub read her claim wrong; with none, the bytes again. Her claim's
+/// digest and amount stay those of the filing: for tests of the hub's
+/// answer to bytes no wallet of this code files.
+#[cfg(feature = "faults")]
+pub fn forge_filings(forge: Option<Forge>) {
+    *FORGE.write().unwrap_or_else(|e| e.into_inner()) = forge;
+}
+
 /// Whether the statement of the contract of `base` would owe the claim
 /// filed as `filed` under `request` whole, should the hub show nothing
 /// against it: its own judgment ([`licash::recovery::owed`]), on the
@@ -1357,6 +1375,17 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
         );
         Ok(filing)
     }
+    /// The bytes of `filing` as her publication carries them, and as she
+    /// judges the hub's response to it on.
+    fn filed(&self, filing: &Filing) -> Vec<u8> {
+        let bytes = filing.to_bytes(Format::of(&self.o.base));
+        #[cfg(feature = "faults")]
+        if let Some(forge) = FORGE.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            return forge(filing, bytes);
+        }
+        bytes
+    }
+
     fn filing_of(&self, state: &State) -> Result<Filing> {
         let p = self.o.base.parts();
         let bytes = hex::decode(state.filing.as_deref().context("no filing")?)?;
@@ -1576,7 +1605,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             .value
             .checked_sub(r_total)
             .context("R creates money")?;
-        let bytes = filing.to_bytes(Format::of(&self.o.base));
+        let bytes = self.filed(filing);
         let at = |vout| OutPoint {
             txid: r.compute_txid(),
             vout,
@@ -2344,7 +2373,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             amount,
             claim_digest,
         };
-        let filed = self.filing_of(state)?.to_bytes(Format::of(&self.o.base));
+        let filed = self.filed(&self.filing_of(state)?);
         let parts = self.o.base.parts();
 
         // What the hub responded on.

@@ -2516,6 +2516,49 @@ async fn stale_claim(seed: [u8; 32]) -> Result<Stale> {
 /// As [`stale_claim`], its hub's ledger scanned, if `scanned`, to before
 /// her request.
 async fn stale_claim_scanned(seed: [u8; 32], scanned: bool) -> Result<Stale> {
+    stale_claim_after(seed, scanned, |_| ()).await
+}
+
+/// A dishonest holder's filings for as long as it lives
+/// ([`licash_contracts::holder::recovery::forge_filings`]): honest again
+/// when the test ends, however it does.
+struct Forging;
+
+impl Forging {
+    fn of(forge: licash_contracts::holder::recovery::Forge) -> Self {
+        licash_contracts::holder::recovery::forge_filings(Some(forge));
+        Self
+    }
+}
+
+impl Drop for Forging {
+    fn drop(&mut self) {
+        licash_contracts::holder::recovery::forge_filings(None);
+    }
+}
+
+/// `bytes`, those of `filing`, with the issuance proof of its settled note
+/// `at` no longer the issuer's: a note never issued, to the statement that
+/// reads them, signed for by its hold key all the same.
+fn never_issued(filing: &licash::recovery::Filing, at: usize, mut bytes: Vec<u8>) -> Vec<u8> {
+    let note = filing.witness().notes[at].to_compact_bytes();
+    let found: Vec<usize> = (bytes.windows(note.len()).enumerate())
+        .filter(|(_, w)| *w == note)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(found.len(), 1, "a note's bytes, once in its filing");
+    // C, the kind of its proof, then the proof: the last byte of that.
+    bytes[found[0] + 33 + 1 + 63] ^= 1;
+    bytes
+}
+
+/// As [`stale_claim_scanned`], with `before` run on its hub before she
+/// forces her contract closed.
+async fn stale_claim_after(
+    seed: [u8; 32],
+    scanned: bool,
+    before: impl FnOnce(&Arc<Hub>),
+) -> Result<Stale> {
     use licash_contracts::holder::recovery;
 
     let StaleCopy {
@@ -2534,6 +2577,7 @@ async fn stale_claim_scanned(seed: [u8; 32], scanned: bool) -> Result<Stale> {
     if scanned {
         while !watch::step(&hub, &source).await? {}
     }
+    before(&hub);
     let forced =
         recovery::force_close(&wallet, &chain, &mine.join("wallet.sqlite"), &id, rate).await?;
     ensure!((forced.claimed, forced.notes) == (131_071, 4), "{forced:?}");
@@ -2694,6 +2738,137 @@ async fn a_hub_meets_a_stale_claim_with_the_spend_it_released_and_pays_what_is_l
     Ok(())
 }
 
+/// The notes of `dir`'s hub that claims on Bitcoin retired.
+fn retired(dir: &Path) -> Result<i64> {
+    let db = rusqlite::Connection::open(dir.join("hub").join("hub.sqlite"))?;
+    Ok(db.query_row("SELECT count(*) FROM claimed", [], |r| r.get(0))?)
+}
+
+/// A stale claim one note of which was never issued, as its filing shows
+/// it: her wallet's copy claims the note she paid away, and files another
+/// of her notes with an issuance proof that is not the issuer's. The
+/// contract's statement owes that note nothing and the rest as ever, and
+/// so does the hub: it reads the claim its statement decides on, meets
+/// the note paid away with the spend it released, responds what the two
+/// others are worth, and retires all four, which she signed for. A hub
+/// that read no claim in such a filing answered nothing, paid her all she
+/// claimed at her timeout and left the four hers to claim again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_meets_a_stale_claim_of_a_note_never_issued_with_the_spend_it_released() -> Result<()>
+{
+    let mut forging = None;
+    let s = stale_claim_after([21; 32], false, |hub| {
+        let ledger = hub.clone();
+        forging = Some(Forging::of(Box::new(move |filing, bytes| {
+            // The note paid away, as the hub's ledger holds its spend:
+            // another is the one never issued.
+            let held = ledger.evidence(filing.publication().claim()).unwrap();
+            let spent: Vec<_> = (held.iter())
+                .flat_map(|e| match e {
+                    licash::recovery::Evidence::Spend { notes, .. } => notes.clone(),
+                    _ => Vec::new(),
+                })
+                .map(|n| n.message().identifier().unwrap())
+                .collect();
+            assert_eq!(spent.len(), 1);
+            let notes = &filing.witness().notes;
+            let at = (notes.iter())
+                .position(|n| !spent.contains(&n.message().identifier().unwrap()))
+                .unwrap();
+            never_issued(filing, at, bytes)
+        })));
+    })
+    .await?;
+    ensure!(retired(s._dir.path())? == 0);
+    let done = played(&s, |_| true).await?;
+    let x = done.response.context("no response")?;
+    ensure!(s.rt.confirmations(&x)?.is_some(), "{done:?}");
+    // Its disclose slot spent: the unlock of the spend published.
+    ensure!(!s.rt.is_unspent(&bitcoin::OutPoint { txid: x, vout: 2 })?);
+    // Her notes less the one paid away and the one never issued.
+    ensure!(done.corrected == Some(65_536), "{done:?}");
+    ensure!(
+        done.assertion.is_none() && done.challenge.is_none(),
+        "{done:?}"
+    );
+    ensure!(done.payout.is_some() && done.timeout.is_none(), "{done:?}");
+    // All four retired, the one never issued too: none is claimed again.
+    ensure!(retired(s._dir.path())? == 4);
+    drop(forging);
+    Ok(())
+}
+
+/// A hub that cannot read its ledger answers a claim it proves owed less
+/// without it: of the stale claim one note was never issued, as its
+/// filing shows it, which the contract's statement finds with no evidence
+/// at all. While its ledger may yet answer it waits; half the blocks to
+/// respond in gone, it tells its operator, once, and responds what the
+/// three other notes are worth, the note paid away among them: less than
+/// its ledger would have saved it, and more than no answer.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_whose_ledger_gives_no_evidence_answers_on_what_it_proves_without() -> Result<()> {
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let mut forging = None;
+    let s = stale_claim_after([22; 32], false, |_| {
+        forging = Some(Forging::of(Box::new(|filing, bytes| {
+            never_issued(filing, 0, bytes)
+        })));
+    })
+    .await?;
+    let told = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let alerts = told.clone();
+    s.openings.alert_with(Arc::new(move |message: &str| {
+        alerts.lock().unwrap().push(message.to_owned())
+    }));
+    let count = |of: &str| {
+        let told = told.lock().unwrap();
+        told.iter().filter(|m| m.contains(of)).count()
+    };
+    // Its ledger changed under it: halted, it reads nothing more.
+    let db = rusqlite::Connection::open(s._dir.path().join("hub").join("hub.sqlite"))?;
+    db.execute("UPDATE meta SET seq = seq + 1", [])?;
+    drop(db);
+    ensure!(s.hub.alert("halt").is_err() && s.hub.halted());
+
+    let (mut waited, mut done) = (0, None);
+    for _ in 0..800 {
+        s.rt.mine(1)?;
+        let round = s.openings.answer_requests().await?;
+        // While it waits for its ledger it answers nothing, and tells
+        // nobody it will.
+        if count("what it proves without") == 0 {
+            ensure!(round.answered == 0, "{round:?}");
+            waited += round.failed;
+        }
+        let r = recovery::advance(&s.wallet, &s.chain, &s.mine.join("wallet.sqlite"), s.rate)
+            .await?[0]
+            .clone();
+        ensure!(r.stage != Stage::Lost, "{r:?}");
+        if r.stage == Stage::Done {
+            done = Some(r);
+            break;
+        }
+    }
+    let done = done.context("never paid")?;
+    ensure!(waited > 0, "the hub never waited for its ledger");
+    ensure!(
+        count("what it proves without") == 1 && count("cannot decide its answer") == 0,
+        "{:?}",
+        told.lock().unwrap()
+    );
+    let x = done.response.context("no response")?;
+    ensure!(s.rt.confirmations(&x)?.is_some(), "{done:?}");
+    // Nothing cited, nothing disclosed.
+    ensure!(s.rt.is_unspent(&bitcoin::OutPoint { txid: x, vout: 2 })?);
+    ensure!(done.corrected == Some(98_304), "{done:?}");
+    ensure!(done.payout.is_some() && done.timeout.is_none(), "{done:?}");
+    drop(forging);
+    Ok(())
+}
+
 /// A lock of hers the hub certified and never settled is refunded on
 /// Bitcoin: her force close past its expiry at depth claims its refund
 /// beside her notes, and the hub, once its ledger scanned her claim's
@@ -2826,6 +3001,18 @@ impl licash_wallet::Transport for NoLock {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs bitcoind and a release build"]
 async fn a_force_close_claims_the_refund_of_a_lock_its_hub_never_certified() -> Result<()> {
+    uncertified_refund([18; 32], || ()).await?;
+    Ok(())
+}
+
+/// The force close of a holder past the expiry of a lock of hers her hub
+/// never heard of, played to its end, her timeout paying her notes and the
+/// lock's refund; `before` run before she files. Her hub's directory and
+/// ledger.
+async fn uncertified_refund(
+    seed: [u8; 32],
+    before: impl FnOnce(),
+) -> Result<(tempfile::TempDir, Arc<Hub>)> {
     use licash_contracts::holder::recovery::{self, Stage};
 
     let rt = Regtest::start_standard()?;
@@ -2845,7 +3032,7 @@ async fn a_force_close_claims_the_refund_of_a_lock_its_hub_never_certified() -> 
         &chain,
         &dir.path().join("wallet"),
         &url,
-        [18; 32],
+        seed,
         &[COIN, COIN],
         NoLock(Http::new(None)?),
     )
@@ -2879,6 +3066,7 @@ async fn a_force_close_claims_the_refund_of_a_lock_its_hub_never_certified() -> 
     rt.mine_to_height(expiry + 12)?;
     while !watch::step(&hub, &source).await? {}
 
+    before();
     let rate = bitcoin::FeeRate::from_sat_per_vb(2).context("a rate")?;
     let forced = recovery::force_close(
         &wallet,
@@ -2915,6 +3103,82 @@ async fn a_force_close_claims_the_refund_of_a_lock_its_hub_never_certified() -> 
         done.response.is_none() && done.timeout.is_some() && done.payout == done.timeout,
         "{done:?}"
     );
+    Ok((dir, hub))
+}
+
+/// The refund of such a lock claimed with a signature that is not its
+/// input's hold key's: the statement of a lean contract, which verifies no
+/// hold signature of a lock's inputs, owes it all the same, and her
+/// timeout pays it. Her hub, shown the lock in her filing, signed by the
+/// input's owner, retires that note by it: no spend takes it after, and
+/// the lock is its answer to any other claim of it. A hub that retired
+/// only what hold keys signed for left the note hers to spend or to claim
+/// again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_retires_the_input_of_a_lock_whose_refund_is_claimed_without_its_hold_key(
+) -> Result<()> {
+    use licash::recovery::{Evidence, SourceWitness};
+
+    let input = Arc::new(std::sync::Mutex::new(None));
+    let mut forging = None;
+    let seen = input.clone();
+    let (dir, hub) = uncertified_refund([23; 32], || {
+        forging = Some(Forging::of(Box::new(move |filing, mut bytes| {
+            let [SourceWitness::Signed { notes, .. }] = &filing.witness().sources[..] else {
+                panic!("not one lock on its own inputs");
+            };
+            let [note] = &notes[..] else {
+                panic!("not a lock of one note");
+            };
+            let records = filing.publication().envelope().records();
+            let record = (records.iter())
+                .find(|r| &r.message == note.message())
+                .expect("her wallet signs for the input");
+            let sig = &record.sig.0[..];
+            let found: Vec<usize> = (bytes.windows(sig.len()).enumerate())
+                .filter(|(_, w)| *w == sig)
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(found.len(), 1, "a hold signature, once in its filing");
+            bytes[found[0] + sig.len() - 1] ^= 1;
+            *seen.lock().unwrap() = Some(note.clone());
+            bytes
+        })));
+    })
+    .await?;
+    drop(forging);
+    let note = input.lock().unwrap().clone().context("nothing filed")?;
+    let y = note.message().identifier()?;
+    // Retired, by the lock and no hold key's word, and spent by nothing.
+    ensure!(hub.spent(&[y])? == [true]);
+    let db = rusqlite::Connection::open(dir.path().join("hub").join("hub.sqlite"))?;
+    let rows = |sql: &str| -> Result<i64> { Ok(db.query_row(sql, [&y.0], |r| r.get(0))?) };
+    ensure!(rows("SELECT count(*) FROM shown_inputs WHERE y = ?1")? == 1);
+    ensure!(rows("SELECT count(*) FROM claimed WHERE y = ?1")? == 0);
+    ensure!(rows("SELECT count(*) FROM spent WHERE y = ?1")? == 0);
+    // Against a claim of it in any other contract: the lock, which voids
+    // it to whoever checks.
+    let keyset = (hub.info().keysets.into_iter())
+        .find(|k| k.id() == note.keyset_id())
+        .context("no keyset of the note's")?;
+    let context = licash::claim::Context {
+        base: [9; 32],
+        deposit: [8; 36],
+        cap: 131_071,
+    };
+    let parts = licash::claim::Parts {
+        items: vec![licash::claim::Item::Settled(note.message().clone())],
+        sources: vec![],
+        activations: vec![],
+        authorizations: vec![note.message().clone()],
+    };
+    let again = licash::claim::UnsignedClaim::new(context, &keyset, 1, parts, 16)?;
+    let found = hub.evidence(&again)?;
+    let [lock @ Evidence::Spend { unlock: None, .. }] = &found[..] else {
+        anyhow::bail!("not the lock alone: {} found", found.len());
+    };
+    ensure!(licash::recovery::voids_note(&keyset, note.message(), lock)?);
     Ok(())
 }
 

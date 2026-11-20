@@ -2,41 +2,111 @@
 //!
 //! A claim published in a recovery contract names notes, each by its hold
 //! key signing the claim. Once the hub reads a claim, no spend takes a note
-//! it names, ever: whatever her dispute pays her, she gave the notes up for
-//! it. Each claimed note is also evidence against any other claim of it
+//! it names so, ever: whatever her dispute pays her, she gave the notes up
+//! for it. Each claimed note is also evidence against any other claim of it
 //! ([`Evidence::SecondClaim`]), so no note is paid twice across contracts.
+//! A note named with a signature that is not its hold key's is not claimed:
+//! nobody gave it up, and the row would cite nothing.
+//!
+//! One exception, of a lean contract, whose statement verifies no hold
+//! signature of the inputs of a lock of her own notes
+//! ([`licash::claim::Source::OwnInputs`]): it owes her the refund of a lock
+//! the hub never served whether or not their hold keys signed her claim.
+//! Such an input is given up by the lock itself, which its owner signed
+//! ([`licash::recovery::Named::locks`]): the hub keeps the lock, spends the
+//! note for nobody, and cites the lock, an owner-signed spend, against any
+//! other claim of it. The lock is not served: neither branch of it is ever
+//! issued.
+//!
 //! A claim a contract is closed cooperatively on ([`Hub::claim_for_fold`])
 //! retires its notes the same way, before the hub signs the fold that pays
 //! them, but only of notes nothing spent: no dispute follows to cite one.
+
+use std::collections::BTreeSet;
 
 use licash::{
     crypto::{Point, Signature},
     hold::{self, Record},
     note::Message,
-    recovery::{Evidence, Publication},
+    recovery::{evidence_to_bytes, Evidence, Held, Publication},
+    spend::ProposalId,
 };
 use rusqlite::{params, Connection};
 
 use crate::{store::now, Error, Hub, Refusal};
 
 impl Hub {
-    /// Retire the notes that `publication`, the claim filed in the contract
-    /// `contract`, names: from now on no spend takes them. Their hold keys'
-    /// signatures were checked as it was decoded, so a claim retires only
-    /// notes its holder can sign for. Retiring them again changes nothing.
+    /// Retire the notes `held` of the claim filed in the contract
+    /// `contract`: from now on no spend takes them. Each is there by its
+    /// hold key's signature of the claim ([`Held`]), so a claim retires
+    /// only notes its holder can sign for, and all of those, whatever else
+    /// of the claim is not valid. Retiring them again changes nothing.
+    ///
+    /// With them, in the same transaction, each input of the locks `shown`
+    /// (the claim's [`licash::recovery::Named::locks`], owner-signed spends
+    /// and nothing else) that is neither held nor spent already, and the
+    /// lock that gave it up, kept to be cited.
     pub fn retire_claimed(
         &self,
         contract: &[u8; 32],
-        publication: &Publication,
+        held: &Held,
+        shown: &[Evidence],
     ) -> Result<(), Error> {
-        let envelope = publication.envelope();
-        let context = envelope.context().to_bytes();
-        let records = envelope
+        let context = held.context().to_bytes();
+        let records = held
             .records()
             .iter()
             .map(|record| Ok((record.message.identifier()?, record)))
             .collect::<Result<Vec<_>, Error>>()?;
-        let held = self.store.write(|tx| {
+        let by_hold: BTreeSet<Point> = records.iter().map(|(y, _)| *y).collect();
+        let mut locks = Vec::new();
+        for lock in shown {
+            let Evidence::Spend {
+                signed,
+                notes,
+                unlock: None,
+            } = lock
+            else {
+                continue;
+            };
+            let mut ys = Vec::new();
+            for note in notes {
+                let y = note.message().identifier()?;
+                if !by_hold.contains(&y) {
+                    ys.push(y);
+                }
+            }
+            let proposal = signed.proposal();
+            let bytes = evidence_to_bytes(std::slice::from_ref(lock));
+            locks.push((proposal.id(), *proposal.keyset_id(), ys, bytes));
+        }
+        let (held, by_lock) = self.store.write(|tx| {
+            let mut by_lock = 0;
+            for (id, keyset, ys, bytes) in &locks {
+                let mut fresh = Vec::new();
+                for y in ys {
+                    let spent = tx
+                        .prepare_cached("SELECT 1 FROM spent WHERE y = ?1")?
+                        .exists([&y.0])?;
+                    if !spent && !is_shown(tx, y)? {
+                        fresh.push(y);
+                    }
+                }
+                if fresh.is_empty() {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO shown_locks (id, keyset, contract, evidence, at)
+                     VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING",
+                    params![id.as_bytes(), keyset, contract, bytes, now()],
+                )?;
+                for y in fresh {
+                    by_lock += tx.execute(
+                        "INSERT INTO shown_inputs (y, lock) VALUES (?1, ?2)",
+                        params![&y.0, id.as_bytes()],
+                    )?;
+                }
+            }
             let mut held = 0;
             for (y, record) in &records {
                 held += tx.execute(
@@ -52,10 +122,18 @@ impl Hub {
                     ],
                 )?;
             }
-            Ok(held)
+            Ok((held, by_lock))
         })?;
         if held > 0 {
             tracing::info!(contract = %hex::encode(contract), notes = held, "claimed notes retired");
+        }
+        if by_lock > 0 {
+            tracing::warn!(
+                contract = %hex::encode(contract),
+                notes = by_lock,
+                "notes retired that a claim gave up by a lock alone, their hold keys' \
+                 signatures not theirs"
+            );
         }
         Ok(())
     }
@@ -127,7 +205,7 @@ fn open_to_fold(
     let mut spent = c.prepare_cached("SELECT 1 FROM spent WHERE y = ?1")?;
     let mut claims = c.prepare_cached("SELECT contract, context FROM claimed WHERE y = ?1")?;
     for y in ys {
-        if spent.exists([&y.0])? {
+        if spent.exists([&y.0])? || is_shown(c, y)? {
             return Err(Refusal::Spent.into());
         }
         let rows = claims.query_map([&y.0], |r| {
@@ -144,10 +222,60 @@ fn open_to_fold(
     Ok(())
 }
 
-/// Whether a claim on Bitcoin retired `y`.
+/// Whether a claim on Bitcoin retired `y`: by its hold key's signature,
+/// or by a lock it showed.
 pub(crate) fn is_claimed(c: &Connection, y: &Point) -> Result<bool, Error> {
     Ok(c.prepare_cached("SELECT 1 FROM claimed WHERE y = ?1")?
+        .exists([&y.0])?
+        || is_shown(c, y)?)
+}
+
+/// Whether a claim on Bitcoin gave `y` up by a lock alone.
+fn is_shown(c: &Connection, y: &Point) -> Result<bool, Error> {
+    Ok(c.prepare_cached("SELECT 1 FROM shown_inputs WHERE y = ?1")?
         .exists([&y.0])?)
+}
+
+/// A lock a claim showed, as kept: its keyset and its evidence's bytes.
+pub(crate) struct Shown {
+    pub(crate) id: ProposalId,
+    pub(crate) keyset: [u8; 32],
+    pub(crate) evidence: Vec<u8>,
+}
+
+/// The locks claims gave any of `ys` up by, each once, in the order of
+/// `ys`. A row that is not as it was kept is left out alone, with a
+/// warning: the others are evidence all the same.
+pub(crate) fn shown(c: &Connection, ys: &[Point]) -> Result<Vec<Shown>, Error> {
+    let mut stmt = c.prepare_cached(
+        "SELECT l.id, l.keyset, l.evidence FROM shown_inputs i
+         JOIN shown_locks l ON l.id = i.lock WHERE i.y = ?1",
+    )?;
+    let mut seen = BTreeSet::new();
+    let mut locks = Vec::new();
+    for y in ys {
+        let rows = stmt.query_map([&y.0], |r| {
+            Ok(Shown {
+                id: ProposalId::from_bytes(r.get(0)?),
+                keyset: r.get(1)?,
+                evidence: r.get(2)?,
+            })
+        })?;
+        for row in rows {
+            match row {
+                Ok(lock) => {
+                    if seen.insert(lock.id) {
+                        locks.push(lock);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    note = %hex::encode(y.0),
+                    "a lock a claim showed not read back: {e}"
+                ),
+            }
+        }
+    }
+    Ok(locks)
 }
 
 /// Whether a claim on Bitcoin retired any of `ys`.

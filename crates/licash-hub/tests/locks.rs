@@ -1494,3 +1494,69 @@ fn the_forwards_since_a_time_sum_what_is_paid_or_under_way() {
     assert!(hub.forwarded_since(at).unwrap() >= 4);
     assert_eq!(hub.forwarded_since(at + 1).unwrap(), 0);
 }
+
+#[test]
+fn a_lock_a_claim_showed_is_never_served_nor_another_of_its_input() {
+    use licash::claim::{Context, Item, Parts, UnsignedClaim};
+    let (files, hub, chain) = setup(policy());
+    let (_, keyset) = issuer(&files);
+    let payer = owner(1);
+    let l = standard(&files, &hub, terms(&hub, chain.height() + 5, 1));
+    // Another of the same note, as she might sign any number.
+    let other = {
+        let e = Ephemeral::random();
+        let output = |to: Address, denom, branch, i| {
+            Output::from_derivation(&e.derive(&to, denom, branch, i).unwrap()).unwrap()
+        };
+        let pay = vec![
+            output(owner(2).address(), 2, Branch::Pay, 0),
+            output(owner(2).address(), 1, Branch::Pay, 1),
+            output(hub.info().address, 1, Branch::Pay, 2),
+        ];
+        let refund = vec![output(payer.address(), 4, Branch::Refund, 0)];
+        let lock = TimedLock::new(terms(&hub, chain.height() + 6, 1), refund).unwrap();
+        let proposal = Proposal::new(&keyset, &l.notes, e.public(), pay, Some(lock)).unwrap();
+        let owners = [l
+            .input
+            .ownership()
+            .owner_secret(payer.spend_secret())
+            .unwrap()];
+        SignedProposal::sign(&keyset, proposal, &l.notes, Authorization::Plain, &owners).unwrap()
+    };
+
+    // A claim on Bitcoin shows the first, unserved, holding a note of hers
+    // but not its input.
+    let (kept, d) = mint(&files, &payer, 4);
+    let message = kept.message().clone();
+    let context = Context {
+        base: [7; 32],
+        deposit: [8; 36],
+        cap: 1_000,
+    };
+    let parts = Parts {
+        items: vec![Item::Settled(message.clone())],
+        sources: vec![],
+        activations: vec![],
+        authorizations: vec![message.clone()],
+    };
+    let claim = UnsignedClaim::new(context, &keyset, 1, parts, 16).unwrap();
+    let holds = [(message, d.hold_key(payer.hold_root()).unwrap())];
+    let held = licash::recovery::Publication::sign(claim, &holds, 16)
+        .unwrap()
+        .held();
+    let shown = licash::recovery::Evidence::Spend {
+        signed: l.signed.clone(),
+        notes: l.notes.clone(),
+        unlock: None,
+    };
+    hub.retire_claimed(&[1; 32], &held, &[shown]).unwrap();
+
+    // Neither is served after it: the note is given up, and no branch of
+    // either lock is ever issued.
+    assert_eq!(refused(hub.lock(&l.signed, &l.notes)), Refusal::Spent);
+    assert_eq!(refused(hub.lock(&other, &l.notes)), Refusal::Spent);
+    assert!(!kinds(&hub).iter().any(|kind| kind.contains("lock")));
+    // A lock of a note no claim showed is served as ever.
+    let free = standard(&files, &hub, terms(&hub, chain.height() + 5, 1));
+    hub.lock(&free.signed, &free.notes).unwrap();
+}

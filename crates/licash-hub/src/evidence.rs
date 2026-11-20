@@ -17,7 +17,7 @@ use licash::{
     crypto::{Point, Signature},
     inquiry,
     note::{Message, Note},
-    recovery::Evidence,
+    recovery::{evidence_from_bytes, Evidence},
     spend::ProposalId,
 };
 use rusqlite::{Connection, OptionalExtension};
@@ -35,8 +35,10 @@ impl Hub {
     /// v4 a Pay without an activation is owed nothing, and the statement
     /// refuses an expiry, so the dispute drops it). Ordered by proposal, then
     /// source. A spend the ledger can no longer read back (its keyset gone)
-    /// is left out. Then each other claim on Bitcoin of any of its notes
-    /// ([`Hub::retire_claimed`]).
+    /// is left out. After the spends, each lock another claim gave one of
+    /// its notes up by, never served ([`Hub::retire_claimed`]): an
+    /// owner-signed spend as well. Then each other claim on Bitcoin of any
+    /// of its notes.
     pub fn evidence(&self, claim: &UnsignedClaim) -> Result<Vec<Evidence>, Error> {
         let parts = claim.parts();
         let mut ys = Vec::new();
@@ -48,8 +50,9 @@ impl Hub {
         }
         self.store.read(|c| {
             let mut evidence = Vec::new();
-            for id in spenders(c, &ys)? {
-                match self.spend(c, &id) {
+            let served = spenders(c, &ys)?;
+            for id in &served {
+                match self.spend(c, id) {
                     Ok(Some(spend)) => evidence.push(spend),
                     Ok(None) => {}
                     Err(e) => tracing::warn!(
@@ -58,6 +61,7 @@ impl Hub {
                     ),
                 }
             }
+            evidence.extend(self.shown(c, &ys, &served)?);
             for source in &parts.sources {
                 let Some(terms) = source.terms() else {
                     continue;
@@ -110,8 +114,9 @@ impl Hub {
                 .map(|(note, _)| {
                     let y = note.identifier()?;
                     let mut evidence = Vec::new();
-                    for id in spenders(c, &[y])? {
-                        match self.spend(c, &id) {
+                    let served = spenders(c, &[y])?;
+                    for id in &served {
+                        match self.spend(c, id) {
                             Ok(Some(spend)) => evidence.push(spend),
                             Ok(None) => {}
                             Err(e) => tracing::warn!(
@@ -120,11 +125,48 @@ impl Hub {
                             ),
                         }
                     }
+                    evidence.extend(self.shown(c, &[y], &served)?);
                     evidence.extend(crate::claims::claims_of(c, &y)?);
                     Ok(evidence)
                 })
                 .collect()
         })
+    }
+
+    /// The locks claims gave any of `ys` up by ([`Hub::retire_claimed`]),
+    /// each the owner-signed spend its claim showed, but those `served`.
+    /// One the ledger can no longer read back (its keyset gone, its bytes
+    /// not what it kept) is left out alone, as a spend is: the rest of the
+    /// evidence stands.
+    fn shown(
+        &self,
+        c: &Connection,
+        ys: &[Point],
+        served: &BTreeSet<ProposalId>,
+    ) -> Result<Vec<Evidence>, Error> {
+        let mut evidence = Vec::new();
+        for lock in crate::claims::shown(c, ys)? {
+            if served.contains(&lock.id) {
+                continue;
+            }
+            let read = self.keys(&lock.keyset).and_then(|(_, keyset)| {
+                let read = evidence_from_bytes(keyset, u32::MAX as usize, &lock.evidence)?;
+                match <[Evidence; 1]>::try_from(read) {
+                    Ok([spend @ Evidence::Spend { unlock: None, .. }]) => Ok(spend),
+                    _ => Err(Error::Invalid(licash::Error::Protocol(
+                        "not one lock shown".into(),
+                    ))),
+                }
+            });
+            match read {
+                Ok(spend) => evidence.push(spend),
+                Err(e) => tracing::warn!(
+                    proposal = %hex::encode(lock.id.as_bytes()),
+                    "a lock a claim showed not cited: {e}"
+                ),
+            }
+        }
+        Ok(evidence)
     }
 
     /// The spend `id` as its owners signed it, with the notes it retired in

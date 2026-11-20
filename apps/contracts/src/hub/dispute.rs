@@ -34,7 +34,7 @@ use bitcoin::block::Header;
 use bitcoin::{Amount, Block, BlockHash, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut};
 use licash::claim::UnsignedClaim;
 use licash::disclosure::Disclosures;
-use licash::recovery::{self, Evidence, Filing, Format, Publication};
+use licash::recovery::{self, Evidence, Named};
 use licash::request::Request;
 use licash_contract::dispute::{self, presign, Payout};
 use licash_contract::graph;
@@ -73,8 +73,10 @@ pub type KeepCheckpoint = dyn Fn(&licash::chain::Checkpoint) -> Result<()> + Sen
 
 /// Where the hub's ledger retires the notes that a holder's published
 /// claim in a contract names ([`Openings::claims_with`]): spent by nothing
-/// else from then on. Again is nothing new.
-pub type Claims = dyn Fn(&[u8; 32], &Publication) -> Result<()> + Send + Sync;
+/// else from then on. Again is nothing new. The claim as the contract's
+/// statement reads it ([`recovery::named`]): every note she signed for,
+/// whether or not each item of hers is valid.
+pub type Claims = dyn Fn(&[u8; 32], &Named) -> Result<()> + Send + Sync;
 
 /// A coin's first spend, once found: its block's height and it.
 type Spend = Option<(u32, Transaction)>;
@@ -567,9 +569,10 @@ impl Openings {
     /// The notes her publication names, retired in the hub's ledger once
     /// it is as deep as the hub decides on: before it decides, and
     /// whatever ends the dispute. Once a run; the ledger keeps them. A
-    /// reclaim, or bytes that decode to no claim, name nothing. Not
-    /// retired, the dispute goes on, the operator is told, and the next
-    /// poll tries again.
+    /// reclaim, or bytes its statement reads no claim in, name nothing: a
+    /// claim it reads, of items valid or not, names all she signed for.
+    /// Not retired, the dispute goes on, the operator is told, and the
+    /// next poll tries again.
     async fn retire_claimed(
         &self,
         id: &[u8; 32],
@@ -586,8 +589,8 @@ impl Openings {
         }
         match self.claimed(o, r, r_at, tip).await {
             Ok(None) => {}
-            Ok(Some(Some(publication))) => {
-                if let Err(e) = claims(id, &publication) {
+            Ok(Some(Some(named))) => {
+                if let Err(e) = claims(id, &named) {
                     if self.once(id, "unretired") {
                         self.alert(&format!(
                             "contract {}: her claimed notes are not retired, so the hub may \
@@ -607,14 +610,15 @@ impl Openings {
     }
 
     /// Her publication, once as deep as the hub decides on: none yet, or
-    /// the claim it carries, if any.
+    /// the claim it carries, if any, read as the hub's statement reads it
+    /// ([`recovery::named`]).
     async fn claimed(
         &self,
         o: &HubOpening,
         r: &Transaction,
         r_at: u32,
         tip: u32,
-    ) -> Result<Option<Option<Publication>>> {
+    ) -> Result<Option<Option<Named>>> {
         let slot = OutPoint {
             txid: r.compute_txid(),
             vout: SLOT,
@@ -631,19 +635,10 @@ impl Openings {
         }
         let request = presign(&o.set, "request")?;
         let block = self.block_at(p_at).await?;
-        let parts = o.base.parts();
-        let filing = dispute::published(&request.tx, &block, &p.compute_txid())
+        let named = dispute::published(&request.tx, &block, &p.compute_txid())
             .ok()
-            .and_then(|filed| {
-                Filing::from_bytes(
-                    Format::of(&o.base),
-                    &parts.keyset,
-                    parts.limits.max_authorizations as usize,
-                    &filed,
-                )
-                .ok()
-            });
-        Ok(Some(filing.map(|f| f.publication().clone())))
+            .and_then(|filed| recovery::named(&o.base, &filed).ok());
+        Ok(Some(named))
     }
 
     /// Her request stands: what her publication is owed, and the response
@@ -741,8 +736,30 @@ impl Openings {
             None => match self.select(o, &filed, p_at, owed) {
                 Ok(evidence) => evidence,
                 Err(e) => {
-                    self.undecided(id, &e, r_at, respond_deadline(o, r_at), tip);
-                    return Err(e);
+                    // Its ledger may yet answer: the hub waits for it while
+                    // half the blocks to respond in are left. Then it
+                    // answers on what it proves without, if that is less
+                    // than she asks: an answer of less evidence saves less,
+                    // none saves nothing.
+                    let deadline = respond_deadline(o, r_at);
+                    let alone = owed(&[])
+                        .ok()
+                        .filter(|alone| unevidenced(alone.owed, b, half_gone(r_at, deadline, tip)));
+                    let Some(alone) = alone else {
+                        self.undecided(id, &e, r_at, deadline, tip);
+                        return Err(e);
+                    };
+                    if self.once(id, "unevidenced") {
+                        self.alert(&format!(
+                            "contract {}: the hub cannot read its ledger's evidence against \
+                             her claim ({e:#}), and {} blocks are left to respond in. It \
+                             answers on what it proves without: {} of the {b} she claims.",
+                            crate::hex_id(id),
+                            deadline.saturating_sub(tip),
+                            alone.owed
+                        ));
+                    }
+                    Vec::new()
                 }
             },
         };
@@ -823,8 +840,10 @@ impl Openings {
     }
 
     /// Of the ledger's candidates against her filing, those the statement
-    /// accepts, in order: each must void something the ones before did not.
-    /// None against a claim ineligible or owed nothing.
+    /// accepts, in order ([`cited`]). None against a claim ineligible or
+    /// owed nothing. Her filing is read as the statement reads it
+    /// ([`recovery::named`]): one it decides on is one the hub finds its
+    /// evidence against.
     fn select(
         &self,
         o: &HubOpening,
@@ -839,31 +858,19 @@ impl Openings {
         if none.ineligible.is_some() || none.owed == 0 {
             return Ok(Vec::new());
         }
-        let p = o.base.parts();
-        let format = Format::of(&o.base);
-        let filing = Filing::from_bytes(
-            format,
-            &p.keyset,
-            p.limits.max_authorizations as usize,
-            filed,
-        )
-        .map_err(|e| anyhow!("{e}"))?;
-        let mut kept = Vec::new();
-        for candidate in ledger(filing.publication().claim(), published_at)? {
-            kept.push(candidate);
-            if owed(&kept).is_err() {
-                kept.pop();
-            }
-        }
-        Ok(kept)
+        let named = recovery::named(&o.base, filed).map_err(|e| anyhow!("{e}"))?;
+        let candidates = ledger(named.claim(), published_at)?;
+        Ok(cited(candidates, &none, owed, |evidence| {
+            pinned_evidence(o, &recovery::evidence_to_bytes(evidence))
+        }))
     }
 
     /// The hub could not decide its answer to her request of `r_at`, for
-    /// `why`: no response is made on evidence it cannot read, and it tries
-    /// again every round. While its ledger's scan is a few blocks behind
-    /// her claim's that passes; once half the blocks to `deadline`, the
-    /// last at which a response still confirms in time, are gone, the
-    /// operator is alerted, once.
+    /// `why`, and proves her owed no less than she asks without its
+    /// ledger: no response is made, and it tries again every round. While
+    /// its ledger's scan is a few blocks behind her claim's that passes;
+    /// once half the blocks to `deadline`, the last at which a response
+    /// still confirms in time, are gone, the operator is alerted, once.
     fn undecided(&self, id: &[u8; 32], why: &anyhow::Error, r_at: u32, deadline: u32, tip: u32) {
         if !half_gone(r_at, deadline, tip) || !self.once(id, "undecided") {
             return;
@@ -2202,6 +2209,51 @@ fn child_fee(child: &Transaction, outputs: &[TxOut], coins: &[(OutPoint, TxOut)]
     (anchor + spent).checked_sub(paid).unwrap_or(Amount::ZERO)
 }
 
+/// Of `candidates` against a filing owed `none` with no evidence, those
+/// the hub cites, in order: each as `owed` decides on it with the ones
+/// before, and voiding something they did not.
+///
+/// A candidate is judged as `pinned` reads it back, which is how the hub
+/// reads its evidence every round from its response on: one its pins do
+/// not carry, or the statement refuses, is left out alone, and the rest
+/// stand. So is one that voids only items already invalid, worth nothing
+/// without it: the spend of a note she names and holds no key of is
+/// another's, and is not made public for her naming it.
+fn cited(
+    candidates: Vec<Evidence>,
+    none: &recovery::Owed,
+    owed: impl Fn(&[Evidence]) -> Result<recovery::Owed>,
+    pinned: impl Fn(&[Evidence]) -> Result<Vec<Evidence>>,
+) -> Vec<Evidence> {
+    let mut kept = Vec::new();
+    let mut voided = none.mask;
+    for candidate in candidates {
+        kept.push(candidate);
+        match pinned(&kept).and_then(|read| owed(&read)) {
+            Ok(with) if !idle(voided, &with) => voided = with.mask,
+            _ => {
+                kept.pop();
+            }
+        }
+    }
+    kept
+}
+
+/// Whether the evidence `with` was decided on voids, beyond the items
+/// `voided` before it, only items invalid anyway.
+fn idle(voided: u32, with: &recovery::Owed) -> bool {
+    let fresh = with.mask & !voided;
+    fresh != 0 && fresh & !with.invalid == 0
+}
+
+/// Whether the hub answers a claim of `b` on the `alone` it proves her
+/// owed with no evidence of its ledger's, which it could not read: only
+/// once it is `late` to wait for it, and only if that is less than she
+/// asks, as of a claim with an item not valid.
+fn unevidenced(alone: u32, b: u32, late: bool) -> bool {
+    late && alone < b
+}
+
 /// Whether at `tip` half the blocks are gone from her request at `r_at`
 /// to `deadline`, the last tip at which the hub's answer still confirms.
 fn half_gone(r_at: u32, deadline: u32, tip: u32) -> bool {
@@ -2380,6 +2432,102 @@ mod tests {
             terminal_coin(first, &extra, sat(3_000), stake),
             (coin(2, 6_000), None)
         );
+    }
+
+    fn decided(owed: u32, mask: u32, invalid: u32) -> recovery::Owed {
+        recovery::Owed {
+            owed,
+            mask,
+            invalid,
+            disclosures: Disclosures::empty(),
+            ineligible: None,
+        }
+    }
+
+    fn candidate(n: u8) -> Evidence {
+        Evidence::Expired {
+            source: licash::spend::ProposalId::from_bytes([n; 32]),
+        }
+    }
+
+    fn names(evidence: &[Evidence]) -> Vec<u8> {
+        (evidence.iter())
+            .map(|e| match e {
+                Evidence::Expired { source } => source.as_bytes()[0],
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    /// Of a claim of four items of 10, the second not valid: a candidate
+    /// the statement refuses, one the hub's pins do not carry and one
+    /// that voids nothing but the item not valid are each left out, and
+    /// the others cited all the same, on what they void together.
+    #[test]
+    fn a_candidate_refused_unpinned_or_idle_is_left_out_alone() {
+        const INVALID: u32 = 0b0010;
+        // What each voids: 1 the first item, 3 the invalid one alone, 5
+        // the invalid one and the third, 6 the first again.
+        let voids = |n: u8| match n {
+            1 | 6 => 0b0001,
+            3 => 0b0010,
+            5 => 0b0110,
+            _ => 0,
+        };
+        let owed = |evidence: &[Evidence]| {
+            let mut mask = 0;
+            for n in names(evidence) {
+                ensure!(n != 2, "refused by the statement");
+                ensure!(voids(n) & !mask != 0, "voids nothing");
+                mask |= voids(n);
+            }
+            let live = !(mask | INVALID) & 0b1111;
+            Ok(decided(10 * live.count_ones(), mask, INVALID))
+        };
+        let pinned = |evidence: &[Evidence]| {
+            ensure!(!names(evidence).contains(&4), "not carried");
+            Ok(evidence.to_vec())
+        };
+        let none = owed(&[]).unwrap();
+        assert_eq!(none.owed, 30);
+        let all = || (1..=6).map(candidate).collect::<Vec<_>>();
+        let kept = cited(all(), &none, owed, pinned);
+        assert_eq!(names(&kept), [1, 5]);
+        assert_eq!(owed(&kept).unwrap().owed, 10);
+        // The one that fails first costs the hub none of the rest.
+        let last_first = all().into_iter().rev().collect();
+        assert_eq!(names(&cited(last_first, &none, owed, pinned)), [6, 5]);
+        // Nothing to cite is no error.
+        assert!(cited(Vec::new(), &none, owed, pinned).is_empty());
+        assert!(cited(vec![candidate(2)], &none, owed, pinned).is_empty());
+    }
+
+    /// Evidence is idle that voids only items not valid: one that voids a
+    /// valid item with them, or no item at all (as a spend that values a
+    /// fallback), is not.
+    #[test]
+    fn evidence_is_idle_that_voids_only_items_not_valid() {
+        assert!(idle(0, &decided(0, 0b10, 0b10)));
+        assert!(idle(0b01, &decided(0, 0b11, 0b10)));
+        assert!(!idle(0, &decided(0, 0b11, 0b10)));
+        assert!(!idle(0, &decided(0, 0b01, 0)));
+        assert!(!idle(0b01, &decided(0, 0b01, 0b10)));
+        // Where no item is invalid, nothing is.
+        for mask in 0..16 {
+            assert!(!idle(0, &decided(0, mask, 0)));
+        }
+    }
+
+    /// A hub that cannot read its ledger answers on what it proves alone
+    /// only once late, and only if that is less than she asks: early, its
+    /// ledger may yet give more, and a claim owed whole has no answer.
+    #[test]
+    fn a_hub_without_its_ledger_answers_late_on_what_it_proves_alone() {
+        assert!(unevidenced(98_304, 131_071, true));
+        assert!(unevidenced(0, 131_071, true));
+        assert!(!unevidenced(98_304, 131_071, false));
+        assert!(!unevidenced(131_071, 131_071, true));
+        assert!(!unevidenced(131_072, 131_071, true));
     }
 
     /// A ledger a few blocks behind her claim is no alert; one still

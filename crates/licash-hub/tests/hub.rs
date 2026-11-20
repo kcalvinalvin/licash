@@ -1379,10 +1379,10 @@ fn a_note_a_claim_on_bitcoin_names_is_retired_for_good() {
     let y = claimed.note.message().identifier().unwrap();
     assert_eq!(hub.spent(&[y]).unwrap(), [false]);
     let contract = [1; 32];
-    hub.retire_claimed(&contract, &filed([7; 32], &keyset, &[&claimed]))
+    hub.retire_claimed(&contract, &filed([7; 32], &keyset, &[&claimed]).held(), &[])
         .unwrap();
     // Read again, as after a restart: the same.
-    hub.retire_claimed(&contract, &filed([7; 32], &keyset, &[&claimed]))
+    hub.retire_claimed(&contract, &filed([7; 32], &keyset, &[&claimed]).held(), &[])
         .unwrap();
     assert_eq!(hub.spent(&[y]).unwrap(), [true]);
     let signed = early.sign(&keyset, Authorization::Granted(Box::new(grant)));
@@ -1438,7 +1438,7 @@ fn a_holder_is_shown_what_the_hub_holds_against_her_notes_and_no_one_else() {
     );
     Spend::new(&keyset, std::slice::from_ref(&spent), &[(bob.address(), 8)])
         .complete(&hub, &keyset);
-    hub.retire_claimed(&[1; 32], &filed([7; 32], &keyset, &[&claimed]))
+    hub.retire_claimed(&[1; 32], &filed([7; 32], &keyset, &[&claimed]).held(), &[])
         .unwrap();
     let at = unix();
     let asked: Vec<_> = [&spent, &kept, &claimed]
@@ -1502,7 +1502,7 @@ fn a_note_claimed_in_one_contract_is_cited_against_its_claim_in_another() {
     let alice = owner(1);
     let (twice, once) = (mint(&files, &alice, 8), mint(&files, &alice, 4));
     let first = filed([7; 32], &keyset, &[&twice, &once]);
-    hub.retire_claimed(&[1; 32], &first).unwrap();
+    hub.retire_claimed(&[1; 32], &first.held(), &[]).unwrap();
     // Not against the claim itself.
     assert!(hub.evidence(first.claim()).unwrap().is_empty());
     // Against another claim of one of its notes: that note's signature of
@@ -1654,4 +1654,268 @@ fn the_ledger_is_a_component_of_a_hub_file_and_its_rows_hold_to_their_states() {
     assert!(grant("x'00'", "1").is_ok());
     assert!(grant("x'00'", "NULL").is_err());
     assert!(grant("NULL", "1").is_err());
+}
+
+/// A lock of `coins`, signed by their owners and never served, each refunded
+/// to its owner: the spend a claim's filing shows of them.
+fn shown_lock(keyset: &Keyset, coins: &[Coin]) -> licash::recovery::Evidence {
+    let terms = TimedTerms::new(
+        ChainProfile::Core30DefaultRegtest,
+        [31; 32],
+        1_000,
+        3,
+        [41; 32],
+    )
+    .unwrap();
+    let e = Ephemeral::random();
+    let bob = owner(2).address();
+    let outputs = |branch| -> Vec<Output> {
+        (0..)
+            .zip(coins)
+            .map(|(i, c)| {
+                let to = match branch {
+                    Branch::Pay => bob,
+                    Branch::Refund => c.owner.address(),
+                };
+                let denom = c.note.message().denomination();
+                Output::from_derivation(&e.derive(&to, denom, branch, i).unwrap()).unwrap()
+            })
+            .collect()
+    };
+    let lock = TimedLock::new(terms, outputs(Branch::Refund)).unwrap();
+    let proposal = Proposal::new(
+        keyset,
+        &notes(coins),
+        e.public(),
+        outputs(Branch::Pay),
+        Some(lock),
+    )
+    .unwrap();
+    let secrets: Vec<_> = coins
+        .iter()
+        .map(|c| {
+            c.derivation
+                .ownership()
+                .owner_secret(c.owner.spend_secret())
+                .unwrap()
+        })
+        .collect();
+    licash::recovery::Evidence::Spend {
+        signed: SignedProposal::sign(
+            keyset,
+            proposal,
+            &notes(coins),
+            Authorization::Plain,
+            &secrets,
+        )
+        .unwrap(),
+        notes: notes(coins),
+        unlock: None,
+    }
+}
+
+fn rows(db: &Path, table: &str) -> i64 {
+    sql(db)
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn a_note_a_claim_gives_up_by_a_lock_alone_is_retired_and_its_lock_cited() {
+    use licash::recovery::{
+        evidence_from_bytes, evidence_to_bytes, voids_note, Evidence as Against,
+    };
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let shown = |files: &Files| {
+        (
+            rows(&files.db, "shown_locks"),
+            rows(&files.db, "shown_inputs"),
+        )
+    };
+
+    // A claim that holds the input of its lock, as a wallet files it: the
+    // note is claimed by its hold key, and no lock is kept for it.
+    let (mine, refund) = (mint(&files, &alice, 8), mint(&files, &alice, 8));
+    let honest = shown_lock(&keyset, std::slice::from_ref(&mine));
+    let held = filed([7; 32], &keyset, &[&mine, &refund]).held();
+    hub.retire_claimed(&[1; 32], &held, &[honest]).unwrap();
+    assert_eq!(shown(&files), (0, 0));
+
+    // A lock of two notes neither of which the claim holds, in another
+    // order than their identifiers'.
+    let mut inputs = vec![mint(&files, &alice, 8), mint(&files, &alice, 4)];
+    inputs.sort_by_key(|c| std::cmp::Reverse(c.note.message().identifier().unwrap()));
+    let ys: Vec<_> = inputs
+        .iter()
+        .map(|c| c.note.message().identifier().unwrap())
+        .collect();
+    let denom = inputs[1].note.message().denomination();
+    let early = Spend::new(&keyset, &inputs[1..], &[(bob.address(), denom)]);
+    let grant = early.offer(&hub).unwrap();
+    let lock = shown_lock(&keyset, &inputs);
+    let refund = mint(&files, &alice, 8);
+    let held = filed([8; 32], &keyset, &[&refund]).held();
+    assert_eq!(hub.spent(&ys).unwrap(), [false, false]);
+    hub.retire_claimed(&[2; 32], &held, std::slice::from_ref(&lock))
+        .unwrap();
+    assert_eq!(shown(&files), (1, 2));
+    // Read again, as after a restart: the same.
+    hub.retire_claimed(&[2; 32], &held, std::slice::from_ref(&lock))
+        .unwrap();
+    assert_eq!(shown(&files), (1, 2));
+    assert_eq!(hub.spent(&ys).unwrap(), [true, true]);
+
+    // No spend takes them, offered before or after, and no fold.
+    let signed = early.sign(&keyset, Authorization::Granted(Box::new(grant)));
+    assert_eq!(
+        refused(hub.release(&signed, &early.notes())),
+        Refusal::Spent
+    );
+    let denom = inputs[0].note.message().denomination();
+    let late = Spend::new(&keyset, &inputs[..1], &[(bob.address(), denom)]);
+    assert_eq!(refused(late.offer(&hub)), Refusal::Spent);
+    assert_eq!(
+        refused(hub.fold_claimable(&[3; 32], &ys[..1])),
+        Refusal::Spent
+    );
+    let again = filed([9; 32], &keyset, &[&inputs[0]]);
+    assert_eq!(
+        refused(hub.claim_for_fold(&[3; 32], &again)),
+        Refusal::Spent
+    );
+    // Retired, and spent by nothing: the lock is not served.
+    assert_eq!((rows(&files.db, "spent"), rows(&files.db, "locks")), (0, 0));
+
+    // Against another claim of either: the lock, a spend its owners signed,
+    // which whoever checks it finds to void both.
+    let found = hub.evidence(again.claim()).unwrap();
+    assert!(matches!(&found[..], [Against::Spend { unlock: None, .. }]));
+    let back = evidence_from_bytes(&keyset, 16, &evidence_to_bytes(&found)).unwrap();
+    for coin in &inputs {
+        assert!(voids_note(&keyset, coin.note.message(), &back[0]).unwrap());
+    }
+    // Not against the claim of a note it does not spend.
+    assert!(hub
+        .evidence(&claim_in([9; 32], &keyset, &[&mint(&files, &alice, 2)]))
+        .unwrap()
+        .is_empty());
+    // And shown to the holder of either who asks.
+    let at = unix();
+    let asked = [ask(&keyset, at, &inputs[1])];
+    let told = hub.inquire(keyset.id(), at, &asked).unwrap();
+    assert!(matches!(
+        &told[0][..],
+        [Against::Spend { unlock: None, .. }]
+    ));
+
+    // Across a restart, still retired and still cited.
+    drop(hub);
+    let hub = open(&files, Policy::default());
+    assert_eq!(hub.spent(&ys).unwrap(), [true, true]);
+    assert_eq!(hub.evidence(again.claim()).unwrap().len(), 1);
+    assert_eq!(shown(&files), (1, 2));
+}
+
+#[test]
+fn a_shown_lock_the_ledger_cannot_read_back_is_left_out_alone() {
+    use licash::recovery::Evidence as Against;
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let alice = owner(1);
+    let (twice, given, refund) = (
+        mint(&files, &alice, 8),
+        mint(&files, &alice, 4),
+        mint(&files, &alice, 4),
+    );
+    hub.retire_claimed(&[1; 32], &filed([7; 32], &keyset, &[&twice]).held(), &[])
+        .unwrap();
+    let lock = shown_lock(&keyset, std::slice::from_ref(&given));
+    let held = filed([8; 32], &keyset, &[&refund]).held();
+    hub.retire_claimed(&[2; 32], &held, &[lock]).unwrap();
+    let second = filed([9; 32], &keyset, &[&twice, &given]);
+    assert!(matches!(
+        &hub.evidence(second.claim()).unwrap()[..],
+        [Against::Spend { .. }, Against::SecondClaim { .. }]
+    ));
+    // Its bytes not what was kept, then its row not: the other claim of the
+    // other note is cited all the same, and the note stays retired.
+    drop(hub);
+    for damage in ["evidence = x'00'", "keyset = x'00'"] {
+        sql(&files.db)
+            .execute(&format!("UPDATE shown_locks SET {damage}"), [])
+            .unwrap();
+        let hub = open(&files, Policy::default());
+        assert!(matches!(
+            &hub.evidence(second.claim()).unwrap()[..],
+            [Against::SecondClaim { .. }]
+        ));
+        let y = given.note.message().identifier().unwrap();
+        assert_eq!(hub.spent(&[y]).unwrap(), [true]);
+    }
+}
+
+#[test]
+fn a_hub_file_of_before_claims_showed_locks_gains_none_shown_when_opened() {
+    let files = files();
+    let (_, keyset) = issuer(&files);
+    let alice = owner(1);
+    let seq = |db: &Path| -> i64 {
+        sql(db)
+            .query_row("SELECT seq FROM meta", [], |r| r.get(0))
+            .unwrap()
+    };
+    // What a hub writes of its own when it opens its file.
+    let created = seq(&files.db);
+    drop(open(&files, Policy::default()));
+    let opening = seq(&files.db) - created;
+    // As the release before made it: the ledger and nothing else.
+    sql(&files.db)
+        .execute_batch(
+            "DROP TABLE shown_inputs; DROP TABLE shown_locks;
+             DELETE FROM schema_versions WHERE component = 'shown';",
+        )
+        .unwrap();
+    let before = seq(&files.db);
+    // Read beside no hub, it is left as it is.
+    let ledger = Ledger::open(&files.db).unwrap();
+    ledger.stats().unwrap();
+    drop(ledger);
+    let version = |db: &Path| -> Option<i64> {
+        sql(db)
+            .query_row(
+                "SELECT version FROM schema_versions WHERE component = 'shown'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+    };
+    assert_eq!(version(&files.db), None);
+
+    // Opened: the tables, empty, and no write of the ledger's for them.
+    let hub = open(&files, Policy::default());
+    assert_eq!(version(&files.db), Some(1));
+    assert_eq!(
+        (
+            rows(&files.db, "shown_locks"),
+            rows(&files.db, "shown_inputs")
+        ),
+        (0, 0)
+    );
+    assert_eq!(seq(&files.db), before + opening);
+    // It writes on, and keeps what it is shown.
+    let (given, refund) = (mint(&files, &alice, 8), mint(&files, &alice, 8));
+    let lock = shown_lock(&keyset, std::slice::from_ref(&given));
+    let held = filed([7; 32], &keyset, &[&refund]).held();
+    hub.retire_claimed(&[1; 32], &held, &[lock]).unwrap();
+    assert!(!hub.halted());
+    let y = given.note.message().identifier().unwrap();
+    assert_eq!(hub.spent(&[y]).unwrap(), [true]);
+    drop(hub);
+    let hub = open(&files, Policy::default());
+    assert_eq!(hub.spent(&[y]).unwrap(), [true]);
+    assert_eq!(rows(&files.db, "shown_inputs"), 1);
 }

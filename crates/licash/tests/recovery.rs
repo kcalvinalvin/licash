@@ -2862,3 +2862,322 @@ fn a_claim_of_the_same_contract_voids_her_notes_only_before_graph_id_12() {
         assert_eq!(decided.unwrap().owed, 4, "{id}");
     }
 }
+
+/// The Hub reads a lean filing with [`recovery::named`] exactly as its
+/// statement does: one item that is not valid, which the strict decoding
+/// refuses the whole filing for, leaves it the claim to find its evidence
+/// against and the notes she signed for to retire. A hold signature that
+/// does not verify retires nothing: its note is not hers to give up.
+#[test]
+fn the_hub_reads_a_lean_filing_of_an_invalid_item_as_its_statement_does() {
+    let o = lean_open();
+    let chain = checkpoint_chain();
+    let keyset = o.base.parts().keyset.clone();
+    let s = plain(&o, 4);
+    let bytes = Filing::new(s.p.clone(), s.witness.clone())
+        .unwrap()
+        .to_bytes(Format::Lean);
+    let ys = |named: &recovery::Named| -> Vec<Point> {
+        let held = named.held();
+        assert!(held.context() == &named.claim().hold_context());
+        for record in held.records() {
+            let digest = held.context().signing_digest(&record.message);
+            crypto::schnorr_verify(record.message.hold(), &digest, &record.sig).unwrap();
+        }
+        (held.records().iter())
+            .map(|r| r.message.identifier().unwrap())
+            .collect()
+    };
+    let all: Vec<Point> = (s.p.envelope().records().iter())
+        .map(|r| r.message.identifier().unwrap())
+        .collect();
+
+    // All valid: every note, as the strict decoding names them.
+    let named = recovery::named(&o.base, &bytes).unwrap();
+    assert_eq!(named.claim().digest(), s.p.claim().digest());
+    assert_eq!(ys(&named), all);
+    let strict = Filing::from_bytes(Format::Lean, &keyset, LIMIT, &bytes).unwrap();
+    assert_eq!(
+        ys(&named).len(),
+        strict.publication().held().records().len()
+    );
+
+    // A note never issued, signed for by its hold key: the strict decoding
+    // has no filing, the statement a claim owed less, and the Hub that
+    // claim, with every note she signed for, the forged one too.
+    let tail = s.notes[1].to_compact_bytes();
+    let mut bad = tail.clone();
+    bad[33 + 1 + 63] ^= 1;
+    let forged_note = swap(&bytes, &tail, &bad);
+    assert!(Filing::from_bytes(Format::Lean, &keyset, LIMIT, &forged_note).is_err());
+    let found = recovery::owed(&o.base, &s.request, &forged_note, &[], &chain).unwrap();
+    assert_eq!(
+        (found.owed, found.invalid, found.ineligible),
+        (12, 0b10, None)
+    );
+    let named = recovery::named(&o.base, &forged_note).unwrap();
+    assert_eq!(named.claim().digest(), s.p.claim().digest());
+    assert_eq!(ys(&named), all);
+
+    // A hold signature that is not its note's: that note is not held, the
+    // others are.
+    let unsigned = s.ds[2].message();
+    let sig = (s.p.envelope().records().iter())
+        .find(|r| &r.message == unsigned)
+        .unwrap();
+    let forged_hold = flip(&bytes, &sig.sig.0);
+    assert!(Filing::from_bytes(Format::Lean, &keyset, LIMIT, &forged_hold).is_err());
+    let named = recovery::named(&o.base, &forged_hold).unwrap();
+    let left: Vec<Point> = (all.iter().copied())
+        .filter(|y| y != &unsigned.identifier().unwrap())
+        .collect();
+    assert_eq!(ys(&named), left);
+    assert_eq!(left.len(), 3);
+
+    // Whatever byte of the filing is changed, a claim the statement
+    // decides on is one the Hub reads.
+    let two = plain(&o, 2);
+    let small = Filing::new(two.p.clone(), two.witness.clone())
+        .unwrap()
+        .to_bytes(Format::Lean);
+    for at in 0..small.len() {
+        let mut changed = small.clone();
+        changed[at] ^= 1;
+        let owed = recovery::owed(&o.base, &two.request, &changed, &[], &chain).unwrap();
+        let named = recovery::named(&o.base, &changed);
+        assert!(owed.ineligible.is_some() || named.is_ok(), "byte {at}");
+        if let Ok(named) = named {
+            ys(&named);
+        }
+    }
+
+    // Under the compact filing nothing is skipped: the forgery is no
+    // filing to either, and a valid one names all its notes.
+    let compact = Opened {
+        issuer: o.issuer.clone(),
+        base: base_at(o.issuer.keyset().unwrap(), recovery::COMPACT_FROM),
+    };
+    let s = plain(&compact, 4);
+    let bytes = Filing::new(s.p.clone(), s.witness.clone())
+        .unwrap()
+        .to_bytes(Format::Compact);
+    let named = recovery::named(&compact.base, &bytes).unwrap();
+    assert_eq!(named.held().records().len(), 4);
+    let sig = &s.p.envelope().records()[0].sig.0;
+    assert!(recovery::named(&compact.base, &flip(&bytes, sig)).is_err());
+    let tail = s.notes[1].to_compact_bytes();
+    let mut bad = tail.clone();
+    bad[33 + 1 + 63] ^= 1;
+    assert!(recovery::named(&compact.base, &swap(&bytes, &tail, &bad)).is_err());
+}
+
+/// A lean claim of the refund of a lock of her own note that the Hub never
+/// served, that note's hold signature not its key's: the statement verifies
+/// no hold signature of a lock's inputs, so the refund is owed and no flag
+/// says otherwise. The Hub reads the lock itself in her filing, signed by
+/// the note's owner, and it is evidence of the note spent against any
+/// claim of it: the note is not paid for twice, nor left hers to spend.
+#[test]
+fn a_lock_a_lean_filing_shows_voids_any_other_claim_of_its_inputs() {
+    let issuer = IssuerKeys::random(3).unwrap();
+    let o = Opened {
+        base: base_at(issuer.keyset().unwrap(), recovery::LEAN_FROM),
+        issuer,
+    };
+    let keyset = o.base.parts().keyset.clone();
+    let hold = hold();
+    // Seven blocks: the lock expired at 4, 3 deep at 7.
+    let (chain, _) = activated_chain_at(1);
+    let own = derive(SPEND, &hold, 4, 23, 40);
+    let own_note = mint(&o.issuer, &keyset, &own);
+    let refund = derive(SPEND, &hold, 4, 67, 0);
+    let carol = derive(53, &HoldRoot::from_seed(&[11; 32]).unwrap(), 4, 31, 0);
+    let lock = TimedLock::new(terms(), vec![Output::from_derivation(&refund).unwrap()]).unwrap();
+    let body = Proposal::new(
+        &keyset,
+        std::slice::from_ref(&own_note),
+        point(47),
+        vec![Output::from_derivation(&carol).unwrap()],
+        Some(lock),
+    )
+    .unwrap();
+    let own_signed = SignedProposal::sign(
+        &keyset,
+        body,
+        std::slice::from_ref(&own_note),
+        Authorization::Plain,
+        &[owner(SPEND, 23, 40)],
+    )
+    .unwrap();
+    let own_id = own_signed.proposal().id();
+    let owner_sig = own_signed.signatures()[0].0;
+    let settled = derive(SPEND, &hold, 4, 23, 0);
+    let settled_note = mint(&o.issuer, &keyset, &settled);
+    // The claim of a settled note and of the lock's refund as the note of
+    // `refunded`, filed.
+    let file = |refunded: &Derivation| {
+        let items = vec![
+            Item::Settled(settled.message().clone()),
+            Item::Pending {
+                message: refunded.message().clone(),
+                source: own_id,
+                branch: Branch::Refund,
+                index: 0,
+                blinding: *refunded.blinding(),
+                preimage: None,
+            },
+        ];
+        let sources = vec![Source::OwnInputs {
+            id: own_id,
+            inputs: vec![own_note.message().identifier().unwrap()],
+            terms: terms(),
+        }];
+        let signers = [settled.clone(), refunded.clone(), own.clone()];
+        let unsigned = claim(&o, items, sources, vec![], &signers, 8);
+        let p = Publication::sign(unsigned, &hold_keys(&signers), LIMIT).unwrap();
+        let witness = Witness {
+            notes: vec![settled_note.clone()],
+            sources: vec![SourceWitness::Signed {
+                signed: own_signed.clone(),
+                notes: vec![own_note.clone()],
+            }],
+            activations: vec![],
+            funded: vec![],
+        };
+        let bytes = Filing::new(p.clone(), witness)
+            .unwrap()
+            .to_bytes(Format::Lean);
+        (p, bytes)
+    };
+    let sig_of = |p: &Publication, d: &Derivation| {
+        let record = (p.envelope().records().iter()).find(|r| &r.message == d.message());
+        record.unwrap().sig.0
+    };
+    let (p, bytes) = file(&refund);
+    let request = Request {
+        amount: 8,
+        claim_digest: *p.claim().digest(),
+    };
+    let y = own.message().identifier().unwrap();
+    let held = |named: &recovery::Named| -> Vec<Point> {
+        (named.held().records().iter())
+            .map(|r| r.message.identifier().unwrap())
+            .collect()
+    };
+
+    // Signed for by all three, as a wallet files it: all held, and no
+    // lock to show for an input, each given up by its hold key.
+    let named = recovery::named(&o.base, &bytes).unwrap();
+    assert_eq!(held(&named).len(), 3);
+    assert!(named.locks().is_empty());
+
+    // The input's hold signature forged: the statement owes the refund all
+    // the same, and takes no flag against it.
+    let forged = flip(&bytes, &sig_of(&p, &own));
+    let found = recovery::owed(&o.base, &request, &forged, &[], &chain).unwrap();
+    assert_eq!((found.owed, found.invalid, found.ineligible), (8, 0, None));
+    for flags in [0b01, 0b10, 0b11] {
+        assert!(recovery::owed_flagged(&o.base, &request, &forged, &[], &chain, flags).is_err());
+    }
+    // The Hub does not hold the input by its hold key, and holds it by the
+    // lock, which its owner signed.
+    let named = recovery::named(&o.base, &forged).unwrap();
+    assert!(!held(&named).contains(&y));
+    assert_eq!(held(&named).len(), 2);
+    let [lock] = named.locks() else {
+        panic!("the lock her filing shows")
+    };
+    assert!(recovery::voids_note(&keyset, own.message(), lock).unwrap());
+    // Against this claim itself it voids nothing: its refund is owed once.
+    assert!(recovery::owed(
+        &o.base,
+        &request,
+        &forged,
+        std::slice::from_ref(lock),
+        &chain
+    )
+    .is_err());
+
+    // Her claim of the same note in another contract, settled: the lock
+    // voids it, through the codec the Hub pins its evidence with.
+    let other = Opened {
+        issuer: o.issuer.clone(),
+        base: base_at(keyset.clone(), recovery::OWN_CLAIMS_FROM),
+    };
+    let twice = [settled.clone(), own.clone()];
+    let items = (twice.iter())
+        .map(|d| Item::Settled(d.message().clone()))
+        .collect();
+    let again = Publication::sign(
+        claim(&other, items, vec![], vec![], &twice, 8),
+        &hold_keys(&twice),
+        LIMIT,
+    )
+    .unwrap();
+    let again_request = Request {
+        amount: 8,
+        claim_digest: *again.claim().digest(),
+    };
+    let again_witness = Witness {
+        notes: twice.iter().map(|d| mint(&o.issuer, &keyset, d)).collect(),
+        sources: vec![],
+        activations: vec![],
+        funded: vec![],
+    };
+    let cited =
+        recovery::evidence_from_bytes(&keyset, LIMIT, &recovery::evidence_to_bytes(named.locks()))
+            .unwrap();
+    let whole = decide(&other, &again_request, &again, &again_witness, &[], None).unwrap();
+    assert_eq!(whole.owed, 8);
+    let less = decide(&other, &again_request, &again, &again_witness, &cited, None).unwrap();
+    let at = (again.claim().parts().items.iter())
+        .position(|i| i.message() == own.message())
+        .unwrap();
+    assert_eq!((less.owed, less.mask), (4, 1 << at));
+
+    // The refund not signed for either: an item not valid, worth nothing,
+    // and no refund of hers that would give the lock's input up.
+    let unheld = flip(&forged, &sig_of(&p, &refund));
+    let found = recovery::owed(&o.base, &request, &unheld, &[], &chain).unwrap();
+    assert_eq!(
+        (found.owed, found.invalid, found.ineligible),
+        (4, 0b10, None)
+    );
+    let named = recovery::named(&o.base, &unheld).unwrap();
+    assert_eq!(held(&named).len(), 1);
+    assert!(named.locks().is_empty());
+
+    // Who holds the lock and is not its refund's, as its payee: she names
+    // a note of her own as the refund, signs for it, and cannot sign for
+    // the input. It opens no output of the lock, her claim is owed
+    // nothing, and the lock shown gives up no note of its payer's.
+    let hers = derive(SPEND, &hold, 4, 71, 0);
+    let (theirs, bytes_of_theirs) = file(&hers);
+    let grief = flip(&bytes_of_theirs, &sig_of(&theirs, &own));
+    let theirs_request = Request {
+        amount: 8,
+        claim_digest: *theirs.claim().digest(),
+    };
+    let found = recovery::owed(&o.base, &theirs_request, &grief, &[], &chain).unwrap();
+    assert!(found.owed == 0 && found.ineligible.is_some());
+    let named = recovery::named(&o.base, &grief).unwrap();
+    assert_eq!(held(&named).len(), 2);
+    assert!(named.locks().is_empty());
+
+    // A lock of a note never issued is no filing either: its outputs
+    // stand on nothing.
+    let tail = own_note.to_compact_bytes();
+    let mut bad = tail.clone();
+    bad[33 + 1 + 63] ^= 1;
+    let unissued = swap(&forged, &tail, &bad);
+    assert!(recovery::named(&o.base, &unissued).is_err());
+    let none = recovery::owed(&o.base, &request, &unissued, &[], &chain).unwrap();
+    assert!(none.owed == 0 && none.ineligible.is_some());
+
+    // A lock its inputs' owners did not sign is no filing, to the Hub as
+    // to its statement: who names a note signs nothing for its owner.
+    let unsigned = flip(&forged, &owner_sig);
+    assert!(recovery::named(&o.base, &unsigned).is_err());
+    let none = recovery::owed(&o.base, &request, &unsigned, &[], &chain).unwrap();
+    assert!(none.owed == 0 && none.ineligible.is_some());
+}

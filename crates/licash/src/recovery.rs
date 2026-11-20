@@ -509,6 +509,50 @@ impl Publication {
         }
         Ok(())
     }
+
+    /// Its hold authorizations that verify ([`Held`]): all of them, of a P
+    /// decoded with [`Publication::from_bytes`].
+    pub fn held(&self) -> Held {
+        let records = self.envelope.records().iter();
+        Held {
+            context: *self.envelope.context(),
+            records: records
+                .filter(|record| self.envelope.verify_record(&record.message).is_ok())
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+/// The hold authorizations of a filed claim that verify: each the signature
+/// of this claim by a note's hold key, which is the whole of the authority
+/// to recover that note ([`Filing`]). What the Hub retires of a claim and
+/// cites against any other claim of the same notes
+/// ([`Evidence::SecondClaim`]). A record that does not verify is nobody's
+/// word, and is never in it: who knows a note's public fields, as its payer
+/// does, signs nothing for it.
+#[derive(Clone)]
+pub struct Held {
+    context: hold::Context,
+    records: Vec<Record>,
+}
+
+impl std::fmt::Debug for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Held(..)")
+    }
+}
+
+impl Held {
+    /// The claim the records sign.
+    pub fn context(&self) -> &hold::Context {
+        &self.context
+    }
+
+    /// Each verified under its note's hold key, in the claim's order.
+    pub fn records(&self) -> &[Record] {
+        &self.records
+    }
 }
 
 /// Holder's private evidence for one source: the complete owner-signed body.
@@ -1123,7 +1167,8 @@ impl Filing {
     /// each hold signature verified only if `checked`: of a lean format
     /// alone, whose statement verifies those of the items it is shown to be
     /// wrong about ([`owed_flagged`]). What it decodes is never to rely on
-    /// but through [`owed_flagged`].
+    /// but through [`owed_flagged`] and [`named`], which check what they
+    /// take of it: outside this module there is no filing unchecked.
     fn decode(
         format: Format,
         keyset: &Keyset,
@@ -1237,6 +1282,128 @@ impl Filing {
         }
         Ok(filing)
     }
+}
+
+/// `filed` as the statement of `base`'s contract reads it: the one decoding
+/// of a filing's bytes for all that decides on them, [`owed`] and what the
+/// Hub does about a claim besides ([`named`]). Bytes one reads and another
+/// refuses leave the Hub answering nothing to a claim its statement would
+/// have proven owed less.
+fn decoded(base: &Base, filed: &[u8]) -> Result<Filing, Error> {
+    let parts = base.parts();
+    let format = Format::of(base);
+    let limit = parts.limits.max_authorizations as usize;
+    Filing::decode(format, &parts.keyset, limit, filed, !format.lean())
+}
+
+/// What a filed claim names, as the Hub acts on it besides deciding what
+/// it is owed ([`named`]).
+#[derive(Clone)]
+pub struct Named {
+    claim: UnsignedClaim,
+    held: Held,
+    locks: Vec<Evidence>,
+}
+
+impl std::fmt::Debug for Named {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Named(..)")
+    }
+}
+
+impl Named {
+    /// The claim: what the Hub's ledger is asked for evidence against.
+    /// Whether an item of it is valid is [`owed`]'s to say.
+    pub fn claim(&self) -> &UnsignedClaim {
+        &self.claim
+    }
+
+    /// The notes its holder gave up for it, whatever it is owed.
+    pub fn held(&self) -> &Held {
+        &self.held
+    }
+
+    /// Each lock of her own notes ([`Source::OwnInputs`]) the claim takes
+    /// the refund of with an input it does not hold ([`Named::held`]), as
+    /// its filing shows it, signed by the owners of the notes it spends: an
+    /// [`Evidence::Spend`] of them, which the Hub may never have served.
+    ///
+    /// Under a lean format the statement verifies no hold signature of a
+    /// lock's inputs: one not its note's neither voids the claim nor is
+    /// flagged, and the refund is owed all the same. Such an input is given
+    /// up for the claim by its owner's word, the lock, where the others are
+    /// by their hold keys', and only the lock shows it spent to any other
+    /// claim of it. None of a claim that holds every input of its locks,
+    /// as every filing a wallet makes does.
+    ///
+    /// Only of a refund hers to take: an item of the lock's refund that its
+    /// hold key signed for and that opens the output it names. Who merely
+    /// holds a lock another signed, as its payee does, shows none of it,
+    /// and gives up no note of its payer's.
+    pub fn locks(&self) -> &[Evidence] {
+        &self.locks
+    }
+}
+
+/// What the claim filed as `filed` under `base` names: read exactly as
+/// [`owed`] reads it, so that the Hub finds its evidence against, and
+/// retires the notes of, every filing its statement decides on. An error
+/// only of bytes [`owed`] finds ineligible as undecodable.
+///
+/// Under a lean format one invalid item does not void the claim, and it
+/// does not blind the Hub to the rest either: the claim is the whole of
+/// what was filed, and [`Named::held`] the authorizations that verify,
+/// whether or not the note of each was ever issued.
+pub fn named(base: &Base, filed: &[u8]) -> Result<Named, Error> {
+    let filing = decoded(base, filed)?;
+    let keyset = &base.parts().keyset;
+    let claim = filing.publication.claim();
+    let held = filing.publication.held();
+    let holds = |message: &Message| held.records.iter().any(|r| &r.message == message);
+    // A refund of `lock` that is hers: signed for, and opening its output.
+    let refunded = |id: ProposalId, lock: &crate::spend::TimedLock| {
+        claim.parts().items.iter().any(|item| match item {
+            Item::Pending {
+                message,
+                source,
+                branch: Branch::Refund,
+                index,
+                blinding,
+                ..
+            } => {
+                *source == id
+                    && holds(message)
+                    && (lock.refund().get(*index as usize))
+                        .is_some_and(|output| opens(output, message, blinding).unwrap_or(false))
+            }
+            _ => false,
+        })
+    };
+    let sources = claim.parts().sources.iter().zip(&filing.witness.sources);
+    let locks = sources
+        .filter_map(|(source, witness)| {
+            let (Source::OwnInputs { id, .. }, SourceWitness::Signed { signed, notes }) =
+                (source, witness)
+            else {
+                return None;
+            };
+            let lock = signed.proposal().lock()?;
+            let shown = matches!(signed.authorization(), Authorization::Plain)
+                && witness.authenticate(keyset, source).is_ok()
+                && notes.iter().any(|note| !holds(note.message()))
+                && refunded(*id, lock);
+            shown.then(|| Evidence::Spend {
+                signed: signed.clone(),
+                notes: notes.clone(),
+                unlock: None,
+            })
+        })
+        .collect();
+    Ok(Named {
+        claim: claim.clone(),
+        held,
+        locks,
+    })
 }
 
 /// Whether a decoded filing is eligible under this opening and request: an
@@ -1426,8 +1593,7 @@ fn judged(
     if chain.checkpoint().commitment() != parts.chain.checkpoint.commitment() {
         return Err(bad("the chain is not from Base's checkpoint"));
     }
-    let limit = parts.limits.max_authorizations as usize;
-    let filing = Filing::decode(format, &parts.keyset, limit, filed, !format.lean())
+    let filing = decoded(base, filed)
         .and_then(|filing| eligible(&filing, base, request, chain).map(|()| filing));
     let filing = match filing {
         Ok(filing) => filing,
