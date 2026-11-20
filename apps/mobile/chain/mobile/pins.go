@@ -7,4 +7,6 @@ import "github.com/licash-org/licash/apps/mobile/chain/node"
 var (
 	bitcoinPin *node.Pin
 	signetPin  *node.Pin
+	// mutinynetPin, once its CDN serves import files.
+	mutinynetPin *node.Pin
 )

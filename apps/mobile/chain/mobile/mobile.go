@@ -7,7 +7,6 @@ package mobile
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -15,22 +14,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 
 	"github.com/licash-org/licash/apps/mobile/chain/node"
-)
-
-// The test networks besides Bitcoin's own, as Licash names them.
-const (
-	// mutinynetChallenge is Mutinynet's signet challenge, as published at
-	// https://blog.mutinywallet.com/mutinynet/.
-	mutinynetChallenge = "512102f7561d208dd9ae99bf497273e16f389bdbd6c4742ddb8e6b216e64fa2928ad8f51ae"
-	// mutinynetPeer is the node Mutinynet publishes: it has no DNS seed.
-	mutinynetPeer = "45.79.52.207:38333"
 )
 
 // network is what a light client of name follows.
@@ -57,14 +46,9 @@ func networkOf(name string) (network, error) {
 		return network{params: chaincfg.SigNetParams, cdn: "https://signet.block-dn.org", seeds: signetSeeds,
 			pin: signetPin}, nil
 	case "mutinynet":
-		challenge, err := hex.DecodeString(mutinynetChallenge)
-		if err != nil {
-			return network{}, err
-		}
-		params := chaincfg.CustomSignetParams(challenge, nil)
-		params.Name = "mutinynet"
-		params.TargetTimePerBlock = 30 * time.Second
-		return network{params: params, peers: []string{mutinynetPeer}}, nil
+		// Its CDN is the only one there is, self-hosted.
+		return network{params: node.Mutinynet(), cdn: "https://mutinynet-blockdn.sgn.space",
+			peers: []string{node.MutinynetPeer}, pin: mutinynetPin}, nil
 	case "regtest":
 		return network{params: chaincfg.RegressionNetParams}, nil
 	}

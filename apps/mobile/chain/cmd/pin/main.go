@@ -83,7 +83,11 @@ func run(network, rpcURL, cookie, user, esplora, server string, height int64, ou
 	case (rpcURL == "") == (esplora == ""):
 		return errors.New("-rpc or -esplora, one of them")
 	case esplora != "":
-		files, err = fromPeers(params, esplora, height, nil)
+		var connect []string
+		if network == "mutinynet" { // No DNS seed.
+			connect = []string{node.MutinynetPeer}
+		}
+		files, err = fromPeers(params, esplora, height, connect)
 	default:
 		files, err = fromCore(&rpc{url: rpcURL, auth: auth}, params, height)
 	}
@@ -106,10 +110,13 @@ func paramsOf(network string) (*chaincfg.Params, string, error) {
 		return &chaincfg.MainNetParams, "https://block-dn.org", nil
 	case "signet":
 		return &chaincfg.SigNetParams, "https://signet.block-dn.org", nil
+	case "mutinynet":
+		params := node.Mutinynet()
+		return &params, "https://mutinynet-blockdn.sgn.space", nil
 	case "regtest": // For its tests: a CDN given.
 		return &chaincfg.RegressionNetParams, "", nil
 	}
-	return nil, "", fmt.Errorf("unknown network %q: bitcoin or signet", network)
+	return nil, "", fmt.Errorf("unknown network %q: bitcoin, signet or mutinynet", network)
 }
 
 // importFiles are the two files of a pin and the pin.

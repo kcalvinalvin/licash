@@ -24,7 +24,7 @@ for `bitcoin`, `signet`, `mutinynet` and `regtest`.
   never imports; a download that fails is not tried again on that store;
   peers serve whatever the import does not. No pin, no request for
   header files. Bitcoin and signet are pinned (blocks 975000 and 330000);
-  mutinynet has no CDN to import from.
+  mutinynet, whose CDN is still filling, is not yet.
 - Peers: neutrino's own discovery (DNS seeds filtered by service, then
   `addr`/`addrv2` gossip, onion addresses included through a proxy).
   Besides, `node/` remembers the peers it completed a handshake with in
