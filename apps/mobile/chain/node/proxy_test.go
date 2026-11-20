@@ -7,9 +7,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
 )
@@ -189,4 +191,25 @@ func TestPeersAreReachedThroughTheProxy(t *testing.T) {
 	if dialer(nil) != nil || resolver(nil) != nil {
 		t.Fatal("no proxy, yet not neutrino's own ways")
 	}
+}
+
+// An onion peer, as neutrino hands its dialer one learned by gossip or
+// asked for, is reached by its name at the proxy's end.
+func TestOnionPeersAreReachedByNameThroughTheProxy(t *testing.T) {
+	onion := "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"
+	f := newFakeSocks(t, map[string]string{})
+	n, err := Start(Config{DataDir: t.TempDir(), Params: chaincfg.RegressionNetParams, Proxy: f.proxy("secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Stop()
+	if err := n.cs.ConnectNode(onion+":18444", false); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if slices.Contains(f.askedOf(), "connect "+onion) {
+			return
+		}
+	}
+	t.Fatalf("the proxy was asked %v", f.askedOf())
 }

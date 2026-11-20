@@ -38,14 +38,16 @@ type network struct {
 	// peers are the only peers to use when none are given, for a network
 	// without DNS seeds.
 	peers []string
+	// seeds are reached when no other peer answers (cmd/seeds).
+	seeds []string
 }
 
 func networkOf(name string) (network, error) {
 	switch name {
 	case "bitcoin":
-		return network{params: chaincfg.MainNetParams, cdn: "https://block-dn.org"}, nil
+		return network{params: chaincfg.MainNetParams, cdn: "https://block-dn.org", seeds: bitcoinSeeds}, nil
 	case "signet":
-		return network{params: chaincfg.SigNetParams, cdn: "https://signet.block-dn.org"}, nil
+		return network{params: chaincfg.SigNetParams, cdn: "https://signet.block-dn.org", seeds: signetSeeds}, nil
 	case "mutinynet":
 		challenge, err := hex.DecodeString(mutinynetChallenge)
 		if err != nil {
@@ -99,6 +101,7 @@ func StartThrough(network, dataDir, peers, cdn, proxy string) (*Chain, error) {
 		DataDir:      dataDir,
 		Params:       net.params,
 		ConnectPeers: connect,
+		FixedSeeds:   net.seeds,
 		CDN:          cdn,
 		Proxy:        through,
 		Log:          logger(),

@@ -1,6 +1,7 @@
 package mobile
 
 import (
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +39,18 @@ func TestNetworks(t *testing.T) {
 	if mutinynet.params.PowLimitBits != chaincfg.SigNetParams.PowLimitBits ||
 		mutinynet.params.TargetTimespan != chaincfg.SigNetParams.TargetTimespan {
 		t.Error("Mutinynet's difficulty is not signet's")
+	}
+	// Fixed seeds where there are DNS seeds, each a host and port.
+	for name, want := range map[string]bool{"bitcoin": true, "signet": true, "mutinynet": false, "regtest": false} {
+		nw, _ := networkOf(name)
+		if (len(nw.seeds) > 0) != want {
+			t.Errorf("%s: %d fixed seeds", name, len(nw.seeds))
+		}
+		for _, s := range nw.seeds {
+			if _, port, err := net.SplitHostPort(s); err != nil || port != nw.params.DefaultPort {
+				t.Errorf("%s: fixed seed %q", name, s)
+			}
+		}
 	}
 	for _, name := range []string{"", "testnet", "mainnet"} {
 		if _, err := networkOf(name); err == nil {

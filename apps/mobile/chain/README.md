@@ -13,6 +13,15 @@ for `bitcoin`, `signet`, `mutinynet` and `regtest`.
   headers fetched independently from peers before any of the file is
   stored. Block and filter headers never come from the CDN; peers serve
   missing or rejected filters too.
+- Peers: neutrino's own discovery (DNS seeds filtered by service, then
+  `addr`/`addrv2` gossip, onion addresses included through a proxy).
+  Besides, `node/` remembers the peers it completed a handshake with in
+  `good-peers.json` and a start reaches the latest four first; a node with
+  no peer after 30 seconds reaches the network's fixed seeds, peers that
+  offered compact filters when `cmd/seeds` generated
+  `mobile/seeds_<network>.go`. Peers given explicitly are the only ones
+  used: no book, no seeds. Each step of catching up is logged with the
+  time it took (`phase: ...`).
 - `mempool/`: unconfirmed transactions touching watched scripts and
   outpoints, as peers report them. Reports are hints: check what can be
   checked, `Node.Reject` what fails, and trust only confirmations.
@@ -35,4 +44,14 @@ Needs Go (see `go.mod`), and Docker for the regtest tests.
 upstream/materialize.sh          # once, and after changing the pin or patches
 go test -race ./...
 ./regtest.sh                     # against a throwaway Bitcoin Core
+```
+
+Before a release, refresh the fixed seeds (from the DNS seeds, and from a
+node's `getnodeaddresses` for onion ones, probed through Tor):
+
+```sh
+go run ./cmd/seeds -network bitcoin > mobile/seeds_bitcoin.go
+go run ./cmd/seeds -network signet > mobile/seeds_signet.go
+bitcoin-cli getnodeaddresses 0 | go run ./cmd/seeds -network bitcoin \
+    -stdin -proxy 127.0.0.1:9050 > mobile/seeds_bitcoin.go
 ```
