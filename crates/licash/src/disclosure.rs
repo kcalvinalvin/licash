@@ -58,7 +58,9 @@ impl Disclosures {
     pub fn encode(&self, lean: bool) -> Vec<u8> {
         match lean {
             false => self.to_bytes().to_vec(),
-            true => self.values[..self.used].concat(),
+            // `used` is a field anyone deserializing sets: never past the
+            // slots there are.
+            true => self.values[..self.used.min(SLOTS)].concat(),
         }
     }
 
@@ -72,5 +74,26 @@ impl Disclosures {
             .iter()
             .copied()
             .find(|value| lock_hash(value) == *hash)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `used` is a field anyone deserializing sets: past the slots, a lean
+    /// encoding is all of them, never a panic.
+    #[test]
+    fn a_used_count_past_the_slots_encodes_them_all() {
+        let mut d = Disclosures::empty();
+        d.values[0] = [7; 32];
+        d.used = 1;
+        assert_eq!(d.encode(true), vec![7; 32]);
+        d.used = SLOTS + 1;
+        assert_eq!(d.encode(true).len(), BYTES);
+        let wild: Disclosures =
+            serde_json::from_value(serde_json::json!({"values": d.values, "used": usize::MAX}))
+                .unwrap();
+        assert_eq!(wild.encode(true).len(), BYTES);
     }
 }
