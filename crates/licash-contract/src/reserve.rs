@@ -52,7 +52,9 @@ pub fn affordable_rate(g: &GraphTerms, notes: u32) -> u64 {
         Amount::from_sat(g.reserve_hub),
         Amount::from_sat(g.dust),
     );
-    let budget = purse.unwrap_or(Amount::ZERO) + SLOT + ANCHOR;
+    let budget = (purse.unwrap_or(Amount::ZERO))
+        .checked_add(SLOT + ANCHOR)
+        .unwrap_or(Amount::MAX);
     let vsize = forced_close_vsize(Format::at(g.id), notes);
     budget.to_sat().saturating_mul(1_000) / vsize
 }
@@ -70,12 +72,15 @@ pub fn affordable_rate_at_most(g: &GraphTerms) -> u64 {
 pub fn reserve_for(id: u32, dust: u64, rate: u64) -> u64 {
     let vsize = forced_close_vsize(Format::at(id), MAX_ITEMS as u32);
     let budget = rate.saturating_mul(vsize).div_ceil(1_000);
-    budget.saturating_sub((SLOT + ANCHOR).to_sat()) + dust
+    budget
+        .saturating_sub((SLOT + ANCHOR).to_sat())
+        .saturating_add(dust)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::opening::{testing, Quote};
     use licash::spend::ChainProfile;
 
@@ -86,6 +91,15 @@ mod tests {
         g.reserve_alice = reserve_alice;
         g.reserve_hub = reserve_hub;
         g
+    }
+
+    /// Terms of any size, as a quote may say, size a reserve without
+    /// overflowing: at most all there is.
+    #[test]
+    fn a_reserve_of_any_terms_is_sized_without_overflowing() {
+        assert_eq!(reserve_for(0, u64::MAX, u64::MAX), u64::MAX);
+        reserve_for(0, 1, u64::MAX);
+        affordable_rate(&terms(0, u64::MAX, u64::MAX), 1);
     }
 
     #[test]
