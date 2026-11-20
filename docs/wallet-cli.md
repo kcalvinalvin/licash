@@ -128,6 +128,10 @@ amount worth more than the activation, the lock's preimage is revealed
 only with 6 blocks left, so a hub keeping the notes is met on Bitcoin
 (`recoveries --chain` activates the lock and the contract's recovery claims
 it); a lock shown later is left to expire and the payment fails back.
+The 6 blocks are counted at the chain's height as the wallet knows it of
+itself, never on its hub's word alone: `resume --chain <url>` tells it, as
+does the last block it scanned, and a protected payment waits, unclaimed,
+for a `resume` that knows neither.
 Without `--chain`, or where it can't, the hub is trusted with the notes.
 An invoice another wallet asked the same hub for is paid inside the hub,
 for its amount alone, with no gateway fee.
@@ -149,7 +153,9 @@ on Bitcoin, the hub's fee on top; `resume` takes the notes once the payment
 confirmed. A deposit never received is taken back after its timeout with
 `refund <hash> --to <address> --chain <url>`. A deposit's lock's preimage
 is revealed only with 6 blocks left, at the higher of its hub's height and
-the last block the wallet scanned. A deposit's refund key derives
+the chain's as the wallet knows it of itself (`resume --chain <url>`, or the
+last block it scanned); a wallet that knows neither trusts its hub's word
+for the height, as it trusts it with the notes. A deposit's refund key derives
 from the seed, the hub and its number there, and its preimage from those,
 a key drawn for it, the notes asked and the payment: a wallet restored from
 its seed finds the deposits it asked at a hub by their refund keys as it

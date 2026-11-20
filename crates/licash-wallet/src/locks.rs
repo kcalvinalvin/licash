@@ -27,17 +27,20 @@ use crate::{
 };
 
 /// Blocks before its expiry after which the wallet no longer claims a
-/// lock: its hub pays a claim only before the lock expires. Counted, as
-/// [`PROTECTED_MARGIN`] is, at the higher of its hub's height and the last
-/// block the wallet looked in itself ([`Wallet::scan_silent`]), if any.
+/// lock: its hub pays a claim only before the lock expires. Counted at
+/// the higher of its hub's height and the chain's as the wallet knows it
+/// of itself ([`Wallet::tip`]), if it does.
 pub const CLAIM_MARGIN: u32 = 3;
 
 /// Blocks before its expiry within which the wallet reveals no preimage of
 /// a protected lock (a deposit's, or a protected invoice's,
 /// [`Wallet::invoice_protected`]), at the higher of its hub's height and
-/// the wallet's own: should the hub not issue its notes, the wallet still
-/// activates the lock on Bitcoin in time for a contract's recovery to
-/// claim them. A lock shown later is left to expire.
+/// the chain's as the wallet knows it of itself ([`Wallet::tip`]): should
+/// the hub not issue its notes, the wallet still activates the lock on
+/// Bitcoin in time for a contract's recovery to claim them. A lock shown
+/// later is left to expire. A wallet that does not know the chain's height
+/// of itself reveals none, as its hub's word is no protection from its
+/// hub: the lock waits until it does.
 pub const PROTECTED_MARGIN: u32 = 6;
 
 /// How a claim reveals its preimage to the lock's hub.
@@ -728,8 +731,8 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// [`Wallet::claim_paying`], revealing the preimage only with
-    /// [`PROTECTED_MARGIN`] blocks left at the higher of its hub's height
-    /// and the last block the wallet scanned for silent payments.
+    /// [`PROTECTED_MARGIN`] blocks left, and only once the wallet knows
+    /// the chain's height of itself ([`Wallet::tip`]).
     pub(crate) async fn claim_protected(
         &self,
         url: &str,
@@ -824,11 +827,20 @@ impl<T: Transport> Wallet<T> {
             }
             _ => {
                 let hub = info.locks.as_ref().map_or(u32::MAX, |l| l.height);
-                // The last block the wallet looked in itself, if any: a hub
-                // behind it, or saying so, is not believed.
-                let own = self.silent_next()?.map_or(0, |next| next.saturating_sub(1));
-                let height = hub.max(own);
+                // A hub behind the chain as the wallet knows it of itself,
+                // or saying it is, is not believed.
+                let own = self.tip()?;
+                let height = hub.max(own.unwrap_or(0));
                 let too_late = match reveal {
+                    // Protected by what the wallet does on Bitcoin in the
+                    // blocks left, which only a height of its own counts.
+                    Reveal::Protected if own.is_none() => {
+                        return Err(Error::Chain(
+                            "the chain's height is not known to the wallet itself, to reveal \
+                             a protected lock's preimage against: tell it, or scan"
+                                .into(),
+                        ));
+                    }
                     Reveal::Protected => height.saturating_add(PROTECTED_MARGIN) > terms.expiry(),
                     _ => height.saturating_add(CLAIM_MARGIN) >= terms.expiry(),
                 };

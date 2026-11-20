@@ -588,6 +588,14 @@ pub async fn close(
     Ok(())
 }
 
+/// Tell `wallet` the height of `chain`, which its protected locks'
+/// preimages are revealed against ([`Wallet::saw_tip`]).
+pub async fn saw_tip(wallet: &Wallet<Http>, chain: &str) -> anyhow::Result<()> {
+    let tip = node(Some(chain))?.height().await;
+    wallet.saw_tip(tip.map_err(|e| anyhow::anyhow!(e))?);
+    Ok(())
+}
+
 /// An invoice paying the wallet `amount` through `hub`, protected where a
 /// contract of the wallet's at the hub would claim its lock's notes should
 /// the hub keep them, and a coin of the wallet's activates the lock on
@@ -606,6 +614,7 @@ pub async fn invoice(
         tracing::info!(%hub, amount, "no contract at the hub protects the invoice's lock");
         return Ok(wallet.invoice(hub, amount).await?);
     }
+    wallet.saw_tip(tip);
     Ok(wallet.invoice_protected(hub, amount).await?)
 }
 

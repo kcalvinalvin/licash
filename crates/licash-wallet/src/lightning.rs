@@ -661,13 +661,23 @@ impl<T: Transport> Wallet<T> {
 
     /// [`Wallet::invoice`], its lock's preimage revealed only with
     /// [`crate::PROTECTED_MARGIN`] blocks left at the higher of its hub's
-    /// height and the wallet's own: should the hub keep the notes, the
-    /// wallet activates the lock on Bitcoin in time for a contract's
-    /// recovery at the hub to claim them; a lock shown later is left to
-    /// expire, the payment failing back to its payer. Only worth asking
-    /// with such a contract, and a coin to activate with: without, a
-    /// protected invoice only fails more often.
+    /// height and the chain's as the wallet knows it of itself
+    /// ([`Wallet::tip`]): should the hub keep the notes, the wallet
+    /// activates the lock on Bitcoin in time for a contract's recovery at
+    /// the hub to claim them; a lock shown later is left to expire, the
+    /// payment failing back to its payer. Only worth asking with such a
+    /// contract, and a coin to activate with: without, a protected invoice
+    /// only fails more often. Refused of a wallet that does not know the
+    /// chain's height of itself, whose hub's word for it protects nothing:
+    /// its payment waits, unclaimed, while it does not.
     pub async fn invoice_protected(&self, url: &str, amount: u64) -> Result<Invoice, Error> {
+        if self.tip()?.is_none() {
+            return Err(Error::Chain(
+                "the chain's height is not known to the wallet itself, to protect an \
+                 invoice by: tell it, or scan"
+                    .into(),
+            ));
+        }
         self.invoice_with(url, amount, true).await
     }
 

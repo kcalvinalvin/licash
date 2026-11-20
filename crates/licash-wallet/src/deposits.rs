@@ -1032,15 +1032,14 @@ impl<T: Transport> Wallet<T> {
         })?;
         // Its deposit's coin buys the notes: revealed only while the
         // wallet can still activate the lock, should the hub keep them.
-        match self
-            .claim_protected(
-                &url,
-                &hex::encode(lock.as_bytes()),
-                &preimage,
-                amount as u64,
-            )
-            .await
-        {
+        // A wallet that does not know the chain's height of itself could
+        // not tell, and trusts its hub with them as with any notes.
+        let (lock, least) = (hex::encode(lock.as_bytes()), amount as u64);
+        let claimed = match self.tip()? {
+            Some(_) => self.claim_protected(&url, &lock, &preimage, least).await,
+            None => self.claim_paying(&url, &lock, &preimage, least).await,
+        };
+        match claimed {
             Ok(_) | Err(Error::AlreadyReceived) => {}
             // Refunded, too late to claim, or not a lock to this wallet.
             Err(Error::Invalid(reason)) => return self.cancel_deposit(hash, &reason),

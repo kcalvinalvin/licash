@@ -180,7 +180,13 @@ enum Command {
         trust: bool,
     },
     /// Finish the payments under way and unlink the notes still linked.
-    Resume,
+    Resume {
+        /// The chain, for its height: a protected invoice's payment, or a
+        /// deposit's, is taken only at a height the wallet knows of itself
+        /// (this, or the last block it scanned), not on its hub's word.
+        #[arg(long, env = "LICASH_WALLET_CHAIN")]
+        chain: Option<String>,
+    },
     /// The payments made, newest first.
     History,
     /// The payments taken, newest first.
@@ -892,7 +898,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 format!("received {}", say::sat(amount)),
             );
         }
-        Command::Resume => {
+        Command::Resume { chain } => {
+            if let Some(chain) = &chain {
+                contract::saw_tip(&wallet, chain).await?;
+            }
             let resumed = resume(&wallet, json).await;
             // The payments it made among them.
             let route = route(tor.clone(), cli.proxy.as_deref())?;

@@ -303,6 +303,8 @@ impl Wallet {
     /// The chain's height, as last seen at least: 0 if never.
     pub(super) fn saw(&self, tip: u32) {
         self.tip.fetch_max(tip, Ordering::Relaxed);
+        // What its protected locks' preimages are revealed against.
+        self.wallet.saw_tip(tip);
     }
 
     /// The chain's height as the wallet last saw it, or the last block it
@@ -336,6 +338,8 @@ impl Wallet {
             tracing::warn!("whether a contract protects an invoice: {e:#}");
             false
         });
+        // Protected only against a height the wallet knows of itself.
+        let protected = protected && matches!(self.wallet.tip(), Ok(Some(_)));
         match protected {
             true => (self.runtime).block_on(self.wallet.invoice_protected(url, amount)),
             false => self.runtime.block_on(self.wallet.invoice(url, amount)),

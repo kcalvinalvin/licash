@@ -1941,6 +1941,36 @@ impl Transport for Withholding {
     }
 }
 
+/// A deposit's lock is protected against the chain's height as the wallet
+/// knows it of itself, whatever its hub says of it: one that does not know
+/// it trusts its hub with the deposit's notes, as with any.
+#[tokio::test]
+async fn a_deposit_is_claimed_at_the_height_the_wallet_knows_of_itself_or_trusting_its_hub() {
+    let net = Net::new().await;
+    let (alice, bob) = (net.wallet("alice"), net.wallet("bob"));
+    let hers = alice.deposit(HUB, 3_000).await.unwrap();
+    let his = bob.deposit(HUB, 3_000).await.unwrap();
+    let pay = |deposit: &licash_wallet::Deposit, n| {
+        payment(&deposit.terms.as_ref().unwrap().address, 3_100, n)
+    };
+    net.mine(2, vec![pay(&hers, 1), pay(&his, 2)]);
+    net.deposits.round().await;
+    // The chain as her own source shows it, at her deposit's timeout: too
+    // late to activate its lock, where her hub says there is time.
+    alice.saw_tip(hers.terms.as_ref().unwrap().timeout);
+    let kept = alice.follow_deposit(&hers.hash).await.unwrap();
+    assert!(
+        matches!(&kept.state, DepositState::Canceled(r) if r.contains("too late")),
+        "{kept:?}"
+    );
+    let lock = licash_api::lock_id(kept.lock.as_ref().unwrap()).unwrap();
+    assert_eq!(net.hub.locked(&lock).unwrap().preimage, None);
+    assert_eq!(available(&alice), 0);
+    let received = bob.follow_deposit(&his.hash).await.unwrap();
+    assert_eq!(received.state, DepositState::Received);
+    assert_eq!(available(&bob), 3_000);
+}
+
 #[tokio::test]
 async fn a_deposit_whose_notes_its_hub_keeps_is_owed_and_claimed_again_inside_the_margin() {
     use licash_wallet::PROTECTED_MARGIN;

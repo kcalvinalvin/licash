@@ -913,6 +913,13 @@ async fn a_protected_invoice_lets_a_lock_shown_late_expire_where_a_trusting_one_
     use licash_wallet::PROTECTED_MARGIN;
     let net = Net::new().await;
     let alice = net.wallet("alice");
+    // Protected only against a height the wallet knows of itself.
+    assert!(matches!(
+        alice.invoice_protected(HUB, 20).await,
+        Err(licash_wallet::Error::Chain(_))
+    ));
+    assert!(alice.invoices().unwrap().is_empty());
+    alice.saw_tip(net.height());
     // Shown in time: claimed as any.
     let invoice = alice.invoice_protected(HUB, 20).await.unwrap();
     assert!(invoice.protected);
@@ -954,6 +961,58 @@ async fn a_protected_invoice_lets_a_lock_shown_late_expire_where_a_trusting_one_
     );
     let listed = alice.invoices().unwrap();
     assert!(listed.iter().any(|i| i.hash == late.hash && i.protected));
+}
+
+/// A hub's word for the chain's height protects nothing from that hub: a
+/// wallet that knows the chain further on than its hub says keeps a
+/// protected lock's preimage, and one that does not know the chain of
+/// itself keeps it until it does.
+#[tokio::test]
+async fn a_protected_invoice_is_claimed_only_at_a_height_the_wallet_knows_of_itself() {
+    use licash_wallet::PROTECTED_MARGIN;
+    let net = Net::new().await;
+    let path = net.dir.path().join("alice.sqlite");
+    let alice = net.wallet("alice");
+    alice.saw_tip(net.height());
+    let (late, kept) = (
+        alice.invoice_protected(HUB, 20).await.unwrap(),
+        alice.invoice_protected(HUB, 20).await.unwrap(),
+    );
+    net.pay_held(&late.hash);
+    net.pay_held(&kept.hash);
+    net.gateway.round().await;
+    // Whether her hub was never told the preimage of the invoice's lock.
+    let unrevealed = |alice: &Wallet<Local>, hash: &str| {
+        let invoice = alice.invoices().unwrap();
+        let invoice = invoice.iter().find(|i| i.hash == hash).unwrap();
+        let lock = net.hub.locked(&proposal_id(invoice.lock.as_ref().unwrap()));
+        lock.unwrap().preimage.is_none()
+    };
+    // The chain as her own source shows it, inside the margin: her hub,
+    // which says it is not, is not believed.
+    let expiry = expiry_of(&net, &late.hash);
+    assert!(net.height() + PROTECTED_MARGIN <= expiry);
+    alice.saw_tip(expiry - PROTECTED_MARGIN + 1);
+    let refused = alice.follow_invoice(&late.hash).await.unwrap();
+    assert!(
+        matches!(&refused.state, InvoiceState::Canceled(r) if r.contains("too late")),
+        "{refused:?}"
+    );
+    assert!(unrevealed(&alice, &late.hash));
+    drop(alice);
+
+    // Opened again, told nothing of the chain yet: the payment waits.
+    let alice = Wallet::open(&path, Local(net.app.clone())).unwrap();
+    let waiting = alice.follow_invoice(&kept.hash).await;
+    assert!(
+        matches!(&waiting, Err(licash_wallet::Error::Pending { reason, .. }) if reason.contains("height")),
+        "{waiting:?}"
+    );
+    assert!(unrevealed(&alice, &kept.hash));
+    alice.saw_tip(net.height());
+    let received = alice.follow_invoice(&kept.hash).await.unwrap();
+    assert_eq!(received.state, InvoiceState::Received);
+    assert_eq!(available(&alice), 20);
 }
 
 #[tokio::test]

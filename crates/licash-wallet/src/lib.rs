@@ -501,6 +501,9 @@ pub struct Wallet<T> {
     ceilings: Mutex<HashMap<i64, licash_api::Fees>>,
     /// What keeps its locks claimable ([`Wallet::guard_locks`]).
     horizon: Mutex<Option<LockHorizon>>,
+    /// The chain's height as its application told it since opened, the
+    /// highest ([`Wallet::saw_tip`]): 0 if never.
+    told_tip: AtomicU32,
 }
 
 /// The height by which a lock at the hub reached at any of the URLs given,
@@ -570,6 +573,7 @@ impl<T: Transport> Wallet<T> {
             renew_ppm: AtomicU32::new(RENEW_PPM),
             ceilings: Mutex::default(),
             horizon: Mutex::default(),
+            told_tip: AtomicU32::new(0),
         })
     }
 
@@ -608,7 +612,28 @@ impl<T: Transport> Wallet<T> {
             renew_ppm: AtomicU32::new(RENEW_PPM),
             ceilings: Mutex::default(),
             horizon: Mutex::default(),
+            told_tip: AtomicU32::new(0),
         })
+    }
+
+    /// Tell the wallet the height of Bitcoin's chain as its application
+    /// sees it, by a source of its own: kept while the wallet is open, the
+    /// highest told. What a hub says of the chain is checked against it
+    /// ([`Wallet::tip`]).
+    pub fn saw_tip(&self, height: u32) {
+        self.told_tip.fetch_max(height, Ordering::Relaxed);
+    }
+
+    /// The height of Bitcoin's chain as the wallet knows it of itself, not
+    /// from a hub: the highest its application told it since it was opened
+    /// ([`Wallet::saw_tip`]), or the last block it looked in
+    /// ([`Wallet::scan_silent`]) if that is higher. None if neither is
+    /// known. Never ahead of the chain, and behind it by as much as the
+    /// wallet was last told or looked.
+    pub fn tip(&self) -> Result<Option<u32>, Error> {
+        let looked = self.silent_next()?.map(|next| next.saturating_sub(1));
+        let told = Some(self.told_tip.load(Ordering::Relaxed)).filter(|told| *told > 0);
+        Ok(told.max(looked))
     }
 
     /// The network of the hubs the wallet trusts: a hub following another
