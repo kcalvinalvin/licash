@@ -23,8 +23,8 @@ for `bitcoin`, `signet`, `mutinynet` and `regtest`.
   CDN is only a transport. A store holding headers, as on any upgrade,
   never imports; a download that fails is not tried again on that store;
   peers serve whatever the import does not. No pin, no request for
-  header files. Bitcoin and signet are pinned (blocks 975000 and 330000);
-  mutinynet, whose CDN is still filling, is not yet.
+  header files. Bitcoin, signet and mutinynet are pinned (blocks 975000,
+  330000 and 3605000).
 - Peers: neutrino's own discovery (DNS seeds filtered by service, then
   `addr`/`addrv2` gossip, onion addresses included through a proxy).
   Besides, `node/` remembers the peers it completed a handshake with in
