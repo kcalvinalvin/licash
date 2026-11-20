@@ -446,7 +446,7 @@ pub struct Resumed {
 /// The step of a payment its hub refused, past which it is not given up:
 /// a send unsigned, a send signed whose hub proves an input spent otherwise
 /// or refuses the offer it forgot, a lock its hub has not certified.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
     Offer,
     Release,
@@ -465,9 +465,11 @@ impl Step {
                 "UPDATE sends SET abandoned = ?2
                  WHERE id = ?1 AND done_at IS NULL AND abandoned IS NULL"
             }
+            // A lock a recovery claims the refund of is its own.
             Self::Lock => {
                 "UPDATE locks SET abandoned = ?2
-                 WHERE id = ?1 AND certificate IS NULL AND abandoned IS NULL"
+                 WHERE id = ?1 AND certificate IS NULL AND abandoned IS NULL
+                 AND claimed_by IS NULL"
             }
         }
     }
@@ -1719,7 +1721,7 @@ impl<T: Transport> Wallet<T> {
                 reason: format!("hub {url} refused its release, proving no input spent: {problem}"),
             });
         }
-        Err(self.given_up(url, id, problem, Step::Release, &shown.spent)?)
+        Err(self.given_up(url, id, problem, Step::Release, &shown)?)
     }
 
     /// Give payment `id` up on its hub's refusal `problem` of `step`, unless
@@ -1736,25 +1738,31 @@ impl<T: Transport> Wallet<T> {
         problem: Problem,
         step: Step,
     ) -> Result<Error, Error> {
-        let gone = if problem.code == Code::Spent {
-            self.spent_inputs(url, id).await.spent
-        } else {
-            Vec::new()
+        let shown = match problem.code == Code::Spent {
+            true => self.spent_inputs(url, id).await,
+            false => inquiry::Shown::default(),
         };
-        self.given_up(url, id, problem, step, &gone)
+        // Its hub shows this very lock made: it is kept.
+        if step == Step::Lock && shown.locks.iter().any(|(lock, _)| lock == id) {
+            return Ok(Error::Pending {
+                id: hex::encode(id.as_bytes()),
+                reason: format!("hub {url} refused it, showing it made: {problem}"),
+            });
+        }
+        self.given_up(url, id, problem, step, &shown)
     }
 
-    /// [`Self::refused`], the notes its hub shows spent being `gone`.
+    /// [`Self::refused`], on what its hub showed of its notes.
     fn given_up(
         &self,
         url: &str,
         id: &ProposalId,
         problem: Problem,
         step: Step,
-        gone: &[[u8; 33]],
+        shown: &inquiry::Shown,
     ) -> Result<Error, Error> {
         let reason = problem.to_string();
-        if self.give_up(step, id, &reason, gone)? {
+        if self.give_up(step, id, &reason, &shown.spent, &shown.locks)? {
             return Ok(Error::Refused {
                 hub: url.to_owned(),
                 problem,
@@ -1786,18 +1794,21 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Give payment `id` up at `step`, unless it went past it, and free its
-    /// notes but drop those `gone`.
+    /// notes but drop those `gone`, save those spent by one of the wallet's
+    /// own `locks` under way, which are that lock's.
     fn give_up(
         &self,
         step: Step,
         id: &ProposalId,
         reason: &str,
         gone: &[[u8; 33]],
+        locks: &[(ProposalId, Vec<[u8; 33]>)],
     ) -> Result<bool, Error> {
         let given_up = self.store.write(|tx| {
             let given_up = tx.execute(step.give_up(), params![id.as_bytes(), reason])? == 1;
             if given_up {
-                for y in gone {
+                let locked = |y: &[u8; 33]| locks.iter().any(|(_, ys)| ys.contains(y));
+                for y in gone.iter().filter(|y| !locked(y)) {
                     // Or a recovery's that took it from the payment: what
                     // it claims of it is the hub's to answer.
                     tx.execute(
@@ -1810,6 +1821,9 @@ impl<T: Transport> Wallet<T> {
                     "UPDATE notes SET spent_by = NULL, spent_kind = NULL WHERE spent_by = ?1",
                     [id.as_bytes()],
                 )?;
+                for (lock, ys) in locks.iter().filter(|(lock, _)| lock != id) {
+                    inquiry::reserve_for_lock(tx, lock, ys)?;
+                }
             }
             Ok(given_up)
         })?;
@@ -1915,7 +1929,7 @@ impl<T: Transport> Wallet<T> {
             true => self.inputs_of(&id)?,
             false => Vec::new(),
         };
-        if self.give_up(Step::Offer, &id, "abandoned by its owner", &[])? {
+        if self.give_up(Step::Offer, &id, "abandoned by its owner", &[], &[])? {
             return self.renewal_refused(&ys);
         }
         Err(Error::Invalid(

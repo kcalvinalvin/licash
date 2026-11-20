@@ -859,6 +859,61 @@ async fn a_lock_its_hub_refused_but_served_is_taken_on_again_once_shown() {
     assert_eq!(available(&alice), (52, 0));
 }
 
+/// A lock its hub refused as spending notes spent, while serving it: the
+/// spend its hub shows is the lock itself, which is kept, not given up.
+#[tokio::test]
+async fn a_lock_its_hub_refused_as_spent_by_itself_is_kept() {
+    let (net, alice, bob) = parties().await;
+    net.fail(licash_api::LOCK, Fault::Belied(Code::Spent));
+    let refused = alice.lock(HUB, &bob.address(), 10, hash(), None).await;
+    assert!(
+        matches!(&refused, Err(Error::Pending { .. })),
+        "{refused:?}"
+    );
+    let id = alice.locks().unwrap()[0].id.clone();
+    assert_eq!(alice.locks().unwrap()[0].state, LockState::Requested);
+    assert_eq!(available(&alice).0, 0);
+    let resumed = alice.resume().await.unwrap();
+    assert_eq!(resumed.locks[0].state, LockState::Locked);
+    assert_eq!(bob.claim(HUB, &id, &PREIMAGE).await.unwrap().amount, 10);
+    assert_eq!(
+        alice.follow_lock(&id).await.unwrap().state,
+        LockState::Paid(PREIMAGE)
+    );
+    assert_eq!(available(&alice), (52, 0));
+}
+
+/// A lock its hub refused while serving it, its notes then spent again by
+/// a payment its hub refuses as spent by the lock: the payment is given
+/// up, and the notes are the lock's, not dropped.
+#[tokio::test]
+async fn a_payment_refused_as_spent_by_a_lock_given_up_hands_its_notes_to_it() {
+    let (net, alice, bob) = parties().await;
+    net.fail(licash_api::LOCK, Fault::Belied(Code::Timing));
+    let refused = alice.lock(HUB, &bob.address(), 10, hash(), None).await;
+    assert!(
+        matches!(&refused, Err(Error::Refused { .. })),
+        "{refused:?}"
+    );
+    let id = alice.locks().unwrap()[0].id.clone();
+    assert_eq!(available(&alice), (64, 0));
+    let sent = alice.send(HUB, &bob.address(), 5).await;
+    assert!(matches!(&sent, Err(Error::Refused { .. })), "{sent:?}");
+    assert_eq!(alice.locks().unwrap()[0].state, LockState::Requested);
+    assert_eq!(available(&alice).0, 0);
+    let inputs = alice.operation_notes(&id).unwrap().spent;
+    assert_eq!(inputs.len(), 1);
+    assert!(!inputs[0].gone, "{:?}", inputs[0]);
+    let resumed = alice.resume().await.unwrap();
+    assert_eq!(resumed.locks[0].state, LockState::Locked);
+    assert_eq!(bob.claim(HUB, &id, &PREIMAGE).await.unwrap().amount, 10);
+    assert_eq!(
+        alice.follow_lock(&id).await.unwrap().state,
+        LockState::Paid(PREIMAGE)
+    );
+    assert_eq!(available(&alice), (52, 0));
+}
+
 /// A payment signed whose release its hub never answered: a force close
 /// claims its notes, its change named beside them should its hub show it
 /// released, and takes no more of either for another recovery. Given

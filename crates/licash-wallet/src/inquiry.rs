@@ -45,6 +45,9 @@ pub(crate) struct Shown {
     /// The granted spends among that evidence, by id, each of which may
     /// have paid the wallet's change.
     pub payments: Vec<(ProposalId, Payment)>,
+    /// The wallet's own locks its hub never certified among that evidence,
+    /// each with the notes it spends: its hub made them, whatever it said.
+    pub locks: Vec<(ProposalId, Vec<[u8; 33]>)>,
 }
 
 /// What [`Wallet::check`] found.
@@ -147,7 +150,11 @@ impl<T: Transport> Wallet<T> {
                     }
                     // Perhaps a lock of the wallet's given up on its hub's
                     // word, which it served all the same.
-                    None => self.revive_lock(&id, notes)?,
+                    None => {
+                        if let Some(inputs) = self.revive_lock(&id, notes)? {
+                            shown.locks.push((id, inputs));
+                        }
+                    }
                 }
             }
             if spent {
@@ -161,33 +168,38 @@ impl<T: Transport> Wallet<T> {
     /// its hub having shown its signed request spending `inputs`: the
     /// hub's refusal was a lie. Those of its inputs still free are its own
     /// again, not dropped as spent; a lock its hub certified or settled is
-    /// as it was.
-    fn revive_lock(&self, id: &ProposalId, inputs: &[Note]) -> Result<(), Error> {
+    /// as it was. The points of its inputs if `id` is a lock of the
+    /// wallet's, not certified, now under way.
+    fn revive_lock(
+        &self,
+        id: &ProposalId,
+        inputs: &[Note],
+    ) -> Result<Option<Vec<[u8; 33]>>, Error> {
         let ys = (inputs.iter())
             .map(|n| Ok(n.message().identifier()?.0))
             .collect::<Result<Vec<_>, Error>>()?;
-        let revived = self.store.write(|tx| {
+        let (revived, live) = self.store.write(|tx| {
             let revived = tx.execute(
                 "UPDATE locks SET abandoned = NULL
                  WHERE id = ?1 AND abandoned IS NOT NULL AND certificate IS NULL",
                 [id.as_bytes()],
             )? == 1;
             if revived {
-                for y in &ys {
-                    tx.execute(
-                        "UPDATE notes SET spent_by = ?1, spent_kind = ?3
-                         WHERE y = ?2 AND spent_by IS NULL AND gone_at IS NULL",
-                        params![id.as_bytes(), y, crate::Spender::Lock.name()],
-                    )?;
-                }
+                reserve_for_lock(tx, id, &ys)?;
             }
-            Ok(revived)
+            let live: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM locks
+                 WHERE id = ?1 AND abandoned IS NULL AND certificate IS NULL)",
+                [id.as_bytes()],
+                |r| r.get(0),
+            )?;
+            Ok((revived, live))
         })?;
         if revived {
             let id = hex::encode(id.as_bytes());
             tracing::warn!(%id, "a lock given up on its hub's refusal, shown made, taken on again");
         }
-        Ok(())
+        Ok(live.then_some(ys))
     }
 
     /// Ask each hub about the notes held and drop those it proves spent:
@@ -287,4 +299,21 @@ impl<T: Transport> Wallet<T> {
         }
         Ok(dropped)
     }
+}
+
+/// Reserve for the lock `id` those of its inputs `ys` that are free: in no
+/// payment, unlink session or recovery, and not dropped.
+pub(crate) fn reserve_for_lock(
+    tx: &rusqlite::Transaction<'_>,
+    id: &ProposalId,
+    ys: &[[u8; 33]],
+) -> Result<(), Error> {
+    for y in ys {
+        tx.execute(
+            "UPDATE notes SET spent_by = ?1, spent_kind = ?3
+             WHERE y = ?2 AND spent_by IS NULL AND session IS NULL AND gone_at IS NULL",
+            params![id.as_bytes(), y, crate::Spender::Lock.name()],
+        )?;
+    }
+    Ok(())
 }

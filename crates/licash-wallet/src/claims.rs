@@ -495,10 +495,14 @@ impl<T: Transport> Wallet<T> {
         let sends = self.store.read(|c| {
             let mut sends = Vec::new();
             for (send, release) in signed_sends(c)? {
-                let Some(claim) = self.send_claim(c, &keyset, &send, &release, id)? else {
-                    continue;
-                };
-                sends.extend(claim.1);
+                match self.send_claim(c, &keyset, &send, &release, id) {
+                    Ok(Some((_, fallback))) => sends.extend(fallback),
+                    Ok(None) => {}
+                    // Never taken by a recovery, which leaves it out too.
+                    Err(e) => {
+                        tracing::warn!(id = %hex::encode(&send), "a payment's notes not claimable: {e}")
+                    }
+                }
             }
             Ok(sends)
         })?;
@@ -963,13 +967,25 @@ impl<T: Transport> Wallet<T> {
     /// The lock refunds it took are given back too.
     pub fn unclaim_notes(&self, id: &[u8; 32]) -> Result<usize, Error> {
         let (freed, locks) = self.store.write(|t| {
+            let taken: BTreeSet<[u8; 33]> = {
+                let mut stmt = t.prepare("SELECT y FROM notes WHERE spent_by = ?1")?;
+                let rows = stmt.query_map([id], |r| r.get(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
             let freed = t.execute(
                 "UPDATE notes SET spent_by = NULL, spent_kind = NULL WHERE spent_by = ?1",
                 [id],
             )?;
-            // The notes of the payments under way it took are theirs again.
+            // The notes it took of the payments under way are theirs again.
             for (send, offer) in pending_sends(t)? {
-                for y in send_inputs(&offer)? {
+                let inputs = match send_inputs(&offer) {
+                    Ok(inputs) => inputs,
+                    Err(e) => {
+                        tracing::warn!(id = %hex::encode(&send), "a payment's offer unread: {e}");
+                        continue;
+                    }
+                };
+                for y in inputs.iter().filter(|y| taken.contains(*y)) {
                     t.execute(
                         "UPDATE notes SET spent_by = ?1, spent_kind = ?3
                          WHERE y = ?2 AND spent_by IS NULL AND gone_at IS NULL",
