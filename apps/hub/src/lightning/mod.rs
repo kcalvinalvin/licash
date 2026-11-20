@@ -98,7 +98,8 @@ impl Default for Config {
             hold_delta: 12,
             downtime: 6,
             receive_blocks: 12,
-            invoice_expiry: 3600,
+            // A slot asked and never paid is freed after it.
+            invoice_expiry: 900,
             pay_timeout: 60,
             grace: 600,
             poll: Duration::from_secs(2),

@@ -141,7 +141,9 @@ invoice is canceled. `--lnd-cert` pins
 LND's certificate. The gateway keeps its invoices in
 `hub.sqlite`, with the ledger's records. An alert says when
 LND's channels can no longer pay or receive the most it takes.
-`--ln-max-receipts` bounds open and locked receipts (1024 by default).
+`--ln-max-receipts` bounds open and locked receipts (1024 by default). A
+receipt's invoice may be paid for 15 minutes (`--ln-invoice-expiry`, 900
+seconds), after which an unpaid one frees its place.
 Lowering it blocks new receipts, not retries or following existing ones.
 
 `--ln-max-pay-day SAT` bounds what the gateway pays out over the node in
@@ -216,7 +218,9 @@ the fee, amounts and timing (a deposit's lock lasts 36 blocks by
 default, room for the payer to activate it on Bitcoin should the hub keep
 its notes). `--deposit-max-open` bounds deposits asked and
 not yet paid (1024 by default): past it, new ones are refused as
-unavailable, never retries or deposits under way. A deposit is named at
+unavailable, never retries or deposits under way. A deposit's payment must
+confirm within 72 blocks (`--deposit-window`, half a day) of the request,
+after which an unpaid one frees its place. A deposit is named at
 its hub by its payer's refund key, x-only, under which the hub takes one
 deposit and refuses another: its status (`/v1/deposit/{refund}`) also
 answers what was asked and the terms answered, so that a wallet restored

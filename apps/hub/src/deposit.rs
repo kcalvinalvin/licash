@@ -88,7 +88,8 @@ impl Config {
             min: 10_000,
             max: 5_000_000,
             depth: 3,
-            window: 144,
+            // Half a day: a slot asked and never paid is freed by then.
+            window: 72,
             lock_blocks: 36,
             downtime: 6,
             sweep_blocks: 36,
