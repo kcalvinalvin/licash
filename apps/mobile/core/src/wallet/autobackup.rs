@@ -60,6 +60,9 @@ const TAG: usize = 16;
 const DETACH_AT: usize = 64 * 1024;
 /// The most bytes one file holds, sealed in one piece.
 const MOST: usize = 64 * 1024 * 1024;
+/// The most bytes a file of the folder takes, sealed: one larger is none
+/// of a backup's.
+const SEALED_MOST: usize = MOST + HEADER + NONCE + TAG;
 /// Snapshots of this install kept in the folder.
 const KEEP: usize = 3;
 /// A backup unchanged this long is written again: proof it is current.
@@ -126,6 +129,13 @@ pub struct BackupFound {
 pub fn backup_folder_name(phrase: String, network: Network) -> Result<String, LicashError> {
     let seed = seed_of(&phrase).map_err(failed)?;
     Ok(Keys::of(&seed, network.profile().name()).folder())
+}
+
+/// The most bytes a file of a backup folder takes: one larger is none of a
+/// backup's, never to be copied whole to look for one.
+#[uniffi::export]
+pub fn backup_file_most() -> u64 {
+    SEALED_MOST as u64
 }
 
 /// The newest backup in `files`, a copy of the folder's files, of the
@@ -623,9 +633,9 @@ fn unpacked(
 fn read_most(path: &Path) -> Result<Vec<u8>> {
     let file = fs::File::open(path).with_context(|| format!("{} missing", path.display()))?;
     let mut bytes = Vec::new();
-    file.take((MOST + HEADER + NONCE + TAG + 1) as u64)
+    file.take((SEALED_MOST + 1) as u64)
         .read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= MOST + HEADER + NONCE + TAG, "too large");
+    ensure!(bytes.len() <= SEALED_MOST, "too large");
     Ok(bytes)
 }
 
@@ -1202,5 +1212,18 @@ mod tests {
         moved[21] ^= 1;
         assert!(keys.open(&moved).is_err());
         assert!(Keys::of(&[7; 32], "signet").open(&sealed).is_err());
+    }
+
+    #[test]
+    fn a_file_larger_than_the_app_copies_is_none_of_a_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("s.lcb");
+        let most = backup_file_most();
+        // Sparse: no 64 MiB written.
+        fs::File::create(&file).unwrap().set_len(most).unwrap();
+        assert_eq!(read_most(&file).unwrap().len() as u64, most);
+        fs::File::create(&file).unwrap().set_len(most + 1).unwrap();
+        let e = read_most(&file).unwrap_err().to_string();
+        assert!(e.contains("too large"), "{e}");
     }
 }

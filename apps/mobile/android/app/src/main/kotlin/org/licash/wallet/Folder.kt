@@ -6,6 +6,7 @@ import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 
 /**
  * A folder of a tree the user chose (Storage Access Framework), as far as
@@ -61,11 +62,16 @@ internal class Folder private constructor(
         }
     }
 
-    /** The file `child` of it copied `to`. */
-    fun read(child: Child, to: File) {
+    /**
+     * The file `child` of it copied `to`, if it holds at most `most` bytes:
+     * else nothing of it kept, and false. Its size as the provider tells it
+     * is not trusted, only what it gives.
+     */
+    fun read(child: Child, to: File, most: Long): Boolean {
+        if (child.bytes > most) return false
         val input = resolver.openInputStream(DocumentsContract.buildDocumentUriUsingTree(tree, child.id))
             ?: throw IOException("${child.name} cannot be read")
-        input.use { i -> to.outputStream().use { i.copyTo(it) } }
+        return input.use { copyAtMost(it, to, most) }
     }
 
     /** Every file `name` in it deleted. */
@@ -106,4 +112,32 @@ internal class Folder private constructor(
         fun of(context: Context, tree: Uri): Folder =
             Folder(context, tree, DocumentsContract.getTreeDocumentId(tree))
     }
+}
+
+/**
+ * `input` copied `to`, if it holds at most `most` bytes: else, or failing,
+ * nothing of it kept, and false. Never more than `most` bytes written,
+ * whatever the stream holds.
+ */
+internal fun copyAtMost(input: InputStream, to: File, most: Long): Boolean {
+    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+    var copied = 0L
+    var whole = false
+    try {
+        to.outputStream().use { out ->
+            while (true) {
+                val n = input.read(buffer)
+                if (n < 0) {
+                    whole = true
+                    break
+                }
+                copied += n
+                if (copied > most) break
+                out.write(buffer, 0, n)
+            }
+        }
+    } finally {
+        if (!whole) to.delete()
+    }
+    return whole
 }

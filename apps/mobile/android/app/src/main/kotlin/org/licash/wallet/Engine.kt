@@ -72,8 +72,10 @@ import org.licash.core.Wallet
 import org.licash.core.chainName
 import org.licash.core.defaultRelays
 import org.licash.core.explorer
+import org.licash.core.backupFileMost
 import org.licash.core.backupFolderName
 import org.licash.core.findBackup
+import org.licash.core.stateBundleMost
 import org.licash.core.setLogger
 import org.licash.core.walletExists
 import org.licash.wallet.ui.Progress
@@ -299,6 +301,9 @@ class Engine(context: Context) {
     init {
         AppLog.start(File(files, "logs"))
         setLogger(AppLog, "info,nostr_sdk=warn,nostr_relay_pool=warn")
+        // A backup found is shown until the app ends, never after: its
+        // copied folder of a run before is of no use.
+        scope.launch { restoreCopy.deleteRecursively() }
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStart(owner: LifecycleOwner) {
                 foreground = true
@@ -1185,7 +1190,8 @@ class Engine(context: Context) {
         return try {
             io {
                 val input = app.contentResolver.openInputStream(from) ?: error("that file cannot be read")
-                input.use { i -> copy.outputStream().use { i.copyTo(it) } }
+                val whole = input.use { copyAtMost(it, copy, stateBundleMost().toLong()) }
+                check(whole) { "that file is too large to be a backup" }
             }.fold(
                 { restored { Wallet.fromStateBundle(walletDir, copy.path, tor()) } },
                 { Result.failure(it) },
@@ -1201,7 +1207,8 @@ class Engine(context: Context) {
     /**
      * The newest backup of the wallet of `words`, on the network chosen, in
      * the folder `tree` or in its own folder in it: none if none restores.
-     * Its files are copied to the phone, kept for [restoreFolder].
+     * Its files are copied to the phone, kept for [restoreFolder] once one
+     * is found, else gone; a file too large for a backup is never copied.
      */
     suspend fun findFolderBackup(tree: Uri, words: List<String>): Result<BackupFound?> = io {
         val phrase = words.joinToString(" ")
@@ -1210,11 +1217,20 @@ class Engine(context: Context) {
         // As [backupDir] finds it, never made here.
         val folder = if (root.name() == name) root else root.find(name)
         val copy = restoreCopy.apply { deleteRecursively(); mkdirs() }
-        if (folder == null) return@io null
-        for (c in folder.children()) {
-            if (!c.dir && c.name.endsWith(".lcb")) folder.read(c, File(copy, c.name))
+        var found: BackupFound? = null
+        try {
+            if (folder != null) {
+                val most = backupFileMost().toLong()
+                for (c in folder.children()) {
+                    if (c.dir || !c.name.endsWith(".lcb")) continue
+                    if (!folder.read(c, File(copy, c.name), most)) AppLog.warn("${c.name} passed over: too large for a backup")
+                }
+                found = findBackup(phrase, prefs.network, copy.path)
+            }
+        } finally {
+            if (found == null) copy.deleteRecursively()
         }
-        findBackup(phrase, prefs.network, copy.path)
+        found
     }
 
     /**

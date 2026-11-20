@@ -26,6 +26,15 @@ use crate::{ChainSource, LicashError, Network, TorClient};
 const FORMAT: u32 = 2;
 const MAX_FILES: usize = 100_000;
 pub(super) const MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// The most bytes a state bundle takes: its files and their archive.
+const BUNDLE_MOST: u64 = MAX_BYTES + 16 * 1024 * 1024;
+
+/// The most bytes a full backup's file takes: one larger is none, never to
+/// be copied whole to restore from.
+#[uniffi::export]
+pub fn state_bundle_most() -> u64 {
+    BUNDLE_MOST
+}
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
@@ -386,7 +395,7 @@ pub(super) fn hash(input: &mut impl Read, output: &mut impl Write) -> Result<Ent
 
 fn extract(bundle: &Path, to: &Path) -> Result<Manifest> {
     ensure!(
-        fs::metadata(bundle)?.len() <= MAX_BYTES + 16 * 1024 * 1024,
+        fs::metadata(bundle)?.len() <= BUNDLE_MOST,
         "state bundle is too large"
     );
     let (manifest, actual) = unpack(File::open(bundle)?, to)?;
@@ -772,5 +781,20 @@ mod tests {
             fs::read(wallet.dir.join("contracts/pinned-proof")).unwrap(),
             b"must stay"
         );
+    }
+
+    #[test]
+    fn a_bundle_larger_than_the_app_copies_is_refused_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("big.licash");
+        // Sparse: nothing written.
+        fs::File::create(&bundle)
+            .unwrap()
+            .set_len(state_bundle_most() + 1)
+            .unwrap();
+        let Err(e) = extract(&bundle, &dir.path().join("to")) else {
+            panic!("a bundle too large extracted");
+        };
+        assert!(e.to_string().contains("too large"), "{e}");
     }
 }
