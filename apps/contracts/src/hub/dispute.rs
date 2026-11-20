@@ -691,6 +691,27 @@ impl Openings {
         if tip.saturating_add(1) < p_at.saturating_add(depth) {
             return Ok(Played::Idle);
         }
+        // Her publication past the headers a proof can carry: nothing to
+        // judge it on, and a response on the short chain would commit the
+        // hub to a proof it can never make. Unanswered, her timeout pays
+        // her what she claims, which the hub keeps its reserve against.
+        let chain_terms = &o.base.parts().chain;
+        if past_the_headers(
+            chain_terms.checkpoint.height(),
+            chain_terms.max_headers,
+            p_at,
+        ) {
+            if self.once(id, "past-headers") {
+                self.alert(&format!(
+                    "contract {}: her publication is in block {p_at}, past the {} headers \
+                     after its checkpoint a proof can carry: the hub cannot judge her claim, \
+                     and does not respond to it.",
+                    crate::hex_id(id),
+                    chain_terms.max_headers
+                ));
+            }
+            return Ok(Played::Idle);
+        }
         let block = self.block_at(p_at).await?;
         let filed = dispute::published(&request.tx, &block, &p.compute_txid())?;
         let (b, e) = o.requested_b(r)?;
@@ -2287,9 +2308,25 @@ fn looked(
     }
 }
 
+/// Whether block `at` is past the last of the `max_headers` headers after
+/// a checkpoint at `checkpoint`.
+fn past_the_headers(checkpoint: u32, max_headers: u32, at: u32) -> bool {
+    u64::from(at) > u64::from(checkpoint) + u64::from(max_headers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_publication_is_past_the_headers_after_the_last_of_them() {
+        // The headers after a checkpoint at 100, 30 of them: through 130.
+        assert!(!past_the_headers(100, 30, 101));
+        assert!(!past_the_headers(100, 30, 130));
+        assert!(past_the_headers(100, 30, 131));
+        assert!(!past_the_headers(u32::MAX, u32::MAX, u32::MAX));
+        assert!(!past_the_headers(u32::MAX - 1, 5, u32::MAX));
+    }
 
     fn coin(n: u8, sat: u64) -> (OutPoint, TxOut) {
         let txid = bitcoin::hashes::Hash::from_byte_array([n; 32]);
