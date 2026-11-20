@@ -41,9 +41,7 @@ Licash runs on signet and Mutinynet. Contracts there are a trial: the
 code has not had a security review, so do not use real funds. The signets'
 headers are checked by their work alone, not by the network's signature of
 each block, so headers that fool a contract's statement cost little to make,
-and a contract's header chain there is only as strong as that work. Contracts
-of graph id 10, which read every header of an exit, are weaker still once a
-claim is published, as its exit is read against what the hub shows then.
+and a contract's recovery there is only as strong as that work.
 
 - **Android:** install `licash-main.apk` from the
   [`main-build` release](https://github.com/lichenbtc-org/licash/releases/tag/main-build),
