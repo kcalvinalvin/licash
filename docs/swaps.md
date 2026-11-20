@@ -219,7 +219,9 @@ With `--tor`, it reaches hubs and relays, onion services included, through a
 Tor client of its own, which keeps its state in `<data>/tor`; `--proxy
 socks5h://...` goes through a Tor daemon instead. With `--onion`, it also
 serves its API as an onion service, announced like `--announce-url`'s; back
-up `<data>/tor/state` to keep the address.
+up `<data>/tor/state` to keep the address. Under load, the service asks its
+clients for a proof of work (Tor's onion service defense) unless
+`--onion-pow false`.
 Notification targets are Apprise URLs, as for the hub; `test-notify` checks
 them. `--notify-kinds` picks the kinds of event: by default all but swaps
 accepted (`accepted`), still under way. Each notification lists the swap's

@@ -3,7 +3,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
-use futures_util::StreamExt;
+use futures_util::{future::Either, FutureExt, StreamExt};
 use hyper_util::{
     rt::{TokioIo, TokioTimer},
     service::TowerToHyperService,
@@ -11,7 +11,8 @@ use hyper_util::{
 use safelog::DisplayRedacted;
 use tor_cell::relaycell::msg::{Connected, End, EndReason};
 use tor_hsservice::{
-    config::OnionServiceConfigBuilder, HsNickname, RunningOnionService, StreamRequest,
+    config::{OnionServiceConfig, OnionServiceConfigBuilder},
+    HsNickname, RendRequest, RunningOnionService, StreamRequest,
 };
 use tor_proto::stream::IncomingStreamRequest;
 
@@ -26,6 +27,21 @@ const RETRY: Duration = Duration::from_secs(60);
 /// Bound accepted streams, including clients that never send HTTP headers.
 const MAX_STREAMS: usize = 128;
 const HEADERS: Duration = Duration::from_secs(120);
+
+/// The rendezvous circuit an onion request came over, as an
+/// [`axum::Extension`] of the request: one introduction, which the
+/// service's proof of work prices while it is under load. Random, so
+/// never the same as one before a restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Circuit(pub [u8; 16]);
+
+impl Circuit {
+    fn new() -> Self {
+        let mut id = [0; 16];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut id);
+        Self(id)
+    }
+}
 
 /// An onion service, served until dropped.
 pub struct Onion {
@@ -50,12 +66,11 @@ impl Drop for Onion {
 impl Tor {
     /// Serve `router` on port 80 of the onion service `nickname`, at the
     /// same address on every start: the client keeps its key in its state.
-    /// Within a Tokio runtime.
-    pub fn serve(&self, nickname: &str, router: axum::Router) -> anyhow::Result<Onion> {
-        let nickname: HsNickname = nickname.parse().context("an onion service's nickname")?;
-        let config = OnionServiceConfigBuilder::default()
-            .nickname(nickname)
-            .build()?;
+    /// With `pow`, clients must solve a proof of work to reach it while it
+    /// is under load. Each request carries its [`Circuit`]. Within a Tokio
+    /// runtime.
+    pub fn serve(&self, nickname: &str, router: axum::Router, pow: bool) -> anyhow::Result<Onion> {
+        let config = config(nickname, pow)?;
         let (service, requests) = self
             .client
             .launch_onion_service(config)?
@@ -64,7 +79,7 @@ impl Tor {
             .onion_address()
             .context("the onion service has no address")?;
         let url = format!("http://{}", address.display_unredacted());
-        let mut streams = Box::pin(tor_hsservice::handle_rend_requests(requests));
+        let mut streams = Box::pin(requests.flat_map_unordered(None, by_circuit));
         let client = self.client.clone();
         let serving = tokio::spawn(async move {
             // The service publishes itself once the client holds the
@@ -81,12 +96,18 @@ impl Tor {
                     // rejection so the accept loop cannot hang on a peer.
                     let _ = tokio::time::timeout(
                         Duration::from_secs(5),
-                        request.reject(End::new_with_reason(EndReason::RESOURCELIMIT)),
+                        request
+                            .1
+                            .reject(End::new_with_reason(EndReason::RESOURCELIMIT)),
                     )
                     .await;
                     continue;
                 }
-                tasks.spawn(answer(request, router.clone()));
+                let (circuit, request) = request;
+                tasks.spawn(answer(
+                    request,
+                    router.clone().layer(axum::Extension(circuit)),
+                ));
             }
         });
         Ok(Onion {
@@ -95,6 +116,35 @@ impl Tor {
             serving,
         })
     }
+}
+
+/// The onion service `nickname`'s configuration, with a proof of work
+/// asked under load if `pow`.
+fn config(nickname: &str, pow: bool) -> anyhow::Result<OnionServiceConfig> {
+    let nickname: HsNickname = nickname.parse().context("an onion service's nickname")?;
+    Ok(OnionServiceConfigBuilder::default()
+        .nickname(nickname)
+        .enable_pow(pow)
+        .build()?)
+}
+
+/// The streams of the rendezvous `rend` once accepted, each with its
+/// [`Circuit`].
+fn by_circuit(
+    rend: RendRequest,
+) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = (Circuit, StreamRequest)> + Send>> {
+    let circuit = Circuit::new();
+    Box::pin(
+        rend.accept()
+            .map(move |accepted| match accepted {
+                Ok(streams) => Either::Left(streams.map(move |s| (circuit, s))),
+                Err(e) => {
+                    tracing::debug!("a rendezvous not accepted: {e}");
+                    Either::Right(futures_util::stream::empty())
+                }
+            })
+            .flatten_stream(),
+    )
 }
 
 /// Serve `router` on the stream `request` asks for, if it asks for port 80.
@@ -145,6 +195,14 @@ mod tests {
 
     use super::*;
 
+    /// Built with Arti's proof of work, which a service asks for only if
+    /// it is.
+    #[test]
+    fn an_onion_service_may_ask_for_a_proof_of_work() {
+        config("licash-test", true).unwrap();
+        config("licash-test", false).unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_idle_http_stream_times_out_and_a_normal_request_still_works() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -178,7 +236,7 @@ mod tests {
         let router = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
         let onion = Tor::new(served.path())
             .unwrap()
-            .serve("licash-test", router)
+            .serve("licash-test", router, true)
             .unwrap();
         assert!(onion.url().ends_with(".onion"), "{}", onion.url());
         let client = Tor::new(asking.path()).unwrap();

@@ -32,7 +32,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{rustls, TlsConnector};
 use tor_rtcompat::PreferredRuntime;
 
-pub use serve::Onion;
+pub use serve::{Circuit, Onion};
 pub use socks::Socks;
 
 /// How long a request may take, its circuit included.

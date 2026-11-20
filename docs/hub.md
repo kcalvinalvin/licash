@@ -662,7 +662,10 @@ web alike.
 With `--onion`, the hub also serves its API as an onion service of a Tor
 client of its own (Arti), and announces its URL, reaching the relays
 through Tor too. The service's key is in `<data>/tor/state`: back it up to
-keep the address.
+keep the address. Under load, the service asks its clients for a proof of
+work (Tor's onion service defense), unless `--onion-pow false`: each new
+circuit to it then costs work. Licash's own clients solve it, as do Tor
+clients from 0.4.8 on.
 
 Notification targets are Apprise URLs (`gotify[s]://`, `tgram://`,
 `ntfy[s]://`, `json[s]://`, `apprise[s]://`); `test-notify` checks them.

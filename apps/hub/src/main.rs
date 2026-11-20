@@ -944,6 +944,12 @@ enum Command {
         #[arg(long, env = "LICASH_HUB_ONION",
               value_parser = clap::builder::BoolishValueParser::new())]
         onion: bool,
+        /// Whether `--onion`'s service asks its clients for a proof of work
+        /// while it is under load, which prices each new circuit to it.
+        #[arg(long, env = "LICASH_HUB_ONION_POW", default_value_t = true,
+              action = clap::ArgAction::Set,
+              value_parser = clap::builder::BoolishValueParser::new())]
+        onion_pow: bool,
         /// Run even though own locks of the hub, which it may yet pay, are
         /// backed by no deposit, Lightning receipt or swap it keeps, as
         /// once such a file was restored older than `hub.sqlite`: alerting
@@ -1068,6 +1074,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             announce,
             swaps,
             onion,
+            onion_pow,
             allow_unbacked_locks,
             notify_kinds,
         } => {
@@ -1372,7 +1379,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             // Served until the hub stops.
             let _onion = match &tor {
                 Some(tor) if onion => {
-                    let onion = tor.serve("licash-hub", router.clone())?;
+                    let onion = tor.serve("licash-hub", router.clone(), onion_pow)?;
                     tracing::info!(url = onion.url(), "serving as an onion service");
                     announce_over(&mut announcing, tor, Some(&onion))?;
                     let mut urls = urls

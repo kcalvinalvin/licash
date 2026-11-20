@@ -670,6 +670,12 @@ enum Command {
         #[arg(long, env = "LICASH_SWAPS_ONION",
               value_parser = clap::builder::BoolishValueParser::new())]
         onion: bool,
+        /// Whether `--onion`'s service asks its clients for a proof of work
+        /// while it is under load, which prices each new circuit to it.
+        #[arg(long, env = "LICASH_SWAPS_ONION_POW", default_value_t = true,
+              action = clap::ArgAction::Set,
+              value_parser = clap::builder::BoolishValueParser::new())]
+        onion_pow: bool,
         #[command(flatten)]
         notify: Notify,
         /// Notify only of these kinds of event [default: all but accepted].
@@ -797,6 +803,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             proxy,
             tor,
             onion,
+            onion_pow,
             notify,
             notify_kinds,
             announce,
@@ -901,7 +908,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             };
             let onion = match &client {
                 Some(client) if onion => {
-                    let onion = client.serve("licash-swaps", router.clone())?;
+                    let onion = client.serve("licash-swaps", router.clone(), onion_pow)?;
                     tracing::info!(url = onion.url(), "serving as an onion service");
                     Some(onion)
                 }
