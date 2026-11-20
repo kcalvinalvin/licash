@@ -91,21 +91,32 @@ pub fn target(bits: u32) -> Option<[u8; 32]> {
 }
 
 /// The work a block of these bits proves, about `2^256 / target`: for a
-/// target `m · 256^(e-3)`, `2^(256 - 8(e-3)) / m`, saturating (far beyond
-/// any difficulty yet). Zero for bits that are no target.
+/// target `m · 256^(e-3)`, `2^(256 - 8(e-3)) / m`, rounded down, saturating
+/// only once that is past `u128` (far beyond any difficulty yet). Zero for
+/// bits that are no target.
 pub fn work(bits: u32) -> u128 {
     if target(bits).is_none() {
         return 0;
     }
     let (e, m) = ((bits >> 24) as i32, (bits & 0x00ff_ffff) as u128);
     let shift = 256 - 8 * (e - 3);
-    if shift >= 128 {
-        return u128::MAX;
-    }
     if shift < 0 {
         return 0;
     }
-    (1u128 << shift) / m
+    if shift < 128 {
+        return (1u128 << shift) / m;
+    }
+    // `m` is under 2^23: from 2^151 on, past `u128` whatever it is.
+    if shift >= 151 {
+        return u128::MAX;
+    }
+    // 2^shift = a · 2^23, `a` fitting: divided in two steps, exactly.
+    let a = 1u128 << (shift - 23);
+    let (quotient, rest) = (a / m, a % m);
+    quotient
+        .checked_mul(1 << 23)
+        .and_then(|q| q.checked_add((rest << 23) / m))
+        .unwrap_or(u128::MAX)
 }
 
 /// The root a txid at `index` reaches through `path` (siblings from the

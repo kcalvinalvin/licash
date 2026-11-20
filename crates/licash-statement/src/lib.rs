@@ -814,6 +814,24 @@ mod tests {
         assert!(btc::target(0x22010000).is_none(), "beyond 256 bits");
     }
 
+    /// Past 2^128 only once the work is: below, rounded down as ever.
+    #[test]
+    fn work_saturates_only_once_it_is_past_what_a_u128_holds() {
+        // Exponent 19, the largest mantissa: 2^128 / 0x7fffff, about 2^105.
+        let w = work(0x137fffff);
+        assert!(w > 1 << 105 && w < (1 << 105) + (1 << 83), "{w}");
+        assert_eq!(w, 40564824043007195767232224305152);
+        // Exponent 19, a mantissa of 1: 2^128, past it.
+        assert_eq!(work(0x13000001), u128::MAX);
+        // Exponents 18 and 17: 2^136 and 2^144 over it, about 2^113 and
+        // 2^121, as exact as ever.
+        assert_eq!(work(0x127fffff), 10384594955009842116411449422118912);
+        assert_eq!(work(0x117fffff), 2658456308482519581801331052062441536);
+        // Exponent 16 and below: past it whatever the mantissa.
+        assert_eq!(work(0x107fffff), u128::MAX);
+        assert_eq!(work(0x03000001), u128::MAX);
+    }
+
     #[test]
     fn carrier_encoding_and_parsing() {
         for n in [0, 1, 75, 76, 255, 256, 520, 521, 1200, 99_000] {
