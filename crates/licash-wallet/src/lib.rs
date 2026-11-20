@@ -444,8 +444,8 @@ pub struct Resumed {
 }
 
 /// The step of a payment its hub refused, past which it is not given up:
-/// a send unsigned, a send signed and refused as spent, a lock its hub has
-/// not certified.
+/// a send unsigned, a send signed whose hub proves an input spent otherwise
+/// or refuses the offer it forgot, a lock its hub has not certified.
 #[derive(Clone, Copy)]
 pub(crate) enum Step {
     Offer,
@@ -1420,7 +1420,7 @@ impl<T: Transport> Wallet<T> {
                 },
             )?)
         })?;
-        let (hub, url, offer, release, unlock, abandoned) = row;
+        let (hub, url, offer, release, mut unlock, abandoned) = row;
         let keep = self.store.read(|c| delivery::keep(c, id))?;
         if let Some(reason) = abandoned {
             return Err(Error::Abandoned {
@@ -1467,6 +1467,13 @@ impl<T: Transport> Wallet<T> {
                             reason: format!("hub {url} refused its release: {problem}"),
                         });
                     }
+                    // Released already, as its hub proves: finished with
+                    // the release and the unlock it shows.
+                    Err(Error::Refused { problem, .. }) if problem.code == Code::Spent => {
+                        let shown = self.spent_release(&url, id, problem).await?;
+                        (release, unlock) = (shown.0, Some(shown.1));
+                        continue;
+                    }
                     Err(e) => return Err(e),
                 },
             };
@@ -1508,9 +1515,10 @@ impl<T: Transport> Wallet<T> {
 
     /// Send `id` offered and signed again, its hub having forgotten the
     /// offer `release` was signed under: a hub deletes those left
-    /// unreleased long. That signature can never be released now, its
-    /// offer's salt gone, so it is dropped; a refusal of the new offer
-    /// gives the send up as [`Self::sign`]'s would.
+    /// unreleased long. An honest hub can never release that signature
+    /// now, its offer's salt gone, but one that kept it could: it is kept
+    /// until the new one replaces it, and with the send if the new offer
+    /// is refused, which gives the send up as [`Self::sign`]'s would.
     async fn offer_again<'k>(
         &self,
         url: &str,
@@ -1520,20 +1528,12 @@ impl<T: Transport> Wallet<T> {
         keysets: impl Fn(&[u8; 32]) -> Option<&'k Keyset>,
     ) -> Result<Release, Error> {
         let signed = serde_json::to_string(release).map_err(invalid)?;
-        self.store.write(|tx| {
-            tx.execute(
-                "UPDATE sends SET release = NULL
-                 WHERE id = ?1 AND release = ?2 AND unlock IS NULL AND abandoned IS NULL",
-                params![id.as_bytes(), signed],
-            )?;
-            Ok(())
-        })?;
-        self.sign(url, id, offer, keysets).await
+        self.sign_over(url, id, offer, keysets, Some(&signed)).await
     }
 
     /// The hub's offer for `offer`, signed and recorded: from then on the
-    /// send is given up only once its hub refuses it as spent. Refused, the
-    /// send is given up.
+    /// send is given up only once its hub proves an input spent otherwise
+    /// ([`Self::spent_release`]). Refused, the send is given up.
     async fn sign<'k>(
         &self,
         url: &str,
@@ -1541,13 +1541,30 @@ impl<T: Transport> Wallet<T> {
         offer: &Offer,
         keysets: impl Fn(&[u8; 32]) -> Option<&'k Keyset>,
     ) -> Result<Release, Error> {
+        self.sign_over(url, id, offer, keysets, None).await
+    }
+
+    /// [`Self::sign`], in place of the release `over` if given, signed
+    /// under an offer its hub forgot.
+    async fn sign_over<'k>(
+        &self,
+        url: &str,
+        id: &ProposalId,
+        offer: &Offer,
+        keysets: impl Fn(&[u8; 32]) -> Option<&'k Keyset>,
+        over: Option<&str>,
+    ) -> Result<Release, Error> {
         let (proposal, notes) = offer.decode(&keysets).map_err(invalid)?;
         let keyset = keysets(proposal.keyset_id())
             .ok_or_else(|| Error::Invalid("a send under a keyset its hub no longer has".into()))?;
         let grant = match self.post::<Offered>(url, licash_api::OFFER, offer).await {
             Ok(offered) => offered.decode().map_err(|p| unavailable(url, p))?,
             Err(Error::Refused { problem, .. }) => {
-                return Err(self.refused(url, id, problem, Step::Offer).await?);
+                let step = match over {
+                    Some(_) => Step::Release,
+                    None => Step::Offer,
+                };
+                return Err(self.refused(url, id, problem, step).await?);
             }
             Err(e) => return Err(e),
         };
@@ -1565,8 +1582,9 @@ impl<T: Transport> Wallet<T> {
         let (release, abandoned): (String, Option<String>) = self.store.write(|tx| {
             tx.execute(
                 "UPDATE sends SET release = ?2
-                 WHERE id = ?1 AND release IS NULL AND abandoned IS NULL",
-                params![id.as_bytes(), release],
+                 WHERE id = ?1 AND (release IS NULL OR release = ?3)
+                    AND unlock IS NULL AND abandoned IS NULL",
+                params![id.as_bytes(), release, over],
             )?;
             Ok(tx.query_row(
                 "SELECT COALESCE(release, ''), abandoned FROM sends WHERE id = ?1",
@@ -1585,9 +1603,10 @@ impl<T: Transport> Wallet<T> {
 
     /// The hub's unlock for the signed `release`, checked to open its
     /// grant, and whether it keeps the payment for its payee, asked to if
-    /// `keep`. A hub that spent an input otherwise will never release it:
-    /// the send is given up. One that forgot its offer is refused as such,
-    /// to offer it again. Any other refusal leaves it pending.
+    /// `keep`. A hub that says an input is spent, or that it forgot its
+    /// offer, is refused as such, for the caller to ask what it proves
+    /// ([`Self::spent_release`]) or to offer it again. Any other refusal
+    /// leaves it pending.
     async fn release(
         &self,
         url: &str,
@@ -1607,11 +1626,10 @@ impl<T: Transport> Wallet<T> {
             .await
         {
             Ok(released) => released,
-            Err(Error::Refused { problem, .. }) if problem.code == Code::Spent => {
-                return Err(self.refused(url, id, problem, Step::Release).await?);
-            }
-            // Its offer forgotten: the caller offers it again.
-            Err(Error::Refused { hub, problem }) if problem.code == Code::UnknownOffer => {
+            // An input said spent, or its offer forgotten: the caller's.
+            Err(Error::Refused { hub, problem })
+                if matches!(problem.code, Code::Spent | Code::UnknownOffer) =>
+            {
                 return Err(Error::Refused { hub, problem });
             }
             Err(Error::Refused { problem, .. }) => {
@@ -1632,9 +1650,55 @@ impl<T: Transport> Wallet<T> {
         Ok((unlock, asked && released.kept))
     }
 
+    /// What the hub at `url` proves of the signed send `id` it refuses to
+    /// release as spent, with `problem`. It holds her signature, so its
+    /// word frees none of her notes:
+    /// - the send released already, shown with its unlock: the release and
+    ///   the unlock to finish it with, recorded (those of an offer it said
+    ///   it forgot, [`Self::offer_again`], may be the ones it released);
+    /// - an input spent otherwise, or claimed on Bitcoin: the send is
+    ///   given up, as [`Self::refused`] gives one up, for its hub can
+    ///   release it no more;
+    /// - nothing: the send stays pending, its notes with it, as its hub
+    ///   may release it yet.
+    async fn spent_release(
+        &self,
+        url: &str,
+        id: &ProposalId,
+        problem: Problem,
+    ) -> Result<(Release, Unlock), Error> {
+        let shown = self.spent_inputs(url, id).await;
+        let released = shown.payments.iter().find(|(spend, _)| spend == id);
+        if let Some((_, payment)) = released {
+            let unlock: Unlock = (payment.unlock.0.as_slice().try_into())
+                .map_err(|_| unavailable(url, "an unlock of another width"))?;
+            let release = serde_json::to_string(&payment.release).map_err(invalid)?;
+            self.store.write(|tx| {
+                tx.execute(
+                    "UPDATE sends SET release = ?2
+                     WHERE id = ?1 AND unlock IS NULL AND abandoned IS NULL",
+                    params![id.as_bytes(), release],
+                )?;
+                Ok(())
+            })?;
+            return Ok((payment.release.clone(), unlock));
+        }
+        if shown.spent.is_empty() {
+            return Err(Error::Pending {
+                id: hex::encode(id.as_bytes()),
+                reason: format!("hub {url} refused its release, proving no input spent: {problem}"),
+            });
+        }
+        Err(self.given_up(url, id, problem, Step::Release, &shown.spent)?)
+    }
+
     /// Give payment `id` up on its hub's refusal `problem` of `step`, unless
     /// it went past it: its notes freed, but those the hub shows spent
     /// dropped. The error to answer with.
+    ///
+    /// Of a signed send, only one whose hub forgot its offer and refuses
+    /// it again ([`Self::offer_again`]): its signature is kept, as its hub
+    /// may have kept it too.
     pub(crate) async fn refused(
         &self,
         url: &str,
@@ -1643,12 +1707,24 @@ impl<T: Transport> Wallet<T> {
         step: Step,
     ) -> Result<Error, Error> {
         let gone = if problem.code == Code::Spent {
-            self.spent_inputs(url, id).await
+            self.spent_inputs(url, id).await.spent
         } else {
             Vec::new()
         };
+        self.given_up(url, id, problem, step, &gone)
+    }
+
+    /// [`Self::refused`], the notes its hub shows spent being `gone`.
+    fn given_up(
+        &self,
+        url: &str,
+        id: &ProposalId,
+        problem: Problem,
+        step: Step,
+        gone: &[[u8; 33]],
+    ) -> Result<Error, Error> {
         let reason = problem.to_string();
-        if self.give_up(step, id, &reason, &gone)? {
+        if self.give_up(step, id, &reason, gone)? {
             return Ok(Error::Refused {
                 hub: url.to_owned(),
                 problem,
@@ -1665,21 +1741,21 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
-    /// The inputs of payment `id` its hub proves spent: none if it cannot
-    /// tell.
-    async fn spent_inputs(&self, url: &str, id: &ProposalId) -> Vec<[u8; 33]> {
+    /// What its hub proves of the inputs of payment `id`: nothing if it
+    /// cannot tell.
+    async fn spent_inputs(&self, url: &str, id: &ProposalId) -> inquiry::Shown {
         let inputs = self.store.read(|c| {
             let mut stmt = c.prepare("SELECT y FROM notes WHERE spent_by = ?1")?;
             let rows = stmt.query_map([id.as_bytes()], |r| r.get(0))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         });
         match inputs {
-            Ok(inputs) => self.shown(url, &inputs).await.map(|shown| shown.spent),
+            Ok(inputs) => self.shown(url, &inputs).await,
             Err(e) => Err(e),
         }
         .unwrap_or_else(|e| {
             tracing::warn!(%url, error = %e, "cannot tell which notes are spent");
-            Vec::new()
+            inquiry::Shown::default()
         })
     }
 

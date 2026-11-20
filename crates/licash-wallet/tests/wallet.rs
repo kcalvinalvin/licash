@@ -1616,3 +1616,72 @@ fn its_futures_run_on_any_runtime_thread() {
     send(wallet.unlink());
     send(wallet.check());
 }
+
+/// A hub that says an input of a signed send is spent, and proves no
+/// spend of it, has her give nothing up: it holds her signature and may
+/// release the send whenever it likes, so her notes stay with the send,
+/// which finishes once its hub releases it.
+#[tokio::test]
+async fn a_signed_send_refused_as_spent_without_proof_stays_pending() {
+    let net = network();
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
+    net.fail(RELEASE, Fault::Refused(Code::Spent));
+    let Err(Error::Pending { id, reason }) = alice.send(HUB, &bob.address(), 10).await else {
+        panic!("not pending");
+    };
+    assert!(reason.contains("Spent"), "{reason}");
+    assert_eq!(alice.sends().unwrap()[0].state, State::Signed);
+    assert_eq!(available(&alice), (0, 64));
+    let resumed = alice.resume().await.unwrap();
+    assert_eq!(resumed.paid[0].id, id);
+    assert_eq!(bob.receive(&resumed.paid[0].payment).unwrap().amount, 10);
+    assert_eq!(available(&alice), (52, 0));
+}
+
+/// A hub that released a signed send, its answer lost, and refuses it as
+/// spent from then on shows the release it made: the send finishes with
+/// the unlock shown, its change kept, and nothing is given up.
+#[tokio::test]
+async fn a_signed_send_refused_as_spent_that_its_hub_shows_released_finishes() {
+    let net = network();
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
+    net.fail(RELEASE, Fault::Dropped);
+    let Err(Error::Pending { id, .. }) = alice.send(HUB, &bob.address(), 10).await else {
+        panic!("not pending");
+    };
+    net.fail(RELEASE, Fault::Refused(Code::Spent));
+    let resumed = alice.resume().await.unwrap();
+    assert_eq!(resumed.paid.len(), 1, "{resumed:?}");
+    assert_eq!(resumed.paid[0].id, id);
+    assert_eq!(bob.receive(&resumed.paid[0].payment).unwrap().amount, 10);
+    assert_eq!(alice.sends().unwrap()[0].state, State::Done);
+    assert_eq!(available(&alice), (52, 0));
+    assert!(same(&alice.payment(&id).unwrap(), &resumed.paid[0].payment));
+}
+
+/// A signed send whose hub forgot its offer, and refuses the offer made
+/// again, is given up as an unsigned one refused is: its notes are freed.
+#[tokio::test]
+async fn a_signed_send_whose_forgotten_offer_is_refused_again_is_given_up() {
+    let net = network();
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
+    net.fail(RELEASE, Fault::Lost);
+    let Err(Error::Pending { id, .. }) = alice.send(HUB, &bob.address(), 10).await else {
+        panic!("not pending");
+    };
+    assert_eq!(alice.sends().unwrap()[0].state, State::Signed);
+    net.fail(RELEASE, Fault::Refused(Code::UnknownOffer));
+    net.fail(OFFER, Fault::Refused(Code::Fee));
+    let resumed = alice.resume().await.unwrap();
+    assert_eq!((resumed.paid.len(), resumed.pending.len()), (0, 0));
+    assert_eq!(resumed.abandoned[0].0, id);
+    assert!(resumed.abandoned[0].1.contains("Fee"), "{resumed:?}");
+    assert!(matches!(
+        alice.sends().unwrap()[0].state,
+        State::Abandoned(_)
+    ));
+    assert_eq!(available(&alice), (64, 0));
+}

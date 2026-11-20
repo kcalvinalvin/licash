@@ -74,7 +74,9 @@ CREATE TABLE keysets (
 
 -- Payments made, each step recorded before the hub is asked for the next:
 -- the offer asked for, then the release once signed. A signed send is
--- given up only once its hub refused it as spent, which it never releases.
+-- given up only once its hub proves an input spent otherwise, or refuses
+-- again an offer it forgot: its release is kept with it, as its hub may
+-- have kept it too.
 -- renewal is 1 for a payment of the wallet's notes to itself renewing
 -- them, which Wallet::unlink finishes. A payment made under a key of its
 -- payer's, at most one each, is found again by it.

@@ -20,6 +20,7 @@ use licash::{
     inquiry,
     note::Keyset,
     recovery::{voids_note, Evidence},
+    spend::ProposalId,
 };
 use licash_api::{Evidenced, Inquire, Payment};
 use rusqlite::{params, OptionalExtension};
@@ -41,9 +42,9 @@ const HELD: &str = "SELECT r.url, n.y FROM notes n
 pub(crate) struct Shown {
     /// The notes its evidence proves spent, or claimed elsewhere.
     pub spent: Vec<[u8; 33]>,
-    /// The granted spends among that evidence, each of which may have paid
-    /// the wallet's change.
-    pub payments: Vec<Payment>,
+    /// The granted spends among that evidence, by id, each of which may
+    /// have paid the wallet's change.
+    pub payments: Vec<(ProposalId, Payment)>,
 }
 
 /// What [`Wallet::check`] found.
@@ -133,10 +134,10 @@ impl<T: Transport> Wallet<T> {
                     unlock: Some(unlock),
                 } = e
                 {
-                    if spends.insert(*signed.proposal().id().as_bytes()) {
-                        shown
-                            .payments
-                            .push(Payment::new(url, signed, notes, unlock));
+                    let id = signed.proposal().id();
+                    if spends.insert(*id.as_bytes()) {
+                        let payment = Payment::new(url, signed, notes, unlock);
+                        shown.payments.push((id, payment));
                     }
                 }
             }
@@ -192,7 +193,7 @@ impl<T: Transport> Wallet<T> {
                 let shown = self.shown(url, &ys).await?;
                 checked.dropped += self.drop_spent(url, &shown.spent)?;
                 ys = Vec::new();
-                for payment in &shown.payments {
+                for (_, payment) in &shown.payments {
                     let Ok(opened) = self.open_payment(payment) else {
                         continue;
                     };
