@@ -454,6 +454,8 @@ pub struct Keeper<T: Transport> {
     answered: HashMap<String, Instant>,
     /// The caps and durations each hub last said it offers.
     ranges: HashMap<String, licash_api::ContractRange>,
+    /// The chain's last estimate, for a round it gives none in.
+    last_rate: Option<FeeRate>,
 }
 
 impl<T: Transport + 'static> Keeper<T> {
@@ -479,6 +481,7 @@ impl<T: Transport + 'static> Keeper<T> {
             told_late: HashSet::new(),
             answered: HashMap::new(),
             ranges: HashMap::new(),
+            last_rate: None,
         }
     }
 
@@ -1022,16 +1025,26 @@ impl<T: Transport + 'static> Keeper<T> {
     }
 
     /// The chain's estimate of a rate confirming within 6 blocks, at least
-    /// the least relayed.
-    async fn rate(&self) -> FeeRate {
+    /// the least relayed: its last one if it gives none now.
+    async fn rate(&mut self) -> FeeRate {
         let estimate = self.chain.0.fee_rate(6).await.unwrap_or_else(|e| {
             tracing::warn!("no fee estimate: {e:#}");
             None
         });
-        estimate
-            .unwrap_or(FeeRate::BROADCAST_MIN)
-            .max(FeeRate::BROADCAST_MIN)
+        let rate = round_rate(estimate, self.last_rate);
+        self.last_rate = Some(rate);
+        rate
     }
+}
+
+/// The rate of a round the chain estimated at `estimate`, its last one
+/// `last`: a forced close's transactions wait on no estimate for the least
+/// rate relayed, which may confirm too late.
+fn round_rate(estimate: Option<FeeRate>, last: Option<FeeRate>) -> FeeRate {
+    estimate
+        .or(last)
+        .unwrap_or(FeeRate::BROADCAST_MIN)
+        .max(FeeRate::BROADCAST_MIN)
 }
 
 /// Tell the operator through `provider` of the `alerts` not in `told`,
@@ -1059,6 +1072,18 @@ mod tests {
     use super::*;
     use bitcoin::OutPoint;
     use licash_contracts::holder::Phase;
+
+    #[test]
+    fn a_round_without_an_estimate_pays_the_last_one() {
+        let rate = |sat| FeeRate::from_sat_per_vb(sat).unwrap();
+        assert_eq!(round_rate(Some(rate(20)), Some(rate(50))), rate(20));
+        assert_eq!(round_rate(None, Some(rate(50))), rate(50));
+        assert_eq!(round_rate(None, None), FeeRate::BROADCAST_MIN);
+        assert_eq!(
+            round_rate(Some(FeeRate::ZERO), None),
+            FeeRate::BROADCAST_MIN
+        );
+    }
 
     #[tokio::test]
     async fn a_keepers_thread_ending_in_a_panic_is_told() {
