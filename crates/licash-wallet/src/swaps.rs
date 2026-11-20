@@ -462,6 +462,16 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
+    /// Ask the hub at `url`, added, what it says of itself again, and keep
+    /// it. [`Wallet::swap_quote`] judges a lock by the height its hubs last
+    /// said they followed, which on quick blocks is soon far behind: a swap
+    /// that would go through is refused until they are asked again.
+    pub async fn refresh_hub(&self, url: &str) -> Result<(), Error> {
+        let url = hub_url(url)?;
+        self.hub(&url)?;
+        self.refresh(&url).await.map(|_| ())
+    }
+
     /// The swaps made, newest first.
     pub fn swaps(&self) -> Result<Vec<Swap>, Error> {
         self.store.read(|c| {

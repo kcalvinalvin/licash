@@ -957,6 +957,42 @@ fn a_swap_goes_through_a_provider_announced_one_used_before_first_then_the_cheap
 }
 
 #[test]
+fn a_provider_is_found_though_a_hub_was_last_asked_many_blocks_before() {
+    use licash_nostr::{wallet::swap_providers, Route};
+    use licash_wallet::SwapLimits;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (_relay, relay) = support::relay(&runtime);
+    let relays = vec![relay];
+    let a = Server::swapping_from(FEE, relays.clone());
+    let b = Server::with_relays(FEE, relays.clone());
+    let swaps = Swaps::start(&[&a, &b], 200);
+    announce_provider(&runtime, &relays, swaps.provider.nostr_secret().unwrap(), swaps.url());
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, at) = party(dir.path(), "alice", Some(&a));
+    ok(wallet(&alice, &["add-hub", &b.url()], None));
+    let funds = serde_json::to_string(&a.pay(&address(&at), 100)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funds)));
+    // Both chains grow, as quick blocks do while a wallet is not looking,
+    // and the wallet asks B again, not A: A's last word is behind B's by
+    // more than a swap's room.
+    a.mine(20, None);
+    b.mine(20, None);
+    ok(wallet(&alice, &["add-hub", &b.url()], None));
+
+    let found = runtime.block_on(async {
+        let transport = licash_transport::Http::new(None).unwrap();
+        let wallet = licash_wallet::Wallet::open(&alice, transport).unwrap();
+        let pair = (a.url(), b.url());
+        let pair = (pair.0.as_str(), pair.1.as_str());
+        let found = swap_providers(&wallet, &relays, &Route::Direct, pair, 20, SwapLimits::usual(20));
+        found.await.unwrap()
+    });
+    // It asked A again, and so found the provider.
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].url, swaps.url());
+}
+
+#[test]
 fn a_payment_at_a_hub_holding_too_little_swaps_there_first_within_its_fees() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (_relay, relay) = support::relay(&runtime);

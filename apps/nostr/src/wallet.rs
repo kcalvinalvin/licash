@@ -911,8 +911,27 @@ pub async fn swap_providers_with<T: Transport>(
     );
     let ask = |url: String| async move { wallet.swap_quote(&url, from, to, amount, limits).await };
     let on = (relays, route, network);
-    let answering = announced.answering(on, &used, ask, |q: &SwapQuote| q.info.nostr.as_deref());
-    let answering = answering.await?;
+    let mut answering = announced
+        .answering(on, &used, ask, |q: &SwapQuote| q.info.nostr.as_deref())
+        .await?;
+    if answering.is_empty() {
+        // A quote judges a lock by the height its hubs last said they
+        // followed, behind by the time it is asked on quick blocks, and so
+        // refuses what would go through: asked again what they say now,
+        // once. A hub that does not answer keeps what it said.
+        let again = |hub: &str| {
+            let hub = hub.to_owned();
+            async move {
+                if let Err(e) = wallet.refresh_hub(&hub).await {
+                    tracing::debug!(%hub, "not asked again before a swap: {e}");
+                }
+            }
+        };
+        join(again(from), again(to)).await;
+        answering = announced
+            .answering(on, &used, ask, |q: &SwapQuote| q.info.nostr.as_deref())
+            .await?;
+    }
     let mut providers: Vec<(bool, SwapProvider)> = answering
         .into_iter()
         .map(|(service, url, quote)| {
