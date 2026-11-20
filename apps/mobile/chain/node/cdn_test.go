@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
 )
@@ -160,5 +161,42 @@ func TestSplitFilters(t *testing.T) {
 	}
 	if filters, err := splitFilters(nil, 0); err != nil || len(filters) != 0 {
 		t.Errorf("empty: %v %v", filters, err)
+	}
+}
+
+func TestAFileBeingFetchedHoldsUpOnlyThoseAskingForIt(t *testing.T) {
+	c := &cdn{
+		status:   cdnStatus{BestFilter: 100, PerFilterFile: 10},
+		read:     time.Now(),
+		log:      slog.New(slog.DiscardHandler),
+		done:     make(map[uint32]bool),
+		fetching: make(map[uint32]chan struct{}),
+	}
+	tip := func() (uint32, error) { return 100, nil }
+	first, per, fetched, wait := c.begin(5, tip)
+	if first != 0 || per != 10 || fetched == nil || wait != nil {
+		t.Fatalf("not fetched: %d %d %v %v", first, per, fetched, wait)
+	}
+	// Another file, meanwhile: fetched too, the lock not held.
+	if _, _, other, wait := c.begin(15, tip); other == nil || wait != nil {
+		t.Fatal("another file held up")
+	}
+	// The same file: waited for.
+	if _, _, again, wait := c.begin(3, tip); again != nil || wait != fetched {
+		t.Fatal("the file being fetched not waited for")
+	}
+	c.end(first, fetched)
+	select {
+	case <-fetched:
+	default:
+		t.Fatal("those waiting not let go")
+	}
+	// Done: neither fetched again nor waited for.
+	if _, _, again, wait := c.begin(3, tip); again != nil || wait != nil {
+		t.Fatal("fetched again")
+	}
+	// Past the filter headers held: not fetched.
+	if _, _, past, _ := c.begin(25, func() (uint32, error) { return 25, nil }); past != nil {
+		t.Fatal("fetched past the filter headers")
 	}
 }

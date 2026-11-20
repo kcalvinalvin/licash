@@ -55,17 +55,20 @@ type cdn struct {
 	read   time.Time
 	// The files of filters fetched, or that failed, by their first block.
 	done map[uint32]bool
+	// The files being fetched, closed once stored or failed.
+	fetching map[uint32]chan struct{}
 }
 
 // newCDN is the server at base, if it follows the chain of params, reached
 // through proxy if set.
 func newCDN(base string, params *chaincfg.Params, proxy *Proxy, log *slog.Logger) (*cdn, error) {
 	c := &cdn{
-		base:    strings.TrimRight(base, "/"),
-		genesis: params.GenesisHash.String(),
-		client:  httpClient(proxy, fileTimeout),
-		log:     log,
-		done:    make(map[uint32]bool),
+		base:     strings.TrimRight(base, "/"),
+		genesis:  params.GenesisHash.String(),
+		client:   httpClient(proxy, fileTimeout),
+		log:      log,
+		done:     make(map[uint32]bool),
+		fetching: make(map[uint32]chan struct{}),
 	}
 	if err := c.refresh(); err != nil {
 		return nil, err
@@ -109,17 +112,52 @@ func (c *cdn) refresh() error {
 // prefetch stores in cs the filters of the file holding the block at
 // height, checked, unless done already, sealed by the server yet, or past
 // the filter headers cs holds. Failures are logged: the peers serve then.
+// The file being fetched is waited for; the others are not: none is
+// fetched holding the lock.
 func (c *cdn) prefetch(cs *neutrino.ChainService, height uint32) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	per := c.status.PerFilterFile
-	first := height / per * per
-	last := first + per - 1
-	if uint64(first)+uint64(per)-1 > uint64(^uint32(0)) {
+	tip := func() (uint32, error) {
+		_, tip, err := cs.RegFilterHeaders.ChainTip()
+		return tip, err
+	}
+	first, per, fetched, wait := c.begin(height, tip)
+	if wait != nil {
+		<-wait
 		return
 	}
-	if c.done[first] {
+	if fetched == nil {
 		return
+	}
+	started := time.Now()
+	err := c.filters(cs, first, per)
+	c.end(first, fetched)
+	if err != nil {
+		c.log.Warn("block-dn filters, asking peers", "first", first, "err", err)
+		return
+	}
+	c.log.Debug("block-dn filters stored", "first", first, "count", per,
+		"took", time.Since(started))
+}
+
+// begin takes the file holding the block at height to fetch, as prefetch
+// does, tip the height of the filter headers held: its first block and
+// size, and a channel to close once done ([cdn.end]); or the channel of
+// the fetch of it under way, to wait for; or neither, nothing to fetch.
+func (c *cdn) begin(height uint32, tip func() (uint32, error)) (
+	first, per uint32, fetched, wait chan struct{},
+) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	per = c.status.PerFilterFile
+	first = height / per * per
+	last := first + per - 1
+	if uint64(first)+uint64(per)-1 > uint64(^uint32(0)) {
+		return first, per, nil, nil
+	}
+	if wait := c.fetching[first]; wait != nil {
+		return first, per, nil, wait
+	}
+	if c.done[first] {
+		return first, per, nil, nil
 	}
 	if last > c.status.BestFilter && time.Since(c.read) > statusEvery {
 		if err := c.refresh(); err != nil {
@@ -127,19 +165,24 @@ func (c *cdn) prefetch(cs *neutrino.ChainService, height uint32) {
 		}
 	}
 	if last > c.status.BestFilter {
-		return
+		return first, per, nil, nil
 	}
-	if _, tip, err := cs.RegFilterHeaders.ChainTip(); err != nil || tip < last {
-		return
+	if held, err := tip(); err != nil || held < last {
+		return first, per, nil, nil
 	}
 	c.done[first] = true
-	started := time.Now()
-	if err := c.filters(cs, first, per); err != nil {
-		c.log.Warn("block-dn filters, asking peers", "first", first, "err", err)
-		return
-	}
-	c.log.Debug("block-dn filters stored", "first", first, "count", per,
-		"took", time.Since(started))
+	fetched = make(chan struct{})
+	c.fetching[first] = fetched
+	return first, per, fetched, nil
+}
+
+// end marks the fetch of the file from block first, begun with fetched,
+// over: those waiting for it go on.
+func (c *cdn) end(first uint32, fetched chan struct{}) {
+	c.mu.Lock()
+	delete(c.fetching, first)
+	c.mu.Unlock()
+	close(fetched)
 }
 
 // filters fetches the file of count filters from block first, checks each
