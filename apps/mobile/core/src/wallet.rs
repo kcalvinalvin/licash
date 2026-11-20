@@ -72,6 +72,9 @@ pub struct Wallet {
     /// Held while opening contracts or carrying them on: one driver to
     /// each.
     contracting: Mutex<()>,
+    /// Held while moving notes between hubs: an attempt finds the swap it
+    /// recorded as the one new since it began, which another would spoil.
+    moving: Mutex<()>,
     /// The times the blocks of the coins found claim, by height, as the
     /// light client told them: learned on each scan, kept in memory only.
     times: Mutex<HashMap<u32, i64>>,
@@ -270,6 +273,7 @@ impl Wallet {
             planned: Mutex::new(None),
             tip: AtomicU32::new(0),
             contracting: Mutex::new(()),
+            moving: Mutex::new(()),
             times: Mutex::new(HashMap::new()),
             onions_asked: Mutex::new(None),
             announced: Announcements::default(),

@@ -2,6 +2,8 @@
 //! provider takes the wallet's lock at one hub and locks as much to it at
 //! the other, less its fee.
 
+use std::sync::PoisonError;
+
 use licash_nostr::wallet::{hub_relays, swap_providers_with, SwapProvider};
 use licash_transport::Http;
 use licash_wallet::{Swap, SwapLimits, SwapQuote, SwapState};
@@ -84,6 +86,7 @@ impl Wallet {
         let Some(chosen) = offers.first() else {
             return Err(LicashError::invalid("no move offer to take"));
         };
+        let _one_at_a_time = self.moving.lock().unwrap_or_else(PoisonError::into_inner);
         let most = chosen.fee;
         let mut last = None;
         for offer in offers.iter().filter(|o| o.fee <= most) {
