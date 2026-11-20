@@ -674,6 +674,60 @@ fn grants_left_unreleased_a_day_are_deleted_and_offered_again() {
     hub.release(&signed, &left.notes()).unwrap();
 }
 
+/// A payer knows the notes she paid, and may offer her payee's in spends
+/// of her own until the hub refuses them: an offer signed by each note's
+/// hold key, which only its owner has, counts apart, so the owner still
+/// offers hers. Those are as bounded, and a signature not her note's is
+/// refused.
+#[test]
+fn a_note_offered_to_the_most_by_its_payer_is_still_offered_by_its_owner() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let pay = Spend::new(&keyset, &[mint(&files, &alice, 8)], &[(bob.address(), 8)]);
+    let issued = pay.complete(&hub, &keyset);
+    // Opened from Alice's derivation and the hub's unlock: no key of Bob's.
+    let seen = Coin {
+        note: issued[0].clone(),
+        derivation: pay.outputs[0].clone(),
+        owner: alice.clone(),
+    };
+    let his = pay.coin(&issued, 0, &bob);
+    let to = |k: u8, coin: &Coin| {
+        Spend::new(
+            &keyset,
+            std::slice::from_ref(coin),
+            &[(owner(10 + k).address(), 8)],
+        )
+    };
+    let holds = |spend: &Spend, coin: &Coin| {
+        let key = coin.derivation.hold_key(coin.owner.hold_root()).unwrap();
+        let note = coin.note.message();
+        vec![licash::offer::sign(&spend.proposal.id(), note, &key).unwrap()]
+    };
+    for k in 1..=MAX_OFFERS {
+        to(k, &seen).offer(&hub).unwrap();
+    }
+    assert_eq!(refused(to(100, &his).offer(&hub)), Refusal::Offered);
+    // Signed for another spend: refused.
+    let forged = to(101, &his);
+    let wrong = holds(&to(102, &his), &his);
+    let result = hub.offer_held(&forged.proposal, &forged.notes(), Some(&wrong));
+    assert!(result.is_err());
+    // Bob's, signed: granted, up to the most.
+    for k in 101..101 + MAX_OFFERS {
+        let spend = to(k, &his);
+        let signed = holds(&spend, &his);
+        hub.offer_held(&spend.proposal, &spend.notes(), Some(&signed))
+            .unwrap();
+    }
+    let spend = to(200, &his);
+    let signed = holds(&spend, &his);
+    let result = hub.offer_held(&spend.proposal, &spend.notes(), Some(&signed));
+    assert_eq!(refused(result), Refusal::Offered);
+}
+
 /// One note is offered in so many spends not released at most by a hub
 /// process: each input of a spend counts, the same spend offered again
 /// does not, nor a spend refused, and a restart forgets.

@@ -1319,7 +1319,8 @@ impl<T: Transport> Wallet<T> {
         let outputs = denominated_outputs(&ephemeral, Branch::Pay, &parts)?;
         let proposal = Proposal::new(&keyset, &inputs, ephemeral.public(), outputs, None)?;
         let id = proposal.id();
-        let offer = serde_json::to_string(&Offer::new(&proposal, &inputs)).map_err(invalid)?;
+        let offer = self.offer_of(&keyset, &proposal, &inputs)?;
+        let offer = serde_json::to_string(&offer).map_err(invalid)?;
         let shared = match delivered {
             Some(_) => Some(ephemeral.shared(payee)?),
             None => None,
@@ -2453,6 +2454,29 @@ impl<T: Transport> Wallet<T> {
             )?;
             Ok(())
         })
+    }
+
+    /// The offer of `proposal`, spending the wallet's `notes`, signed by
+    /// each note's hold key: its owner's, which no one else knowing the
+    /// notes, their payer say, can have its hub refuse ([`licash::offer`]).
+    fn offer_of(
+        &self,
+        keyset: &Keyset,
+        proposal: &Proposal,
+        notes: &[Note],
+    ) -> Result<Offer, Error> {
+        let id = proposal.id();
+        let holds = self.store.read(|c| {
+            notes
+                .iter()
+                .map(|note| {
+                    let held = held(c, keyset, &note.message().identifier()?.0)?;
+                    let key = self.derivation(&held)?.hold_key(self.owner.hold_root())?;
+                    Ok(licash::offer::sign(&id, note.message(), &key)?)
+                })
+                .collect::<Result<Vec<_>, Error>>()
+        })?;
+        Ok(Offer::held(proposal, notes, &holds))
     }
 
     /// `proposal`, spending the wallet's `notes`, signed by their owner.

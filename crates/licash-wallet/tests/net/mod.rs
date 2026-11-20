@@ -337,7 +337,8 @@ fn post(hub: &Hub, path: &str, body: &[u8]) -> Result<Vec<u8>, Problem> {
         licash_api::OFFER => {
             let offer: Offer = serde_json::from_slice(body).map_err(json)?;
             let (proposal, notes) = offer.decode(lookup)?;
-            let grant = hub.offer(&proposal, &notes).map_err(problem)?;
+            let holds = offer.holds()?;
+            let grant = (hub.offer_held(&proposal, &notes, holds.as_deref())).map_err(problem)?;
             serde_json::to_vec(&Offered::new(&grant)?)
         }
         licash_api::UNLINK => {

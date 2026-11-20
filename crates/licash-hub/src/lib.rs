@@ -66,7 +66,9 @@ pub const MAX_POW: u32 = 62;
 
 /// The most grants a hub process makes for one note not spent: a payer
 /// abandoning a spend and trying again needs a few; anyone holding a note
-/// could otherwise have it offered endlessly, each grant a row kept.
+/// could otherwise have it offered endlessly, each grant a row kept. As
+/// many again of offers its owner signed ([`Hub::offer_held`]), which no
+/// one else knowing the note, its payer say, can use up.
 pub const MAX_OFFERS: u8 = 8;
 
 /// How long, in seconds, a grant left unreleased is kept: a day. Then it
@@ -437,6 +439,8 @@ pub struct Hub {
     /// identifier's bytes: [`MAX_OFFERS`] at most. Never stored, so
     /// nothing old is refused, and a restart forgets.
     offers: Mutex<HashMap<[u8; 33], u8>>,
+    /// [`Hub::offers`] of the offers their notes' owners signed.
+    held_offers: Mutex<HashMap<[u8; 33], u8>>,
     /// When this process last deleted the grants left unreleased too long.
     forgotten_at: Mutex<Option<Instant>>,
     policy: Policy,
@@ -522,6 +526,7 @@ impl Hub {
             boot_key: tagged_hash("licash-hub/boot", &[&secret, &drawn]),
             answered: Mutex::default(),
             offers: Mutex::default(),
+            held_offers: Mutex::default(),
             forgotten_at: Mutex::default(),
             policy,
             newest: Mutex::new(newest),
@@ -719,6 +724,19 @@ impl Hub {
     /// its outputs once their owners authorize it ([`Hub::release`]). The
     /// same proposal gets the same offer.
     pub fn offer(&self, proposal: &Proposal, notes: &[Note]) -> Result<Grant, Error> {
+        self.offer_held(proposal, notes, None)
+    }
+
+    /// [`Hub::offer`], signed by each of `notes`' hold key if `holds`, one
+    /// for each in their order ([`licash::offer`]): its owner's offer,
+    /// counted apart from those of anyone else knowing the notes. Refused
+    /// if one is not its note's.
+    pub fn offer_held(
+        &self,
+        proposal: &Proposal,
+        notes: &[Note],
+        holds: Option<&[Signature]>,
+    ) -> Result<Grant, Error> {
         let (keys, keyset) = self.keys(proposal.keyset_id())?;
         if proposal.lock().is_some() {
             return Err(Refusal::Timed.into());
@@ -735,6 +753,19 @@ impl Hub {
             return Err(Refusal::Spent.into());
         }
         let ys = proposal.verify(keyset, notes)?;
+        if let Some(holds) = holds {
+            if holds.len() != notes.len() {
+                let why = "an offer's holds are not one for each note";
+                return Err(licash::Error::Protocol(why.into()).into());
+            }
+            for (note, sig) in notes.iter().zip(holds) {
+                licash::offer::verify(&id, note.message(), sig)?;
+            }
+        }
+        let counted = match holds {
+            Some(_) => &self.held_offers,
+            None => &self.offers,
+        };
         let (amount, fee, made) = self.charge(proposal)?;
         let due = self.policy.fees().spending().due(amount, made);
         if fee < due {
@@ -747,9 +778,7 @@ impl Hub {
         self.forget_unreleased()?;
         // Refused before its grant is made, unless offered before: its
         // grant then, as kept.
-        if full(&self.offers.lock().unwrap_or_else(PoisonError::into_inner))
-            && !self.offered(&id)?
-        {
+        if full(&counted.lock().unwrap_or_else(PoisonError::into_inner)) && !self.offered(&id)? {
             return Err(Refusal::Offered.into());
         }
         let mut salt = [0; 32];
@@ -760,7 +789,7 @@ impl Hub {
                 .offer();
         let offer = grant.to_bytes()?;
         // Held over the write: racing offers of a note count to the most.
-        let mut offers = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut offers = counted.lock().unwrap_or_else(PoisonError::into_inner);
         let (grant, new) = self.store.write(|tx| {
             if claims::claimed(tx, &ys)? {
                 return Err(Refusal::Spent.into());
@@ -964,9 +993,11 @@ impl Hub {
         if released? {
             tracing::info!(proposal = %hex::encode(id.as_bytes()), amount, fee, "released");
             // Its notes spent: offered no more, not counted.
-            let mut offers = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-            for y in &ys {
-                offers.remove(&y.0);
+            for counted in [&self.offers, &self.held_offers] {
+                let mut offers = counted.lock().unwrap_or_else(PoisonError::into_inner);
+                for y in &ys {
+                    offers.remove(&y.0);
+                }
             }
         }
         Ok(unlock)

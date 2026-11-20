@@ -438,11 +438,16 @@ pub struct BlockTweaks {
     pub tweaks: Vec<Hex>,
 }
 
-/// Ask for a grant on `proposal`, spending `notes`.
+/// Ask for a grant on `proposal`, spending `notes`: signed by each note's
+/// hold key, in their order, if `holds`, the owner's offer, which a hub
+/// counts apart from those of anyone else knowing the notes
+/// ([`licash::offer`]).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Offer {
     pub proposal: Hex,
     pub notes: Vec<Hex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holds: Option<Vec<Hex>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1177,7 +1182,35 @@ impl Offer {
         Self {
             proposal: Hex(proposal.commitment_bytes()),
             notes: hexes(notes),
+            holds: None,
         }
+    }
+
+    /// [`Offer::new`], signed by each of `notes`' hold key: `holds`, in
+    /// their order ([`licash::offer::sign`]).
+    pub fn held(proposal: &Proposal, notes: &[Note], holds: &[Signature]) -> Self {
+        Self {
+            holds: Some(holds.iter().map(|s| Hex(s.0.to_vec())).collect()),
+            ..Self::new(proposal, notes)
+        }
+    }
+
+    /// Its notes' hold keys' signatures, if signed: not verified.
+    pub fn holds(&self) -> Result<Option<Vec<Signature>>, Problem> {
+        let Some(holds) = &self.holds else {
+            return Ok(None);
+        };
+        if holds.len() != self.notes.len() {
+            return Err(Problem::invalid(
+                "an offer's holds are not one for each note",
+            ));
+        }
+        let holds = holds.iter().map(|h| {
+            let bytes = <[u8; 64]>::try_from(h.0.as_slice())
+                .map_err(|_| Problem::invalid("an offer's hold is not a signature"))?;
+            Ok(Signature(bytes))
+        });
+        Ok(Some(holds.collect::<Result<_, Problem>>()?))
     }
 
     /// The proposal and its notes, under the keyset the proposal names

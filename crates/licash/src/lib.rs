@@ -21,6 +21,7 @@ pub mod ec;
 pub mod hold;
 pub mod inquiry;
 pub mod note;
+pub mod offer;
 pub mod recovery;
 pub mod request;
 pub mod route;

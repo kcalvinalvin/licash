@@ -113,7 +113,10 @@ replaced, and a hub is made anew.
 A spend's offer (its grant) its payer never released within a day is
 deleted, so that offers never made into spends cost no row for good; a
 wallet releasing it later offers the spend again. One note is offered in at
-most 8 spends not released per run of the hub.
+most 8 spends not released per run of the hub, and in as many again whose
+offer each note's hold key signed (`holds` in `POST /v1/offer`): its
+owner's, which a payer who knows the note, having made it, can't sign, so
+can't use up.
 
 Notes the hub locks for a deposit, a Lightning receipt or a swap into it
 are backed by that payment, recorded in `hub.sqlite` (the deposits and

@@ -389,7 +389,8 @@ async fn offer(
     let Json(body) = body?;
     blocking(hub, move |hub| {
         let (proposal, notes) = body.decode(|id| hub.keyset(id))?;
-        let grant = hub.offer(&proposal, &notes)?;
+        let holds = body.holds()?;
+        let grant = hub.offer_held(&proposal, &notes, holds.as_deref())?;
         Ok(Offered::new(&grant)?)
     })
     .await

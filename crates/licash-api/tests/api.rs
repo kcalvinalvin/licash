@@ -104,6 +104,18 @@ fn bodies_carry_the_canonical_bytes_through_json() {
     let (proposal, decoded) = offer.decode(lookup).unwrap();
     assert_eq!(proposal.id(), f.proposal.id());
     assert_eq!(decoded, notes);
+    assert_eq!(offer.holds().unwrap(), None);
+    assert!(!serde_json::to_string(&offer).unwrap().contains("holds"));
+    // Signed by its notes' owner: one signature each, kept as made.
+    let holds = vec![licash::crypto::Signature([5; 64])];
+    let held = json(&Offer::held(&f.proposal, &notes, &holds));
+    assert_eq!(held.holds().unwrap(), Some(holds));
+    let mut short = held.clone();
+    short.holds.as_mut().unwrap()[0].0.pop();
+    assert_eq!(short.holds().unwrap_err().code, Code::Invalid);
+    let mut more = held.clone();
+    more.holds.as_mut().unwrap().push(Hex(vec![0; 64]));
+    assert_eq!(more.holds().unwrap_err().code, Code::Invalid);
 
     let prepared = PreparedGrant::new(&f.keys, &f.proposal).unwrap();
     let grant = prepared.offer();
