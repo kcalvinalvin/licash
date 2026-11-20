@@ -1,6 +1,6 @@
 [package]
 name = "licash"
-description = "Owner-bound ecash with local Bitcoin recovery"
+description = "Ecash with a unilateral exit to Bitcoin"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

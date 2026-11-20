@@ -1,4 +1,4 @@
-//! licash: owner-bound ecash with local Bitcoin recovery.
+//! licash: ecash with a unilateral exit to Bitcoin.
 //!
 //! The protocol is specified in the paper (`paper/licash.pdf`). Modules by
 //! section: the model's notes, owner keys, unlinking and contracts (`note`,

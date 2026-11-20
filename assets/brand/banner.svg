@@ -6,6 +6,6 @@
   </g>
   <g font-family="Inter, 'Noto Sans', 'Helvetica Neue', Arial, sans-serif">
     <text x="400" y="360" font-size="150" font-weight="700" fill="#E8ECEF" letter-spacing="-4">Licash</text>
-    <text x="406" y="425" font-size="34" fill="#8A949B">Owner-bound ecash with local Bitcoin recovery</text>
+    <text x="406" y="425" font-size="34" fill="#8A949B">Ecash with a unilateral exit to Bitcoin</text>
   </g>
 </svg>
