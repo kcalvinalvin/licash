@@ -225,9 +225,18 @@ pub fn windows(g: &GraphTerms) -> Windows {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many statements [`build`] compiled on this thread, for tests of
+    /// what does not compile one.
+    pub(crate) static BUILDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// The graph of `base` with the holder's and the hub's keys and the kept
 /// instances' hashlocks, in the order of the instances kept.
 pub fn build(base: &Base, holder: &HolderPub, hub: &HubPub, hmsg: Vec<Hash>) -> Result<HubProves> {
+    #[cfg(test)]
+    BUILDS.with(|b| b.set(b.get() + 1));
     let p = base.parts();
     let g = &p.graph;
     let windows = windows(g);

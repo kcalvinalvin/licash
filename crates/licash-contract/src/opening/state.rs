@@ -8,7 +8,7 @@ use crate::wire::{Reader, Writer};
 use lichen_btc::bitcoin::hashes::sha256;
 
 const MAGIC: [u8; 4] = *b"LCOS";
-pub const FORMAT: u16 = 4;
+pub const FORMAT: u16 = 5;
 
 #[derive(Clone, Debug)]
 pub struct Peek {
@@ -245,6 +245,11 @@ impl Hub {
         put(&mut w, self.kept.as_ref(), |k| {
             wire::Choose { kept: k.clone() }.encode()
         });
+        put(&mut w, self.draft.as_ref(), |out| {
+            let mut w = Writer::default();
+            w.txout(out);
+            w.0
+        });
         put(&mut w, self.opened.as_ref(), wire::Opened::encode);
         w.count(self.received.len());
         for (i, hash) in &self.received {
@@ -279,6 +284,12 @@ impl Hub {
         h.base = get(&mut r, |b| Ok(Base::from_bytes(b)?))?;
         h.commit = get(&mut r, wire::Commit::decode)?;
         h.kept = get(&mut r, |b| Ok(wire::Choose::decode(b)?.kept))?;
+        h.draft = get(&mut r, |b| {
+            let mut r = Reader(b);
+            let out = r.txout()?;
+            r.end()?;
+            Ok(out)
+        })?;
         h.opened = get(&mut r, wire::Opened::decode)?;
         let n = r.count(36)?;
         for _ in 0..n {
@@ -310,6 +321,7 @@ impl Hub {
         ensure!(
             h.commit.is_some() == (phase >= HubPhase::Chosen)
                 && h.kept.is_some() == (phase >= HubPhase::Chosen)
+                && h.draft.is_some() == (phase >= HubPhase::Chosen)
                 && h.offer.is_some() == (phase >= HubPhase::Offered)
                 && h.consent.is_some() == (phase >= HubPhase::Consented)
                 && h.signed.is_some() == (phase >= HubPhase::Signed)
@@ -460,6 +472,7 @@ impl Hub {
         let base = get(&mut r, |b| Ok(Base::from_bytes(b)?))?.context("no Base")?;
         get(&mut r, wire::Commit::decode)?;
         get(&mut r, wire::Choose::decode)?;
+        get(&mut r, |b| Ok(b.to_vec()))?;
         get(&mut r, wire::Opened::decode)?;
         let n = r.count(36)?;
         r.take(n * 36)?;

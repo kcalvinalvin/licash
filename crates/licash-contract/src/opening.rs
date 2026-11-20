@@ -1016,6 +1016,10 @@ pub struct Hub {
     base: Option<Base>,
     commit: Option<wire::Commit>,
     kept: Option<Vec<u32>>,
+    /// The contract's output, of the draft built once on her commitment:
+    /// building it again on every step, or load, would cost the hub a
+    /// statement's compilation each time.
+    draft: Option<TxOut>,
     opened: Option<wire::Opened>,
     received: BTreeMap<u32, Hash>,
     funds: Option<(Transaction, Vec<TxOut>)>,
@@ -1063,6 +1067,7 @@ impl Hub {
             base: None,
             commit: None,
             kept: None,
+            draft: None,
             opened: None,
             received: BTreeMap::new(),
             funds: None,
@@ -1130,14 +1135,7 @@ impl Hub {
         compile(base, &commit.holder, &self.keys.public(), hmsg, funding)
     }
     fn draft_output(&self) -> Result<TxOut> {
-        let b = self.base.as_ref().context("no terms")?;
-        let c = self.commit.as_ref().context("no commitments")?;
-        contract_output(&graph::build(
-            b,
-            &c.holder,
-            &self.keys.public(),
-            graph::draft_hmsg(b.parts().recipe.kept),
-        )?)
+        self.draft.clone().context("no commitments")
     }
     fn fund_out(&self) -> Result<Out> {
         let open = self.open.as_ref().context("no Open")?;
@@ -1284,14 +1282,15 @@ impl Hub {
                                 .all(|v| v.len() == (r.instances - r.kept) as usize + 1),
                             "wrong dealing degree"
                         );
-                        graph::build(
+                        let draft = graph::build(
                             self.base.as_ref().unwrap(),
                             &c.holder,
                             &self.keys.public(),
                             graph::draft_hmsg(r.kept),
-                        )?
-                        .presign(OutPoint::null())?;
+                        )?;
+                        draft.presign(OutPoint::null())?;
                         let kept = cut::choose(r.instances as u32, r.kept as u32, &mut OsRng);
+                        self.draft = Some(contract_output(&draft)?);
                         self.commit = Some(c);
                         self.kept = Some(kept);
                         announce_choice = true;
@@ -2083,10 +2082,15 @@ mod tests {
         let chosen = h
             .step(Input::Message(sent(&commit, Kind::Commit)), &ctx)
             .unwrap();
+        // Replayed, or the hub loaded again, it compiles no statement: the
+        // draft is kept.
+        let builds = graph::BUILDS.with(std::cell::Cell::get);
         let replay = h
             .step(Input::Message(sent(&commit, Kind::Commit)), &ctx)
             .unwrap();
         assert_eq!(replay, chosen);
+        h = Hub::load(&h.to_bytes(), &ctx).unwrap();
+        assert_eq!(graph::BUILDS.with(std::cell::Cell::get), builds);
         reload(&mut a, &mut h, &ctx);
         let opened = a
             .step(Input::Message(sent(&chosen, Kind::Choose)), &ctx)
