@@ -183,7 +183,7 @@ pub fn unblind(
 
 /// A proof that `C_ = k B_` for the `k` behind the issuer's public key `K = k G`.
 /// Chaum-Pedersen as in Cashu NUT-12, but with the base in the challenge:
-/// `e = H(R1 || R2 || K || B_ || C_)`, `s = r + e k` ([`dleq_challenge`]).
+/// `e = H(R1 || R2 || K || B_ || C_)`, `s = r + e k` (`dleq_challenge`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dleq {
     pub e: ScalarBytes,
