@@ -240,6 +240,16 @@ pub enum Skipped {
 }
 
 impl Skipped {
+    /// Why, in a line.
+    pub fn said(&self) -> String {
+        match self {
+            Self::NoRoute(why) => format!("No route: {why}"),
+            Self::Unaffordable(cost) => {
+                format!("A move quoted at {cost} sat would pass its share of the budget")
+            }
+        }
+    }
+
     /// How long before a move of the kind is tried again.
     pub fn retry(&self) -> Duration {
         match self {
@@ -257,6 +267,8 @@ pub struct Mover<T: Transport> {
     /// Hubs the wallet could not add, by id, and why.
     refused: HashMap<String, String>,
     next: HashMap<Kind, i64>,
+    /// Why the last try of each kind made no move, until one is made.
+    waiting: HashMap<Kind, String>,
     last_resume: i64,
     /// What the operator should know, said on the page.
     notes: Vec<String>,
@@ -283,6 +295,7 @@ impl<T: Transport + 'static> Mover<T> {
             added: HashMap::new(),
             refused: HashMap::new(),
             next,
+            waiting: HashMap::new(),
             last_resume: 0,
             notes: Vec::new(),
         })
@@ -327,9 +340,13 @@ impl<T: Transport + 'static> Mover<T> {
             .min_by_key(|k| self.next[k]);
         if let Some(kind) = due {
             let wait = match self.attempt(kind, &network).await {
-                Ok(cost) => self.mean(kind, cost)?,
+                Ok(cost) => {
+                    self.waiting.remove(&kind);
+                    self.mean(kind, cost)?
+                }
                 Err(skipped) => {
                     tracing::info!(kind = kind.key(), "no move: {skipped:?}");
+                    self.waiting.insert(kind, skipped.said());
                     skipped.retry()
                 }
             };
@@ -351,6 +368,10 @@ impl<T: Transport + 'static> Mover<T> {
             .map_err(|e| Skipped::NoRoute(format!("{e:#}")))?;
         self.add_hubs(&network).await;
         let made = self.attempt(kind, &network).await;
+        match &made {
+            Ok(_) => self.waiting.remove(&kind),
+            Err(skipped) => self.waiting.insert(kind, skipped.said()),
+        };
         let _ = self.show(&network);
         made
     }
@@ -976,6 +997,9 @@ impl<T: Transport + 'static> Mover<T> {
             .collect();
         let balance = self.total();
         let mut budget = Budget::new(self.moving.monthly, &month, balance, &plans);
+        for kind in &mut budget.kinds {
+            kind.waiting = self.waiting.get(&kind.kind).cloned();
+        }
         self.notes.clear();
         if balance.unwrap_or(0) < self.moving.amount {
             self.notes.push(format!(

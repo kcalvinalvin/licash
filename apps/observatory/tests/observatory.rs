@@ -407,6 +407,12 @@ async fn an_unfunded_mover_moves_nothing_and_says_so() {
         "{:?}",
         budget.notes
     );
+    let hub = budget.kinds.iter().find(|k| k.kind == Kind::Hub).unwrap();
+    let why = hub.waiting.as_deref().unwrap();
+    assert!(
+        why.starts_with("No route:"),
+        "a kind waiting says why: {why}"
+    );
     let chain = budget.kinds.iter().find(|k| k.kind == Kind::Chain).unwrap();
     assert!(!chain.enabled);
 }

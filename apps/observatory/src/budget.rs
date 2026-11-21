@@ -158,6 +158,9 @@ pub struct KindBudget {
     pub enabled: bool,
     /// When it comes next, if planned.
     pub next: Option<i64>,
+    /// Why the last try made no move, if it made none: no route, or no
+    /// budget for it. Cleared by a move made.
+    pub waiting: Option<String>,
 }
 
 impl Budget {
@@ -175,6 +178,7 @@ impl Budget {
                 spent: spent(last_month, Some(kind)),
                 enabled,
                 next,
+                waiting: None,
             })
             .collect();
         Self {

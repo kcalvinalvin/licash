@@ -112,6 +112,12 @@ and a half times that mean, so no service can tell when the next comes.
 A move is made only if the 30 days before it, with its quote, stay within
 its share and the whole budget.
 
+A move over Lightning pays an invoice of one hub from another hub's gateway,
+or through a provider that pays over Lightning, so it needs two hubs with a
+gateway, or one and such a provider; with fewer, the page says "No route"
+beside it and the observatory tries again every few minutes, spending
+nothing. A kind that waits shows why on the Moves page.
+
 Moves are made one at a time, and each costs what the wallet holds less
 after it: fees, and anything lost. Only services that answered their last
 probe are used, a source hub only if it holds enough, and the rest at

@@ -1344,9 +1344,20 @@ fn moves_body(view: &View) -> String {
             for k in &budget.kinds {
                 let next = if !k.enabled {
                     "<span class=\"dim\">Off</span>".to_owned()
+                } else if let Some(why) = &k.waiting {
+                    format!(
+                        "<span class=\"dim\" title=\"{0}\">{1}</span>",
+                        esc(why),
+                        opt(k
+                            .next
+                            .map(|at| format!("tries again {}", format::until(at, view.at))))
+                    )
                 } else {
                     opt(k.next.map(|at| format::until(at, view.at)))
                 };
+                let why = k.waiting.as_deref().map_or_else(String::new, |why| {
+                    format!("<div class=\"why\">{}</div>", esc(why))
+                });
                 let used = if k.allowance > 0 {
                     k.spent as f64 / k.allowance as f64
                 } else {
@@ -1361,7 +1372,7 @@ fn moves_body(view: &View) -> String {
                 };
                 let _ = write!(
                     out,
-                    "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}{}</td>\
+                    "<tr><td>{}{why}</td><td class=\"num\">{}</td><td class=\"num\">{}{}</td>\
                      <td class=\"num\">{next}</td></tr>",
                     esc(k.kind.label()),
                     format::sat(k.allowance),
@@ -1451,6 +1462,7 @@ td:first-child{min-width:150px}
 @media (prefers-reduced-motion:no-preference){.banner.ok .pulse{animation:pulse 2.6s ease-out infinite}}
 @keyframes pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--accent) 45%,transparent)}70%,100%{box-shadow:0 0 0 9px transparent}}
 tbody tr:hover td{background:color-mix(in srgb,var(--tint) 55%,transparent)}
+.why{font-size:12px;color:var(--warn);max-width:46ch;white-space:normal}
 .card{transition:border-color .15s}.card:hover{border-color:var(--accent)}
 .tag{font-size:11px;color:var(--dim);border:1px solid var(--line);border-radius:6px;padding:0 5px}
 table{width:100%;border-collapse:separate;border-spacing:0;overflow:hidden}
