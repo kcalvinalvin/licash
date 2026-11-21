@@ -15,6 +15,13 @@ with a payment you signed, that you are owed less.
 It is not meant for your savings. Keep those in cold storage, and use Licash
 for day-to-day spending, as a checking account.
 
+|                                      | Lightning (own node) | Custodial ecash | Ark                     | Licash              |
+| ------------------------------------ | -------------------- | --------------- | ----------------------- | ------------------- |
+| Back on Bitcoin without the operator | Yes                  | No              | Yes, if renewed in time | Yes, up to your cap |
+| Channels or inbound liquidity        | Needed               | Not needed      | Not needed              | Not needed          |
+| Receive while offline                | No                   | Yes             | Yes                     | Yes, within a hub   |
+| The operator can link your payments  | Partly               | No              | Yes                     | No                  |
+
 ## Why
 
 - **No consolidation, no toxic change.** Each coin you receive is swapped in
@@ -31,6 +38,24 @@ for day-to-day spending, as a checking account.
 - **You keep custody, up to your limit.** Value within your contracts can
   always be recovered on Bitcoin. A stale backup is paid exactly what is
   still unspent, never punished.
+- **No shared hub needed.** Two people can pay each other from different
+  hubs: swap providers move the money between them, or over Lightning.
+
+### What protection costs
+
+A hub prices a contract by an opening fee and yearly interest on the part
+of the cover it locks up. At a hub asking 3,000 sat and 1% a year,
+protecting 131,071 sat for six months costs 3,000 + 655 = 3,655 sat. You
+also put in a reserve, say 20,000 sat: it is yours, pays the Bitcoin fees
+if you ever recover without the hub, and comes back otherwise.
+
+### Limits
+
+- Above your cap, your balance rests on the hub's word, as with any ecash.
+- A contract lasts a set time. Open the app now and then, and before it
+  ends, protect again or cash out.
+- Recovering without the hub takes days and pays Bitcoin fees.
+- No hub runs on Bitcoin yet, and the code has had no security review.
 
 The [paper](paper/licash.pdf) describes the protocol, its security and its
 privacy.
