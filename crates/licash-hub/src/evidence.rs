@@ -24,7 +24,23 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::{Error, Hub};
 
+/// What the ledger holds against a claim ([`Hub::found`]): its evidence, and
+/// why each record of it that the ledger could not read back was left out.
+/// One left out is evidence the hub had and cannot cite: her claim may then
+/// be paid in full for a note it retired, and the operator must be told.
+#[derive(Default)]
+pub struct Found {
+    pub evidence: Vec<Evidence>,
+    pub unread: Vec<String>,
+}
+
 impl Hub {
+    /// [`Hub::found`]'s evidence, the records left out told in warnings
+    /// only: for a holder's view and tests, not for a dispute.
+    pub fn evidence(&self, claim: &UnsignedClaim) -> Result<Vec<Evidence>, Error> {
+        Ok(self.found(claim)?.evidence)
+    }
+
     /// The evidence the ledger holds against `claim`: each owner-signed
     /// spend that retired one of its notes or one of its sources' inputs,
     /// a granted spend with its unlock (released, so its payee has it), and
@@ -34,12 +50,13 @@ impl Hub {
     /// the statement checks against the chain (a v3 contract's only: under
     /// v4 a Pay without an activation is owed nothing, and the statement
     /// refuses an expiry, so the dispute drops it). Ordered by proposal, then
-    /// source. A spend the ledger can no longer read back (its keyset gone)
-    /// is left out. After the spends, each lock another claim gave one of
-    /// its notes up by, never served ([`Hub::retire_claimed`]): an
+    /// source. A spend the ledger can no longer read back (its keyset gone,
+    /// its signed proposal not kept) is left out alone, and said in
+    /// [`Found::unread`]. After the spends, each lock another claim gave one
+    /// of its notes up by, never served ([`Hub::retire_claimed`]): an
     /// owner-signed spend as well. Then each other claim on Bitcoin of any
-    /// of its notes.
-    pub fn evidence(&self, claim: &UnsignedClaim) -> Result<Vec<Evidence>, Error> {
+    /// of its notes. Any of these not read back is left out alone and said.
+    pub fn found(&self, claim: &UnsignedClaim) -> Result<Found, Error> {
         let parts = claim.parts();
         let mut ys = Vec::new();
         for item in &parts.items {
@@ -50,18 +67,23 @@ impl Hub {
         }
         self.store.read(|c| {
             let mut evidence = Vec::new();
+            let mut unread = Vec::new();
             let served = spenders(c, &ys)?;
             for id in &served {
+                let proposal = hex::encode(id.as_bytes());
                 match self.spend(c, id) {
                     Ok(Some(spend)) => evidence.push(spend),
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!(
-                        proposal = %hex::encode(id.as_bytes()),
-                        "a retired spend not cited against a claim: {e}"
-                    ),
+                    Ok(None) => {
+                        tracing::warn!(%proposal, "a retired spend not kept, not cited against a claim");
+                        unread.push(format!("the spend {proposal} that retired a note is not kept"));
+                    }
+                    Err(e) => {
+                        tracing::warn!(%proposal, "a retired spend not cited against a claim: {e}");
+                        unread.push(format!("the spend {proposal} does not read back: {e}"));
+                    }
                 }
             }
-            evidence.extend(self.shown(c, &ys, &served)?);
+            evidence.extend(self.shown(c, &ys, &served, &mut unread)?);
             for source in &parts.sources {
                 let Some(terms) = source.terms() else {
                     continue;
@@ -78,8 +100,9 @@ impl Hub {
                 let seen = preimage(c, terms.hash())?;
                 evidence.extend(against_timed(id, settled.as_deref(), seen));
             }
-            evidence.extend(crate::claims::second_claims(c, &ys, &claim.hold_context())?);
-            Ok(evidence)
+            let context = claim.hold_context();
+            evidence.extend(crate::claims::second_claims(c, &ys, &context, &mut unread)?);
+            Ok(Found { evidence, unread })
         })
     }
 
@@ -125,7 +148,7 @@ impl Hub {
                             ),
                         }
                     }
-                    evidence.extend(self.shown(c, &[y], &served)?);
+                    evidence.extend(self.shown(c, &[y], &served, &mut Vec::new())?);
                     evidence.extend(crate::claims::claims_of(c, &y)?);
                     Ok(evidence)
                 })
@@ -136,16 +159,17 @@ impl Hub {
     /// The locks claims gave any of `ys` up by ([`Hub::retire_claimed`]),
     /// each the owner-signed spend its claim showed, but those `served`.
     /// One the ledger can no longer read back (its keyset gone, its bytes
-    /// not what it kept) is left out alone, as a spend is: the rest of the
-    /// evidence stands.
+    /// not what it kept) is left out alone, as a spend is, and said in
+    /// `unread`: the rest of the evidence stands.
     fn shown(
         &self,
         c: &Connection,
         ys: &[Point],
         served: &BTreeSet<ProposalId>,
+        unread: &mut Vec<String>,
     ) -> Result<Vec<Evidence>, Error> {
         let mut evidence = Vec::new();
-        for lock in crate::claims::shown(c, ys)? {
+        for lock in crate::claims::shown(c, ys, unread)? {
             if served.contains(&lock.id) {
                 continue;
             }
@@ -160,10 +184,13 @@ impl Hub {
             });
             match read {
                 Ok(spend) => evidence.push(spend),
-                Err(e) => tracing::warn!(
-                    proposal = %hex::encode(lock.id.as_bytes()),
-                    "a lock a claim showed not cited: {e}"
-                ),
+                Err(e) => {
+                    let proposal = hex::encode(lock.id.as_bytes());
+                    tracing::warn!(%proposal, "a lock a claim showed not cited: {e}");
+                    unread.push(format!(
+                        "the lock {proposal} a claim showed does not read back: {e}"
+                    ));
+                }
             }
         }
         Ok(evidence)

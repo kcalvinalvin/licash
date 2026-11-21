@@ -51,11 +51,21 @@ use crate::holder::node::Node;
 use crate::FoldOffer;
 
 /// What the hub's ledger holds against a claim published in the block at
-/// a height: candidates, of which the responder cites those the statement
-/// accepts. None known is no error: the claim is then owed what its notes
-/// are worth. An error if the ledger hasn't seen that block yet: an
-/// activation in it, or before, gives a preimage that voids her refund.
-pub type Evidencer = dyn Fn(&UnsignedClaim, u32) -> Result<Vec<Evidence>> + Send + Sync;
+/// a height ([`Found`]): candidates, of which the responder cites those the
+/// statement accepts. None known is no error: the claim is then owed what
+/// its notes are worth. An error if the ledger hasn't seen that block yet:
+/// an activation in it, or before, gives a preimage that voids her refund.
+pub type Evidencer = dyn Fn(&UnsignedClaim, u32) -> Result<Found> + Send + Sync;
+
+/// What the hub's ledger holds against a claim ([`Evidencer`]): its
+/// candidates, and why each record of it the ledger could not read back
+/// was left out. Each of those is evidence the hub had and cannot cite,
+/// which the operator is told of at once.
+#[derive(Default)]
+pub struct Found {
+    pub evidence: Vec<Evidence>,
+    pub unread: Vec<String>,
+}
 
 /// The hub ledger's lock checkpoints, as new contracts open on them
 /// ([`Openings::checkpoints_with`]).
@@ -757,10 +767,15 @@ impl Openings {
         if !pinned && self.pin_lost(id, "respond", spends, lone).await? {
             return Ok(Played::Idle);
         }
+        // What its ledger holds against her claim that the hub cannot cite.
+        let mut missed = Vec::new();
         let evidence = match pins.evidence(id)? {
             Some(pinned) => pinned_evidence(o, &pinned)?,
             None => match self.select(o, &filed, p_at, owed) {
-                Ok(evidence) => evidence,
+                Ok(selected) => {
+                    missed = selected.uncited;
+                    selected.kept
+                }
                 Err(e) => {
                     // Its ledger may yet answer: the hub waits for it while
                     // half the blocks to respond in are left. Then it
@@ -790,6 +805,9 @@ impl Openings {
             },
         };
         let mut decided = owed(&evidence)?;
+        if !missed.is_empty() {
+            self.uncited(id, &missed, b, decided.owed, respond_deadline(o, r_at), tip);
+        }
         if decided.owed >= b {
             self.note_once(
                 id,
@@ -887,25 +905,59 @@ impl Openings {
     /// owed nothing. Her filing is read as the statement reads it
     /// ([`recovery::named`]): one it decides on is one the hub finds its
     /// evidence against.
+    ///
+    /// With them, why each record of its ledger against her claim that the
+    /// hub cannot cite was left out: one it could not read back, or one its
+    /// statement could not ([`Cited::uncited`]).
     fn select(
         &self,
         o: &HubOpening,
         filed: &[u8],
         published_at: u32,
         owed: impl Fn(&[Evidence]) -> Result<recovery::Owed>,
-    ) -> Result<Vec<Evidence>> {
+    ) -> Result<Cited> {
         let Some(ledger) = self.evidencer.get() else {
-            return Ok(Vec::new());
+            return Ok(Cited::default());
         };
         let none = owed(&[])?;
         if none.ineligible.is_some() || none.owed == 0 {
-            return Ok(Vec::new());
+            return Ok(Cited::default());
         }
         let named = recovery::named(&o.base, filed).map_err(|e| anyhow!("{e}"))?;
-        let candidates = ledger(named.claim(), published_at)?;
-        Ok(cited(candidates, &none, owed, |evidence| {
+        let found = ledger(named.claim(), published_at)?;
+        let mut selected = cited(found.evidence, &none, owed, |evidence| {
             pinned_evidence(o, &recovery::evidence_to_bytes(evidence))
-        }))
+        });
+        selected.uncited.splice(0..0, found.unread);
+        Ok(selected)
+    }
+
+    /// The hub's ledger holds evidence against her claim of `b`, owed
+    /// `owed` on the rest, that it cannot cite, for each of `why`: the
+    /// operator is told at once, whatever is left of the blocks to respond
+    /// in to `deadline`, since nothing the hub does by itself will cite it.
+    /// Its notes were retired, and her claim may be paid for them.
+    fn uncited(&self, id: &[u8; 32], why: &[String], b: u32, owed: u32, deadline: u32, tip: u32) {
+        if !self.once(id, "uncited") {
+            return;
+        }
+        let shown = 3;
+        let mut reasons = why[..why.len().min(shown)].join("; ");
+        if why.len() > shown {
+            reasons.push_str(&format!("; and {} more", why.len() - shown));
+        }
+        let outcome = match owed >= b {
+            true => "Without it her claim is owed all she asks: unanswered, her timeout pays her \
+                     all she claims."
+                .to_owned(),
+            false => format!("It answers on the rest: {owed} of the {b} she claims."),
+        };
+        self.alert(&format!(
+            "contract {}: the hub's ledger holds evidence against her claim that it cannot \
+             cite ({reasons}), and {} blocks are left to respond in. {outcome}",
+            crate::hex_id(id),
+            deadline.saturating_sub(tip)
+        ));
     }
 
     /// The hub could not decide its answer to her request of `r_at`, for
@@ -2351,24 +2403,46 @@ fn child_fee(child: &Transaction, outputs: &[TxOut], coins: &[(OutPoint, TxOut)]
 /// stand. So is one that voids only items already invalid, worth nothing
 /// without it: the spend of a note she names and holds no key of is
 /// another's, and is not made public for her naming it.
+///
+/// Of these, one the statement refuses or that voids nothing new is the
+/// ledger's to offer and the statement's to decline. One its pins cannot
+/// carry is evidence the hub holds and cannot cite at all, as a spend of
+/// more than a statement reads: said in [`Cited::uncited`].
 fn cited(
     candidates: Vec<Evidence>,
     none: &recovery::Owed,
     owed: impl Fn(&[Evidence]) -> Result<recovery::Owed>,
     pinned: impl Fn(&[Evidence]) -> Result<Vec<Evidence>>,
-) -> Vec<Evidence> {
-    let mut kept = Vec::new();
+) -> Cited {
+    let mut selected = Cited::default();
+    let kept = &mut selected.kept;
     let mut voided = none.mask;
     for candidate in candidates {
         kept.push(candidate);
-        match pinned(&kept).and_then(|read| owed(&read)) {
+        let read = match pinned(kept) {
+            Ok(read) => read,
+            Err(e) => {
+                kept.pop();
+                selected.uncited.push(format!("{e:#}"));
+                continue;
+            }
+        };
+        match owed(&read) {
             Ok(with) if !idle(voided, &with) => voided = with.mask,
             _ => {
                 kept.pop();
             }
         }
     }
-    kept
+    selected
+}
+
+/// What [`cited`] cites, in order, and why each candidate it could not
+/// carry, whatever it would void, was left out.
+#[derive(Default)]
+struct Cited {
+    kept: Vec<Evidence>,
+    uncited: Vec<String>,
 }
 
 /// Whether the evidence `with` was decided on voids, beyond the items
@@ -2624,14 +2698,31 @@ mod tests {
         assert_eq!(none.owed, 30);
         let all = || (1..=6).map(candidate).collect::<Vec<_>>();
         let kept = cited(all(), &none, owed, pinned);
-        assert_eq!(names(&kept), [1, 5]);
-        assert_eq!(owed(&kept).unwrap().owed, 10);
+        assert_eq!(names(&kept.kept), [1, 5]);
+        assert_eq!(owed(&kept.kept).unwrap().owed, 10);
         // The one that fails first costs the hub none of the rest.
         let last_first = all().into_iter().rev().collect();
-        assert_eq!(names(&cited(last_first, &none, owed, pinned)), [6, 5]);
+        assert_eq!(names(&cited(last_first, &none, owed, pinned).kept), [6, 5]);
         // Nothing to cite is no error.
-        assert!(cited(Vec::new(), &none, owed, pinned).is_empty());
-        assert!(cited(vec![candidate(2)], &none, owed, pinned).is_empty());
+        assert!(cited(Vec::new(), &none, owed, pinned).kept.is_empty());
+        assert!(cited(vec![candidate(2)], &none, owed, pinned)
+            .kept
+            .is_empty());
+        // Of those left out, only the one its pins cannot carry is
+        // evidence the hub holds and cannot cite: the statement declining
+        // the others is no news.
+        assert_eq!(kept.uncited.len(), 1);
+        assert!(
+            kept.uncited[0].contains("not carried"),
+            "{:?}",
+            kept.uncited
+        );
+        assert!(cited(vec![candidate(2)], &none, owed, pinned)
+            .uncited
+            .is_empty());
+        let alone = cited(vec![candidate(4)], &none, owed, pinned);
+        assert!(alone.kept.is_empty());
+        assert_eq!(alone.uncited.len(), 1);
     }
 
     /// Evidence is idle that voids only items not valid: one that voids a

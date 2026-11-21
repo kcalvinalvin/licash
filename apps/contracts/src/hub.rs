@@ -32,7 +32,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-pub use dispute::{Claims, Evidencer, LockCheckpoints, Played};
+pub use dispute::{Claims, Evidencer, Found, LockCheckpoints, Played};
 pub use fold::FoldLedger;
 pub use funded::{FundedIssue, Issuer, FUNDED_DEPTH};
 /// How the hub tells its operator what needs them ([`Openings::alert_with`]).

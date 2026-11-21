@@ -81,7 +81,11 @@ pub fn answer_from(openings: &licash_contracts::hub::Openings, hub: Arc<Hub>) {
         let timed = claim.parts().sources.iter().any(|s| s.terms().is_some());
         let top = ledger.scanned()?.map(|(top, _)| top);
         scanned_for(timed, top, published_at)?;
-        Ok(ledger.evidence(claim)?)
+        let found = ledger.found(claim)?;
+        Ok(licash_contracts::hub::Found {
+            evidence: found.evidence,
+            unread: found.unread,
+        })
     }));
     let ledger = hub.clone();
     openings.claims_with(Arc::new(move |contract, named| {

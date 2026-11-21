@@ -58,6 +58,7 @@ use serde::{Deserialize, Serialize};
 use store::{now, setup_io, Store};
 
 pub use citable::{uncitable, Uncitable, MAX_EVIDENCE_BYTES};
+pub use evidence::Found;
 pub use forwards::{Forward, Forwarded, LOCAL};
 pub use locks::{Lock, Settled, Timing};
 pub use records::{Excess, ForwardRecord, LockRecord, Movement, Notes, Unlinks};

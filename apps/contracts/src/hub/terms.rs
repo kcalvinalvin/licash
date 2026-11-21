@@ -448,17 +448,24 @@ impl Timing {
                 work_depth: self.work_depth,
                 max_headers: blocks.saturating_add(HEADER_SLACK),
             },
-            limits: Limits {
-                max_transaction_bytes: 100_000,
-                max_publication_bytes: 64_000,
-                max_authorizations: 128,
-                max_source_inputs: 128,
-            },
+            limits: limits(),
             fees: Fees {
                 max_rate_sat_per_kvb: MAX_RATE_SAT_PER_KVB,
                 opening_fee_quote: self.fee(cap, blocks, funded),
             },
         }
+    }
+}
+
+/// The limits the hub quotes: its statement reads any spend a proposal may
+/// be ([`licash::base::MIN_AUTHORIZATIONS`]), so that whatever its ledger
+/// retired notes for, it can cite against a claim of one.
+fn limits() -> Limits {
+    Limits {
+        max_transaction_bytes: 100_000,
+        max_publication_bytes: 64_000,
+        max_authorizations: 128,
+        max_source_inputs: 128,
     }
 }
 
@@ -483,6 +490,13 @@ mod tests {
     use licash_contract::opening::Hub;
     use licash_contract::wire::Writer;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn the_quoted_limits_read_every_spend_the_hub_retires_notes_for() {
+        let quoted = limits();
+        assert!(quoted.max_authorizations >= licash::base::MIN_AUTHORIZATIONS);
+        assert!(quoted.max_authorizations as usize >= licash::spend::MAX_INPUTS);
+    }
 
     #[test]
     fn a_wallet_funds_the_widest_graph_it_holds_with_its_reserve_and_margin() {

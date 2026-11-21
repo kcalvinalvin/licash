@@ -3752,6 +3752,66 @@ async fn a_hub_whose_ledger_gives_no_evidence_alerts_and_pays_her_whole_claim() 
     Ok(())
 }
 
+/// A hub whose ledger retired her stale note by a spend it can no longer
+/// cite (its signed spend unreadable, as one of more than a statement
+/// reads would be) is told so at once, on the first round it decides, not
+/// half the blocks to respond in later: it answers nothing, and her
+/// timeout pays her all she claimed, the loss it was told of.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_holding_evidence_it_cannot_cite_alerts_at_once() -> Result<()> {
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let s = stale_claim([21; 32]).await?;
+    let told = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let alerts = told.clone();
+    s.openings.alert_with(Arc::new(move |message: &str| {
+        alerts.lock().unwrap().push(message.to_owned())
+    }));
+    let uncited = || {
+        let told = told.lock().unwrap();
+        told.iter().filter(|m| m.contains("cannot cite")).count()
+    };
+    // The spend of her stale note, kept as nothing it reads back.
+    let db = rusqlite::Connection::open(s._dir.path().join("hub").join("hub.sqlite"))?;
+    let broken = db.execute(
+        "UPDATE grants SET signed = x'00' WHERE released_at IS NOT NULL",
+        [],
+    )?;
+    ensure!(broken >= 1, "no released spend");
+    drop(db);
+
+    let (mut rounds, mut first, mut done) = (0, None, None);
+    for _ in 0..800 {
+        let round = s.openings.answer_requests().await?;
+        ensure!(round.answered == 0 && round.failed == 0, "{round:?}");
+        rounds += 1;
+        if first.is_none() && uncited() > 0 {
+            first = Some(rounds);
+        }
+        s.rt.mine(1)?;
+        let r = recovery::advance(&s.wallet, &s.chain, &s.mine.join("wallet.sqlite"), s.rate)
+            .await?[0]
+            .clone();
+        ensure!(r.stage != Stage::Lost, "{r:?}");
+        if r.stage == Stage::Done {
+            done = Some(r);
+            break;
+        }
+    }
+    let done = done.context("never paid")?;
+    // Once, and well before half the blocks to respond in were gone.
+    let first = first.context("never told")?;
+    ensure!(uncited() == 1, "{:?}", told.lock().unwrap());
+    ensure!(first * 4 < rounds, "told on round {first} of {rounds}");
+    ensure!(
+        done.response.is_none() && done.timeout.is_some(),
+        "{done:?}"
+    );
+    ensure!(done.claimed == 131_071, "{done:?}");
+    Ok(())
+}
+
 /// A hub that signed its response and lost its response pins signs no
 /// other, decided anew: its openings tell it began that answer, and where
 /// they tell nothing either, as of a database restored older, its response

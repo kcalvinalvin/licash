@@ -2024,6 +2024,48 @@ fn a_spend_too_large_to_cite_is_refused_and_retires_nothing() {
     assert!(evidence_from_bytes(&keyset, least, &evidence_to_bytes(&found)).is_ok());
 }
 
+/// What the ledger holds against a claim and cannot read back is told to
+/// the dispute ([`licash_hub::Found::unread`]), not only logged: evidence
+/// the hub had and cannot cite, of which its operator is alerted.
+#[test]
+fn what_the_ledger_cannot_read_back_is_told_to_the_dispute() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let (spent, claimed) = (mint(&files, &alice, 8), mint(&files, &alice, 4));
+    Spend::new(&keyset, std::slice::from_ref(&spent), &[(bob.address(), 8)])
+        .complete(&hub, &keyset);
+    hub.retire_claimed(&[1; 32], &filed([7; 32], &keyset, &[&claimed]).held(), &[])
+        .unwrap();
+    let claim = filed([9; 32], &keyset, &[&spent, &claimed]);
+    let found = hub.found(claim.claim()).unwrap();
+    assert_eq!((found.evidence.len(), found.unread.len()), (2, 0));
+    drop(hub);
+
+    sql(&files.db)
+        .execute(
+            "UPDATE grants SET signed = x'00' WHERE released_at IS NOT NULL",
+            [],
+        )
+        .unwrap();
+    let y = claimed.note.message().identifier().unwrap();
+    sql(&files.db)
+        .execute("UPDATE claimed SET message = x'00' WHERE y = ?1", [&y.0])
+        .unwrap();
+    let hub = open(&files, Policy::default());
+    let found = hub.found(claim.claim()).unwrap();
+    assert!(found.evidence.is_empty());
+    assert_eq!(found.unread.len(), 2, "{:?}", found.unread);
+    assert!(
+        found.unread[0].contains("does not read back"),
+        "{:?}",
+        found.unread
+    );
+    // The view without them, as before.
+    assert!(hub.evidence(claim.claim()).unwrap().is_empty());
+}
+
 /// The audit finds, in a ledger of the release before (schema 1), which
 /// the hub no longer opens, each spend it retired notes for that a dispute
 /// cannot cite: of more notes than a statement reads, or of a signed spend

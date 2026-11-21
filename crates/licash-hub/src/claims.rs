@@ -245,8 +245,12 @@ pub(crate) struct Shown {
 
 /// The locks claims gave any of `ys` up by, each once, in the order of
 /// `ys`. A row that is not as it was kept is left out alone, with a
-/// warning: the others are evidence all the same.
-pub(crate) fn shown(c: &Connection, ys: &[Point]) -> Result<Vec<Shown>, Error> {
+/// warning, and said in `unread`: the others are evidence all the same.
+pub(crate) fn shown(
+    c: &Connection,
+    ys: &[Point],
+    unread: &mut Vec<String>,
+) -> Result<Vec<Shown>, Error> {
     let mut stmt = c.prepare_cached(
         "SELECT l.id, l.keyset, l.evidence FROM shown_inputs i
          JOIN shown_locks l ON l.id = i.lock WHERE i.y = ?1",
@@ -268,10 +272,11 @@ pub(crate) fn shown(c: &Connection, ys: &[Point]) -> Result<Vec<Shown>, Error> {
                         locks.push(lock);
                     }
                 }
-                Err(e) => tracing::warn!(
-                    note = %hex::encode(y.0),
-                    "a lock a claim showed not read back: {e}"
-                ),
+                Err(e) => {
+                    let note = hex::encode(y.0);
+                    tracing::warn!(%note, "a lock a claim showed not read back: {e}");
+                    unread.push(format!("a lock a claim showed of the note {note}: {e}"));
+                }
             }
         }
     }
@@ -290,12 +295,13 @@ pub(crate) fn claimed(c: &Connection, ys: &[Point]) -> Result<bool, Error> {
 
 /// Each other claim of any of `ys` than the one of `context`: its hold
 /// key's signature of that claim, by note then contract. A row that is not
-/// as it was kept is left out alone, with a warning: one claim the ledger
-/// cannot cite is no reason to cite none.
+/// as it was kept is left out alone, with a warning, and said in `unread`:
+/// one claim the ledger cannot cite is no reason to cite none.
 pub(crate) fn second_claims(
     c: &Connection,
     ys: &[Point],
     context: &hold::Context,
+    unread: &mut Vec<String>,
 ) -> Result<Vec<Evidence>, Error> {
     let own = context.to_bytes();
     let mut stmt = c.prepare_cached(
@@ -312,7 +318,13 @@ pub(crate) fn second_claims(
             ))
         })?;
         for row in rows {
-            evidence.extend(cited(y, row));
+            match cited(y, row) {
+                Some(e) => evidence.push(e),
+                None => unread.push(format!(
+                    "another claim of the note {} does not read back",
+                    hex::encode(y.0)
+                )),
+            }
         }
     }
     Ok(evidence)
