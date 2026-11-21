@@ -55,8 +55,14 @@ const CLAIM_VBYTES: u64 = 160;
 /// for its cost to be measured.
 const SETTLE: Duration = Duration::from_secs(3 * 60);
 
-/// When nothing could be done, or afforded, look again this much later.
+/// When a move would overspend the budget, look again this much later: its
+/// kind's next move is paced by its share, and a month's costs only age out
+/// slowly.
 const RETRY: Duration = Duration::from_secs(30 * 60);
+
+/// When no route was found, look again this much later: nothing was spent,
+/// and a probe, a balance or a swap may change that within minutes.
+const RETRY_ROUTE: Duration = Duration::from_secs(5 * 60);
 
 /// How the mover moves.
 pub struct Moving {
@@ -186,6 +192,16 @@ pub enum Skipped {
     Unaffordable(u64),
 }
 
+impl Skipped {
+    /// How long before a move of the kind is tried again.
+    pub fn retry(&self) -> Duration {
+        match self {
+            Self::NoRoute(_) => RETRY_ROUTE,
+            Self::Unaffordable(_) => RETRY,
+        }
+    }
+}
+
 pub struct Mover<T: Transport> {
     wallet: Arc<Wallet<T>>,
     moving: Moving,
@@ -267,7 +283,7 @@ impl<T: Transport + 'static> Mover<T> {
                 Ok(cost) => self.mean(kind, cost)?,
                 Err(skipped) => {
                     tracing::info!(kind = kind.key(), "no move: {skipped:?}");
-                    RETRY
+                    skipped.retry()
                 }
             };
             let wait = budget::jitter(wait, OsRng.next_u64());
@@ -960,4 +976,17 @@ fn pick<T>(items: &[T]) -> Option<&T> {
         return None;
     }
     items.get((OsRng.next_u64() % items.len() as u64) as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_route_is_tried_again_sooner_than_no_budget() {
+        let route = Skipped::NoRoute("none".into()).retry();
+        let budget = Skipped::Unaffordable(100).retry();
+        assert!(route < budget);
+        assert!(route >= Duration::from_secs(60), "not a busy loop");
+    }
 }
