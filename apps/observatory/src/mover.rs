@@ -10,11 +10,18 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
-use licash_wallet::{InvoiceState, LockState, SwapLimits, SwapState, Transport, Wallet};
+use bitcoin::{BlockHash, FeeRate};
+use licash_chain_client::Source;
+use licash_wallet::{
+    DepositState, InvoiceState, LockState, PayoutState, SwapLimits, SwapState, Transport, Wallet,
+};
 use rand_core::{OsRng, RngCore};
 
 use crate::{
@@ -40,6 +47,10 @@ fn patience(kind: Kind) -> Duration {
     }
 }
 
+/// A payout's claim, in virtual bytes, at most: one input of a lock's
+/// claim path, one output.
+const CLAIM_VBYTES: u64 = 160;
+
 /// How long a move's locks may take to be known paid, once it is made,
 /// for its cost to be measured.
 const SETTLE: Duration = Duration::from_secs(3 * 60);
@@ -58,6 +69,34 @@ pub struct Moving {
     pub fresh: i64,
     /// Where the budget is shown.
     pub shown: Arc<Mutex<Option<Budget>>>,
+    /// The chain to follow payouts on and broadcast their claims to: moves
+    /// on Bitcoin are made only with one.
+    pub chain: Option<Source>,
+}
+
+/// A chain source as the wallet reads Bitcoin through it.
+struct Blocks<'a>(&'a Source);
+
+fn text(e: anyhow::Error) -> String {
+    format!("{e:#}")
+}
+
+impl licash_wallet::Blocks for Blocks<'_> {
+    async fn height(&self) -> Result<u32, String> {
+        Ok(self.0.tip().await.map_err(text)?.height)
+    }
+
+    async fn hash(&self, height: u32) -> Result<BlockHash, String> {
+        self.0.hash(height).await.map_err(text)
+    }
+
+    async fn filter(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, String> {
+        self.0.filter(hash).await.map_err(text)
+    }
+
+    async fn block(&self, hash: &BlockHash) -> Result<bitcoin::Block, String> {
+        self.0.block(hash).await.map_err(text)
+    }
 }
 
 /// A hub or provider that answered lately, with its terms.
@@ -209,12 +248,18 @@ impl<T: Transport + 'static> Mover<T> {
             if let Err(e) = self.wallet.resume().await {
                 tracing::debug!("taking moves under way on: {e}");
             }
+            if let Some(chain) = &self.moving.chain {
+                if let Err(e) = self.wallet.follow_payouts(&Blocks(chain)).await {
+                    tracing::debug!("taking payouts under way on: {e}");
+                }
+                broadcast_claims(&self.wallet, chain).await;
+            }
         }
         let network = network(&self.moving.store, self.moving.fresh)?;
         self.add_hubs(&network).await;
         let due = Kind::ALL
             .into_iter()
-            .filter(|&k| enabled(k))
+            .filter(|&k| self.enabled(k))
             .filter(|k| self.next.get(k).is_some_and(|&at| at <= now))
             .min_by_key(|k| self.next[k]);
         if let Some(kind) = due {
@@ -229,6 +274,11 @@ impl<T: Transport + 'static> Mover<T> {
             self.next.insert(kind, store::now() + millis(wait));
         }
         self.show(&network)
+    }
+
+    /// Whether moves of `kind` are made: on Bitcoin only with a chain.
+    fn enabled(&self, kind: Kind) -> bool {
+        kind != Kind::Chain || self.moving.chain.is_some()
     }
 
     /// Make a move of `kind` now, as the budget allows: what it was
@@ -340,9 +390,7 @@ impl<T: Transport + 'static> Mover<T> {
             Kind::Hub => self.plan_hub(network),
             Kind::Swap => self.plan_swap(network).await,
             Kind::Lightning => self.plan_lightning(network),
-            Kind::Chain => Err(Skipped::NoRoute(
-                "payouts on Bitcoin are not made yet".into(),
-            )),
+            Kind::Chain => self.plan_chain(network),
         }?;
         let month = self
             .moving
@@ -539,7 +587,8 @@ impl<T: Transport + 'static> Mover<T> {
             Ok(id) => id,
             Err(e) => return tracing::warn!("recording a move: {e:#}"),
         };
-        let made = within(patience(plan.kind), self.carry(&plan)).await;
+        let paid = AtomicBool::new(false);
+        let made = within(patience(plan.kind), self.carry(&plan, &paid)).await;
         let ended = store::now();
         // Its change unlinked, as any wallet does after a payment: part of
         // what it costs.
@@ -556,9 +605,12 @@ impl<T: Transport + 'static> Mover<T> {
         let measured = before
             .zip(self.total())
             .map(|((available, pending), after)| (available + pending).saturating_sub(after));
-        let cost = match settled {
-            true => measured,
-            false => Some(measured.unwrap_or(0).max(plan.quoted)),
+        let cost = match (settled, &made) {
+            // Its value may be on its way on Bitcoin still, out of the
+            // wallet's sight: the quote, for want of better.
+            (_, Err(_)) if paid.load(Ordering::Relaxed) => Some(plan.quoted),
+            (true, _) => measured,
+            (false, _) => Some(measured.unwrap_or(0).max(plan.quoted)),
         };
         let (outcome, detail) = match &made {
             Ok(()) => (Outcome::Done, None),
@@ -581,7 +633,7 @@ impl<T: Transport + 'static> Mover<T> {
         }
     }
 
-    async fn carry(&self, plan: &Plan) -> Result<(), String> {
+    async fn carry(&self, plan: &Plan, paid: &AtomicBool) -> Result<(), String> {
         let wallet = &self.wallet;
         let (from, to) = (self.url(&plan.source), self.url(&plan.target));
         match plan.kind {
@@ -619,7 +671,7 @@ impl<T: Transport + 'static> Mover<T> {
                 }
             }
             Kind::Lightning => self.carry_lightning(plan, from, to).await,
-            Kind::Chain => Err("payouts on Bitcoin are not made yet".into()),
+            Kind::Chain => self.carry_chain(plan, (from, to), paid).await,
         }
     }
 
@@ -688,6 +740,134 @@ impl<T: Transport + 'static> Mover<T> {
         }
     }
 
+    /// Out of a hub through a provider, onto Bitcoin, into a hub again: a
+    /// payout to a deposit's address, estimated from their terms, as the
+    /// deposit is asked for only once the move is made.
+    fn plan_chain(&self, network: &Network) -> Result<Plan, Skipped> {
+        let available = self.available();
+        let mut routes = Vec::new();
+        for provider in &network.providers {
+            let Some(chain) = &provider.terms.chain else {
+                continue;
+            };
+            for to in network
+                .hubs
+                .iter()
+                .filter(|h| self.added.contains_key(&h.id))
+            {
+                let Some(deposits) = &to.terms.deposits else {
+                    continue;
+                };
+                let amount = self.moving.amount.max(deposits.min);
+                let pays = amount + deposits.fee.due(amount);
+                // The wallet's claim, budgeted as the wallet does, at the
+                // provider's rate.
+                let claim = (CLAIM_VBYTES * chain.rate.max(1_000) * 3).div_ceil(1000);
+                let value = pays + claim;
+                if amount > deposits.max || value < chain.min || value > chain.max {
+                    continue;
+                }
+                for from in network
+                    .hubs
+                    .iter()
+                    .filter(|h| self.added.contains_key(&h.id))
+                {
+                    let swaps_at = from
+                        .terms
+                        .address
+                        .as_ref()
+                        .is_some_and(|a| provider.terms.hubs.iter().any(|(at, _)| at == a));
+                    let held = available.get(&from.id).copied().unwrap_or(0);
+                    let locked = chain.pays(value);
+                    let lock = self
+                        .wallet
+                        .lock_fee(self.url(&from.id), locked)
+                        .unwrap_or(0);
+                    // The provider's fee and its miners', the claim's and
+                    // the lock's; then the deposit's.
+                    let costs = locked - pays + lock;
+                    if swaps_at && held >= pays + costs {
+                        let quoted = costs + (pays - amount);
+                        routes.push((provider, from, to, amount, quoted));
+                    }
+                }
+            }
+        }
+        let (via, from, to, amount, quoted) = pick(&routes).ok_or_else(|| {
+            Skipped::NoRoute(
+                "no provider pays out of a hub holding enough to a hub taking deposits".into(),
+            )
+        })?;
+        Ok(Plan {
+            kind: Kind::Chain,
+            source: from.id.clone(),
+            target: to.id.clone(),
+            via: Some(via.id.clone()),
+            amount: *amount,
+            quoted: *quoted,
+        })
+    }
+
+    /// The payout, then the deposit it pays: `paid` set once the payout is
+    /// made, its value then on its way out of the wallet's sight.
+    async fn carry_chain(
+        &self,
+        plan: &Plan,
+        (from, to): (&str, &str),
+        paid: &AtomicBool,
+    ) -> Result<(), String> {
+        let wallet = &self.wallet;
+        let chain = self.moving.chain.as_ref().ok_or("no chain")?;
+        let provider = self.provider_url(plan)?;
+        let mut deposit = wallet.deposit(to, plan.amount).await.map_err(said)?;
+        let terms = loop {
+            match (&deposit.terms, &deposit.state) {
+                (_, DepositState::Canceled(why)) => return Err(format!("no deposit: {why}")),
+                (Some(terms), _) => break terms.clone(),
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if let Ok(followed) = wallet.follow_deposit(&deposit.hash).await {
+                deposit = followed;
+            }
+        };
+        let rate = match chain.fee_rate(6).await {
+            Ok(Some(rate)) => rate.max(FeeRate::BROADCAST_MIN),
+            _ => FeeRate::BROADCAST_MIN,
+        };
+        // Within what was planned, but for the deposit's fee.
+        let max_fee = plan.quoted - (terms.pays - plan.amount);
+        let quote = wallet
+            .payout_quote(&provider, from, &terms.address, terms.pays, max_fee, rate)
+            .await
+            .map_err(said)?;
+        paid.store(true, Ordering::Relaxed);
+        let mut payout = wallet.payout(&quote).await.map_err(said)?;
+        loop {
+            if let PayoutState::Failed(why) = &payout.state {
+                return Err(format!("the payout failed: {why}"));
+            }
+            match &deposit.state {
+                DepositState::Received => return Ok(()),
+                DepositState::Canceled(why) => return Err(format!("the deposit failed: {why}")),
+                DepositState::Refunded(_) => return Err("the deposit was refunded".into()),
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            if !matches!(payout.state, PayoutState::Done) {
+                match wallet.follow_payout(&payout.hash, &Blocks(chain)).await {
+                    Ok(followed) => payout = followed,
+                    Err(licash_wallet::Error::Pending { .. }) => {}
+                    Err(e) => tracing::debug!("following a payout: {e}"),
+                }
+                broadcast_claims(wallet, chain).await;
+            }
+            if let Ok(followed) = wallet.follow_deposit(&deposit.hash).await {
+                deposit = followed;
+            }
+        }
+    }
+
     fn provider_url(&self, plan: &Plan) -> Result<String, String> {
         let id = plan.via.as_deref().ok_or("no provider")?;
         let services = self.moving.store.services().map_err(|e| e.to_string())?;
@@ -712,7 +892,7 @@ impl<T: Transport + 'static> Mover<T> {
             .actions_since(now - millis(budget::MONTH))?;
         let plans: Vec<(Kind, bool, Option<i64>)> = Kind::ALL
             .into_iter()
-            .map(|k| (k, enabled(k), self.next.get(&k).copied()))
+            .map(|k| (k, self.enabled(k), self.next.get(&k).copied()))
             .collect();
         let balance = self.total();
         let mut budget = Budget::new(self.moving.monthly, &month, balance, &plans);
@@ -741,9 +921,14 @@ impl<T: Transport + 'static> Mover<T> {
     }
 }
 
-/// Whether moves of `kind` are made: not yet on Bitcoin.
-fn enabled(kind: Kind) -> bool {
-    kind != Kind::Chain
+/// The claims of payouts not done broadcast: one the chain refuses is
+/// broadcast again next time, as its coin may not be in its view yet.
+async fn broadcast_claims<T: Transport>(wallet: &Wallet<T>, chain: &Source) {
+    for claim in wallet.payout_claims().unwrap_or_default() {
+        if let Err(e) = chain.broadcast(&claim).await {
+            tracing::debug!(txid = %claim.compute_txid(), "claim not broadcast: {e:#}");
+        }
+    }
 }
 
 /// `run` within `patience`, or why not.

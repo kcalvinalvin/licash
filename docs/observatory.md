@@ -73,9 +73,18 @@ take, and what they cost.
 | In Licash | pays itself at a hub | 10% | 10 minutes |
 | Between hubs | swaps through a provider from one hub to another | 30% | 30 minutes |
 | Over Lightning | pays another hub's invoice, from a hub's gateway or through a provider | 30% | 30 minutes |
-| On Bitcoin | not made yet | 30% | 24 hours |
+| On Bitcoin | pays out of a hub through a provider to a hub's deposit address, then claims the deposit | 30% | 24 hours |
 
-Each move moves `--amount` sat (2,000 by default). How often a kind of
+Each move moves `--amount` sat (2,000 by default), and a move on Bitcoin
+at least the smallest deposit its hub takes (often 10,000 sat). Moves on
+Bitcoin are made only with `--chain URL`, Bitcoin Core's JSON-RPC
+(`http://user:pass@host:8332`) or Esplora (`esplora+https://host/api`),
+which the observatory reads directly, not over Tor, to follow its payouts
+and broadcast their claims. Such a move costs the provider's and the
+hub's fees and two transactions' miners, around 2,000 sat on signet: with
+a budget of 10,000 sat a month, its 3,000 sat share pays for one every
+twenty days or so. A kind of move whose single move costs more than its
+share is never made. How often a kind of
 move comes is its share of the budget over what its last moves cost: a
 move costing 3 sat comes far more often than one costing 300, and none
 more often than the table's limit. Each wait is drawn between half and one
@@ -87,8 +96,10 @@ Moves are made one at a time, and each costs what the wallet holds less
 after it: fees, and anything lost. Only services that answered their last
 probe are used, a source hub only if it holds enough, and the rest at
 random. A move not done in time (2 minutes in Licash, 15 between hubs, 5
-over Lightning) counts as failed; the wallet takes it on later, as it does
-moves under way when the observatory stops.
+over Lightning, 6 hours on Bitcoin) counts as failed; the wallet takes it
+on later, as it does moves under way when the observatory stops. A move on
+Bitcoin that failed after its payout is counted at its quote, as its value
+may still be on its way.
 
 Fund the wallet at any hub the observatory watches, with the `licash-wallet`
 CLI beside it, and let the observatory take the payment on:

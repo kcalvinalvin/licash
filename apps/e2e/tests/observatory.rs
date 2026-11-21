@@ -1,14 +1,14 @@
 //! The observatory watches the stack's hubs and provider, then moves a
-//! balance of its own between them, in Licash, through the provider and
-//! over Lightning, each move recorded with what it cost, on the stack of
-//! `apps/e2e/run.sh`, which runs these.
+//! balance of its own between them, in Licash, through the provider, over
+//! Lightning and on Bitcoin, each move recorded with what it cost, on the
+//! stack of `apps/e2e/run.sh`, which runs these.
 
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use licash_e2e::Eco;
+use licash_e2e::{until, Eco};
 use licash_nostr::Route;
 use licash_observatory::{
     budget::Kind,
@@ -21,6 +21,28 @@ use licash_observatory::{
 /// What each move moves.
 const AMOUNT: u64 = 2_000;
 
+/// What the observatory's wallet is funded with.
+const FUNDS: u64 = 40_000;
+
+/// The provider able to pay out `amount` on Bitcoin, funded there once.
+async fn funded(eco: &Eco, amount: u64) -> anyhow::Result<()> {
+    let max = || async {
+        let info = eco.swaps_info().await?;
+        anyhow::Ok(info.chain.map_or(0, |c| c.max))
+    };
+    if max().await? >= amount {
+        return Ok(());
+    }
+    let address = eco.exec("swaps", &["licash-swaps", "address"]).await?;
+    eco.send_to(String::from_utf8(address)?.trim(), 3 * amount)
+        .await?;
+    eco.mine(1).await?;
+    until("the provider's coins found", 120, || async {
+        Ok((max().await? >= amount).then_some(()))
+    })
+    .await
+}
+
 #[tokio::test]
 #[ignore = "needs the stack of apps/e2e/run.sh"]
 async fn the_observatory_moves_its_balance_between_hubs_and_records_each_move() -> anyhow::Result<()>
@@ -28,6 +50,7 @@ async fn the_observatory_moves_its_balance_between_hubs_and_records_each_move() 
     let eco = Eco::up().await?;
     let (hub1, hub2) = (eco.hub(1).to_owned(), eco.hub(2).to_owned());
     eco.stock(10 * AMOUNT).await?;
+    funded(&eco, 100_000).await?;
 
     let dir = tempfile::tempdir()?;
     let store = Arc::new(Store::open(&dir.path().join("observatory.sqlite"))?);
@@ -51,7 +74,7 @@ async fn the_observatory_moves_its_balance_between_hubs_and_records_each_move() 
 
     let wallet = eco.wallet("observatory")?;
     wallet.add_hub(&hub1).await?;
-    eco.pay_in(&wallet, &hub1, 20_000).await?;
+    eco.pay_in(&wallet, &hub1, FUNDS).await?;
     let shown = Arc::new(Mutex::new(None));
     let moving = Moving {
         store: store.clone(),
@@ -59,14 +82,23 @@ async fn the_observatory_moves_its_balance_between_hubs_and_records_each_move() 
         amount: AMOUNT,
         fresh: 600_000,
         shown: shown.clone(),
+        chain: Some(eco.chain().parse()?),
     };
     let mut mover = Mover::new(wallet, moving)?;
 
-    for kind in [Kind::Hub, Kind::Swap, Kind::Lightning] {
-        let quoted = mover
-            .move_now(kind)
-            .await
-            .map_err(|e| anyhow::anyhow!("{kind:?}: {e:?}"))?;
+    for kind in [Kind::Hub, Kind::Swap, Kind::Lightning, Kind::Chain] {
+        // Blocks mined meanwhile, for a move on Bitcoin.
+        let mining = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                eco.mine(1).await?;
+            }
+        };
+        let quoted = tokio::select! {
+            made = mover.move_now(kind) => made,
+            failed = mining => return failed,
+        }
+        .map_err(|e| anyhow::anyhow!("{kind:?}: {e:?}"))?;
         let actions = store.actions_since(0)?;
         let made = actions.last().unwrap();
         assert_eq!(made.kind, kind.key());
@@ -90,6 +122,6 @@ async fn the_observatory_moves_its_balance_between_hubs_and_records_each_move() 
     assert_eq!(budget.spent, spent);
     assert!(spent > 0, "fees are paid");
     // What was spent is what the wallet holds less, all of it.
-    assert_eq!(budget.balance, Some(20_000 - spent));
+    assert_eq!(budget.balance, Some(FUNDS - spent));
     Ok(())
 }

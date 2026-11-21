@@ -200,6 +200,12 @@ impl Eco {
         &self.hubs[n - 1]
     }
 
+    /// Bitcoin Core's JSON-RPC, as published on this host, with its
+    /// credentials: a chain URL of `licash-chain-client`.
+    pub fn chain(&self) -> String {
+        self.core.replacen("http://", "http://licash:licash@", 1)
+    }
+
     /// The URL of the Nostr relay the hubs announce themselves on.
     pub fn relay(&self) -> &str {
         &self.relay

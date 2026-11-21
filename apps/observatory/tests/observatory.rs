@@ -378,6 +378,7 @@ async fn an_unfunded_mover_moves_nothing_and_says_so() {
         amount: 1_000,
         fresh: 60_000,
         shown: shown.clone(),
+        chain: None,
     };
     let mut mover = Mover::new(wallet, moving).unwrap();
     for kind in [Kind::Hub, Kind::Swap, Kind::Lightning] {

@@ -12,6 +12,7 @@ use std::{
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use licash::spend::ChainProfile;
+use licash_chain_client::Source;
 use licash_nostr::Route;
 use licash_observatory::{
     mover::{Mover, Moving},
@@ -139,6 +140,13 @@ struct Run {
     #[arg(long, env = "LICASH_OBSERVATORY_AMOUNT", default_value_t = 2_000,
           value_parser = clap::value_parser!(u64).range(1..))]
     amount: u64,
+    /// The chain to follow payouts on and broadcast their claims to:
+    /// Bitcoin Core's JSON-RPC, `http[s]://[user:pass@]host:port`, or
+    /// Esplora, `esplora+https://host/api`. With it, a move on Bitcoin, out
+    /// of a hub and into one, comes at most once a day; it is read directly,
+    /// not over Tor.
+    #[arg(long, env = "LICASH_OBSERVATORY_CHAIN")]
+    chain: Option<Source>,
 }
 
 fn main() -> ExitCode {
@@ -236,6 +244,7 @@ async fn serve(data: PathBuf, run: Run) -> anyhow::Result<()> {
             amount: run.amount,
             fresh: (fresh * 1000) as i64,
             shown: budget,
+            chain: run.chain,
         };
         tasks.push(tokio::spawn(Mover::new(wallet, moving)?.run()));
     }
