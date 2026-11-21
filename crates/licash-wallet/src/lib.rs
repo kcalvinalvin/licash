@@ -40,6 +40,7 @@ mod cold;
 mod delivery;
 mod deposits;
 mod inquiry;
+mod journal;
 mod lightning;
 mod locks;
 mod payouts;
@@ -88,6 +89,7 @@ pub use deposits::{
     Close, CloseDeposit, Deposit, DepositState, DepositTerms, CLOSE_ATTEMPTS, GAP as DEPOSIT_GAP,
 };
 pub use inquiry::Checked;
+pub use journal::{CoinSpan, Journal, NoteSpan};
 pub use lightning::{refund_blocks, Invoice, InvoiceState, Payable, ViaQuote, ROUTE_BLOCKS};
 pub use locks::{Incoming, Lock, LockState, Via, CLAIM_MARGIN, PROTECTED_MARGIN};
 pub use payouts::{
