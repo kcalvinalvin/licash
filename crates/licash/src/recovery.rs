@@ -613,7 +613,8 @@ impl SourceWitness {
                 cert.verify_source(keyset, signed, notes)
             }
             (Source::Plain { .. } | Source::OwnInputs { .. }, Self::Signed { signed, notes }) => {
-                let mut inputs = signed.verify(keyset, notes)?;
+                // Verified as the filing was decoded, its notes with it.
+                let mut inputs = signed.inputs_of(keyset, notes)?;
                 inputs.sort_unstable();
                 if inputs != source.inputs() || lock_terms != source.terms() {
                     return Err(bad("source body differs from claimed metadata"));
@@ -883,8 +884,9 @@ pub fn evidence_from_bytes(
     for _ in 0..r.count(MAX_EVIDENCE)? {
         evidence.push(match r.byte()? {
             0 => {
+                // Verified once, as the spend's inputs it is read with.
                 let notes = (0..r.count(limit)?)
-                    .map(|_| Note::from_bytes(keyset, r.blob()?))
+                    .map(|_| Note::from_bytes_unverified(r.blob()?))
                     .collect::<Result<Vec<_>, _>>()?;
                 let signed = SignedProposal::from_bytes(keyset, &notes, r.blob()?)?;
                 let unlock = match r.byte()? {
@@ -985,16 +987,17 @@ pub fn disclosures(evidence: &[Evidence]) -> Result<Disclosures, Error> {
 }
 
 /// The identifiers an owner-signed spend consumes, once verified: its
-/// owners' signatures, and for a granted spend its unlock. The owners
-/// committed to the grant, so a granted spend cannot be cited as a plain
-/// one to keep its unlock private.
+/// owners' signatures, which every [`SignedProposal`] was made or read
+/// with, and for a granted spend its unlock. The owners committed to the
+/// grant, so a granted spend cannot be cited as a plain one to keep its
+/// unlock private.
 fn spent_by(
     keyset: &Keyset,
     signed: &SignedProposal,
     notes: &[Note],
     unlock: Option<&Unlock>,
 ) -> Result<BTreeSet<Point>, Error> {
-    let spent = signed.verify(keyset, notes)?.into_iter().collect();
+    let spent = signed.inputs_of(keyset, notes)?.into_iter().collect();
     match (signed.authorization(), unlock) {
         (Authorization::Plain, None) => {}
         (Authorization::Granted(grant), Some(unlock)) => grant.verify_unlock(keyset, unlock)?,
@@ -1451,7 +1454,10 @@ impl Filing {
         for _ in 0..r.count(MAX_ITEMS)? {
             sources.push(match r.byte()? {
                 0 => {
-                    let notes = notes(&mut r, limit)?;
+                    // Verified once, as the spend's inputs it is read with.
+                    let notes = (0..r.count(limit)?)
+                        .map(|_| Note::from_bytes_unverified(r.blob()?))
+                        .collect::<Result<Vec<_>, _>>()?;
                     let signed = SignedProposal::from_bytes(keyset, &notes, r.blob()?)?;
                     SourceWitness::Signed { signed, notes }
                 }

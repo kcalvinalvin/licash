@@ -3480,3 +3480,82 @@ fn a_granted_spend_cited_by_its_signatures_voids_only_with_its_unlock() {
     };
     assert!(disclosures(&[cited, preimage]).is_err());
 }
+
+/// Each note a spend is read with is verified once, with the spend, and
+/// still verified: evidence or a filing of a note whose issuance does not
+/// verify is no evidence and no filing. A spend made or read verified is
+/// not verified again where it is relied on, only matched to the keyset
+/// and the notes it is relied on with.
+#[test]
+fn notes_read_with_a_spend_are_verified_once_and_still_verified() {
+    let w = withheld();
+    let keyset = w.o.base.parts().keyset.clone();
+    let spend = Evidence::Spend {
+        signed: w.signed.clone(),
+        notes: vec![w.note.clone()],
+        unlock: Some(w.unlock),
+    };
+    let bytes = evidence_to_bytes(std::slice::from_ref(&spend));
+    evidence_from_bytes(&keyset, LIMIT, &bytes).unwrap();
+    // Any byte of the note changed so that it is no note of the keyset,
+    // though it decodes, makes the evidence none: as it did when the note
+    // was verified twice.
+    let note = w.note.to_bytes();
+    let at = (0..bytes.len() - note.len())
+        .find(|&i| bytes[i..i + note.len()] == note[..])
+        .unwrap();
+    let mut forged = None;
+    for i in 0..note.len() {
+        let mut candidate = note.clone();
+        candidate[i] ^= 1;
+        let mut changed = bytes.clone();
+        changed[at..at + note.len()].copy_from_slice(&candidate);
+        if licash::note::Note::from_bytes(&keyset, &candidate).is_err() {
+            assert!(
+                evidence_from_bytes(&keyset, LIMIT, &changed).is_err(),
+                "byte {i}"
+            );
+            if licash::note::Note::peek(&candidate).is_ok() {
+                forged.get_or_insert(candidate);
+            }
+        }
+    }
+    let forged = forged.expect("a note that decodes and does not verify");
+    // Relied on, a spend is matched to its keyset and notes.
+    assert_eq!(
+        w.signed
+            .inputs_of(&keyset, std::slice::from_ref(&w.note))
+            .unwrap(),
+        vec![w.note.message().identifier().unwrap()]
+    );
+    let other = IssuerKeys::random(7).unwrap().keyset().unwrap();
+    assert!(w
+        .signed
+        .inputs_of(&other, std::slice::from_ref(&w.note))
+        .is_err());
+    assert!(w.signed.inputs_of(&keyset, &[]).is_err());
+    let stranger = mint(&w.o.issuer, &keyset, &derive(SPEND, &hold(), 128, 23, 1));
+    assert!(w.signed.inputs_of(&keyset, &[stranger]).is_err());
+    let filing = Filing::new(w.publication.clone(), w.witness.clone())
+        .unwrap()
+        .to_bytes(Format::of(&w.o.base));
+    assert_eq!(
+        decide(&w.o, &w.request, &w.publication, &w.witness, &[], None)
+            .unwrap()
+            .owed,
+        128
+    );
+    let at = (0..filing.len() - note.len())
+        .rev()
+        .find(|&i| filing[i..i + note.len()] == note[..])
+        .unwrap();
+    let mut changed = filing.clone();
+    changed[at..at + note.len()].copy_from_slice(&forged);
+    let chain = checkpoint_chain();
+    let read = recovery::owed(&w.o.base, &w.request, &changed, &[], &chain);
+    assert!(
+        read.as_ref().map_or(true, |o| o.owed == 0),
+        "{:?}",
+        read.map(|o| (o.owed, o.mask, o.ineligible))
+    );
+}

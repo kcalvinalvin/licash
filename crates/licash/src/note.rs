@@ -462,6 +462,14 @@ impl Note {
         Ok(note)
     }
 
+    /// Decode `to_bytes` and verify nothing: for a decoder that verifies
+    /// the note right after, with the spend it is an input of
+    /// ([`crate::authorization::SignedProposal::from_bytes`]), rather than
+    /// twice.
+    pub(crate) fn from_bytes_unverified(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
     /// What `to_bytes` say of a note, decoded but not verified: for a
     /// ledger reading back the notes it verified before keeping them. It
     /// proves nothing about the note.

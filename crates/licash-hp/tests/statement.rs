@@ -426,6 +426,16 @@ fn signed_request(seed: u8, e: &Hash, b: u32) -> (RequestKeys, Vec<Vec<u8>>) {
     (RequestKeys::new(b_ends, e_ends).unwrap(), witness)
 }
 
+/// A spend as the Hub cites it, by the signatures of every input of it:
+/// all of them are her claim's, in these fixtures.
+fn cite(spent: Evidence) -> Evidence {
+    let Evidence::Spend { signed, unlock, .. } = spent else {
+        return spent;
+    };
+    let all = (0..signed.proposal().inputs().len()).collect();
+    licash::recovery::by_signature(&signed, unlock, &all).unwrap()
+}
+
 /// The inputs r0/host measures the guest on (`licash-r0 hp-exec`),
 /// written to `LICASH_HP_INPUTS` if set: the 32-item claim the Hub
 /// answers with a 16-note spend, the same claim unanswered, and its like of
@@ -437,10 +447,10 @@ fn export_inputs() {
     };
     let (f, spent) = stale();
     println!("filing: {} bytes", f.bytes.len());
-    let answered = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 64), vec![spent]);
+    let answered = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 64), vec![cite(spent)]);
     let unanswered = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 127), vec![]);
     let (f, spent) = funded_notes();
-    let funded = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 64), vec![spent]);
+    let funded = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 64), vec![cite(spent)]);
     let inputs = [
         ("answered", answered),
         ("unanswered", unanswered),
@@ -488,11 +498,8 @@ fn export_worst_inputs() {
             let signed =
                 SignedProposal::sign(&keyset, proposal, &inputs, Authorization::Plain, &owners)
                     .unwrap();
-            Evidence::Spend {
-                signed,
-                notes: inputs,
-                unlock: None,
-            }
+            // As the Hub cites it: by the signature of her note alone.
+            licash::recovery::by_signature(&signed, None, &[0].into()).unwrap()
         })
         .collect();
     let parts = claim::Parts {
@@ -516,7 +523,7 @@ fn export_worst_inputs() {
     assert_eq!(owed.owed, 0);
     let worst = input(&f.base, x, spends);
     let (a, spent) = stale();
-    let answered = input(&a.base, exit(&a.base, a.b, &a.e, &a.bytes, 64), vec![spent]);
+    let answered = input(&a.base, exit(&a.base, a.b, &a.e, &a.bytes, 64), vec![cite(spent)]);
     for (name, i) in [("worst", worst), ("answered", answered)] {
         let bytes = i.to_bytes();
         let start = std::time::Instant::now();
@@ -589,6 +596,36 @@ fn the_hub_proves_what_its_evidence_leaves_owed() {
         check(&input(&other, x, vec![spent])),
         Err(Refusal::Evidence(_))
     ));
+}
+
+/// The Hub cites a spend by the signatures of the inputs her claim relies
+/// on ([`Evidence::Signed`]), as it does: the statement proves the same of
+/// it as of the spend whole, from fewer bytes, and nothing of a part of it.
+#[test]
+fn the_hub_proves_the_same_of_a_spend_cited_by_its_signatures() {
+    let (f, spent) = stale();
+    let journal = contract(&f.base).journal();
+    let Evidence::Spend { signed, .. } = &spent else {
+        panic!("a spend");
+    };
+    let cited = licash::recovery::by_signature(signed, None, &(0..16).collect()).unwrap();
+    let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
+    let (owed, _) = decide(&f.base, &keys(), &x, std::slice::from_ref(&cited)).unwrap();
+    assert_eq!((owed.owed, owed.mask), (64, 0xffff));
+    let bytes = input(&f.base, x.clone(), vec![cited.clone()]).to_bytes();
+    assert!(bytes.len() < input(&f.base, x.clone(), vec![spent.clone()]).to_bytes().len());
+    assert_eq!(
+        check(&HubInput::from_bytes(&bytes).unwrap()).unwrap(),
+        journal
+    );
+    // Cited by 15 of its 16 inputs it voids 15 notes: 64 is not proven.
+    let part = licash::recovery::by_signature(signed, None, &(1..16).collect()).unwrap();
+    assert_eq!(
+        check(&input(&f.base, x.clone(), vec![part.clone()])),
+        Err(Refusal::Owed)
+    );
+    let x = exit(&f.base, f.b, &f.e, &f.bytes, 68);
+    assert_eq!(check(&input(&f.base, x, vec![part])).unwrap(), journal);
 }
 
 /// The statement holds only of a request signed under the keys Base binds:

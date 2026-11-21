@@ -690,6 +690,29 @@ impl SignedProposal {
         Ok(inputs)
     }
 
+    /// The identifiers of the inputs this spend consumes, of `notes` under
+    /// `keyset`, without verifying it again: whatever made it verified it,
+    /// its input notes and its owners' signatures ([`Self::sign`],
+    /// [`Self::from_parts`], [`Self::from_bytes`]), under the keyset its
+    /// proposal names, so this checks only that `keyset` is that one and
+    /// `notes` are of its inputs, in order.
+    pub fn inputs_of(&self, keyset: &Keyset, notes: &[Note]) -> Result<Vec<Point>, Error> {
+        let inputs = self.proposal.inputs();
+        if self.proposal.keyset_id() != keyset.id()
+            || notes.len() != inputs.len()
+            || notes
+                .iter()
+                .zip(inputs)
+                .any(|(note, m)| note.message() != m)
+        {
+            return Err(bad("signed proposal input witness context"));
+        }
+        inputs
+            .iter()
+            .map(crate::note::Message::identifier)
+            .collect()
+    }
+
     pub fn open_granted_output(
         &self,
         keyset: &Keyset,
