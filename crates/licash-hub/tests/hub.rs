@@ -1981,14 +1981,15 @@ fn a_hub_file_of_before_claims_showed_locks_gains_none_shown_when_opened() {
     assert_eq!(rows(&files.db, "shown_inputs"), 1);
 }
 
-/// A spend whose evidence no dispute could cite, here larger than
-/// [`licash_hub::MAX_EVIDENCE_BYTES`] though of no more notes or outputs
-/// than a proposal may have, is refused at release: none of its notes is
-/// retired, no unlock given, and they spend in a smaller spend after.
-/// Formerly released, its notes retired by a spend the hub could never show
-/// against a claim of one (the audit's oversized spend).
+/// The largest spend a proposal may be, of [`licash::spend::MAX_INPUTS`]
+/// notes to [`licash::spend::MAX_OUTPUTS`] outputs and granted, whose
+/// evidence whole is larger than [`licash_hub::MAX_EVIDENCE_BYTES`], is
+/// released: the hub cites it by its owners' signatures
+/// ([`licash::recovery::Evidence::Signed`]), which no proposal makes too
+/// large. Before evidence by signature it was refused as too large to cite
+/// and retired nothing.
 #[test]
-fn a_spend_too_large_to_cite_is_refused_and_retires_nothing() {
+fn the_largest_spend_is_released_and_cited_by_its_signatures() {
     use licash::recovery::{evidence_from_bytes, evidence_to_bytes, Evidence as Against};
     use licash::spend::{MAX_INPUTS, MAX_OUTPUTS};
     let files = files();
@@ -2012,29 +2013,27 @@ fn a_spend_too_large_to_cite_is_refused_and_retires_nothing() {
     }])
     .len();
     assert!(size > licash_hub::MAX_EVIDENCE_BYTES, "{size} bytes");
-    assert!(matches!(
-        hub.release(&signed, &notes),
-        Err(Error::Refused(Refusal::TooLarge))
-    ));
-    assert_eq!(hub.spent(&ys).unwrap(), vec![false; MAX_INPUTS]);
-    assert!(hub
-        .evidence(&claim_in([7; 32], &keyset, &[&inputs[0]]))
-        .unwrap()
-        .is_empty());
-
-    // As many notes, to fewer outputs: released, and cited under any Base.
-    let small = Spend::new(&keyset, &inputs, &[(bob.address(), 64); 2]);
-    small.complete(&hub, &keyset);
+    hub.release(&signed, &notes).unwrap();
     assert_eq!(hub.spent(&ys).unwrap(), vec![true; MAX_INPUTS]);
-    let found = hub
-        .evidence(&claim_in([7; 32], &keyset, &[&inputs[0]]))
-        .unwrap();
-    let [Against::Spend { notes, .. }] = &found[..] else {
+
+    let claim = claim_in([7; 32], &keyset, &[&inputs[0]]);
+    let found = hub.evidence(&claim).unwrap();
+    let [spend @ Against::Spend { notes, .. }] = &found[..] else {
         panic!("not the released spend alone");
     };
     assert_eq!(notes.len(), MAX_INPUTS);
+    let cited = licash::recovery::cite(&claim, spend.clone()).unwrap();
+    let bytes = evidence_to_bytes(std::slice::from_ref(&cited));
+    // Its body, hashed and never decoded but for the input relied on, and
+    // one signature.
+    assert!(
+        bytes.len() < licash::spend::MAX_BODY_BYTES + 200 && bytes.len() < size / 2,
+        "{} bytes",
+        bytes.len()
+    );
     let least = licash::base::MIN_AUTHORIZATIONS as usize;
-    assert!(evidence_from_bytes(&keyset, least, &evidence_to_bytes(&found)).is_ok());
+    let read = evidence_from_bytes(&keyset, least, &bytes).unwrap();
+    assert!(licash::recovery::voids_note(&keyset, inputs[0].note.message(), &read[0]).unwrap());
 }
 
 /// What the ledger holds against a claim and cannot read back is told to

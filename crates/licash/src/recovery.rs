@@ -11,7 +11,10 @@
 //! penalty mode.
 
 use crate::{
-    authorization::{Authorization, SignedProposal, Unlock},
+    authorization::{
+        granted_digest, plain_digest, Authorization, GrantHead, SignedProposal, Unlock,
+        GRANT_HEAD_BYTES,
+    },
     base::Base,
     chain::{Activation, ActivationRef, Chain, Checkpoint, Inclusion},
     claim::{self, ActivationRecord, Branch, Item, Source, UnsignedClaim, MAX_ITEMS},
@@ -21,7 +24,10 @@ use crate::{
     note::{Keyset, Message, Note, PUBLIC_FIELDS_BYTES},
     request::Request,
     source::Certificate,
-    spend::{Proposal, ProposalId, TimedTerms, TIMED_TERMS_BYTES},
+    spend::{
+        body_id, body_input, Proposal, ProposalId, TimedTerms, MAX_BODY_BYTES, MAX_INPUTS,
+        TIMED_TERMS_BYTES,
+    },
     Error,
 };
 use sha2::{Digest, Sha256};
@@ -64,6 +70,13 @@ pub const OWN_CLAIMS_FROM: u32 = 12;
 /// than selecting a rule: the Base of an earlier graph embeds a keyset of
 /// the format before, which this code no longer reads.
 pub const BOUND_BASE_FROM: u32 = 13;
+
+/// The first graph id whose hub cites a spend by its owners' signatures
+/// ([`Evidence::Signed`], [`cite`]) and whose grants anyone verifies
+/// ([`crate::authorization::Grant`]), and otherwise judged as
+/// [`BOUND_BASE_FROM`]'s. It names the change rather than selecting a rule,
+/// as that one does: this code reads no grant of the format before.
+pub const SIGNED_FROM: u32 = 14;
 
 /// Whether, in a contract of graph `id`, another claim of the same
 /// contract voids the notes it holds ([`OWN_CLAIMS_FROM`]).
@@ -656,6 +669,134 @@ pub enum Evidence {
     /// It voids nothing: a lock's Pay is owed only with an activation, so a
     /// claim with evidence of it is refused.
     Expired { source: ProposalId },
+    /// A spend by the word of the owners the Hub relies on, and nothing
+    /// else of it: the bytes its proposal commits to, hashed to its id and
+    /// otherwise unread, and the owner's signature of each input relied on,
+    /// by its index, in order. It voids what [`Evidence::Spend`] does, of
+    /// those inputs alone: whoever signed a spend of her note gave it up,
+    /// whatever else the spend took and made, so what it costs to read
+    /// does not grow with either. Shown to execute a Plain source it is
+    /// signed for by every input of it ([`void`]).
+    ///
+    /// Of a granted spend, with what its owners signed of the grant
+    /// ([`GrantHead`]) and the unlock, the secret of the key they signed:
+    /// each verified its every packet before she signed
+    /// ([`crate::authorization::Grant::verify`]), so the unlock published
+    /// is the payee's outputs released, and no packet is read.
+    Signed {
+        body: Vec<u8>,
+        signers: Vec<(u32, Signature)>,
+        grant: Option<(GrantHead, Unlock)>,
+    },
+}
+
+/// The id of the spend of `keyset` that commits to `body`, and the
+/// identifiers of the inputs `signers` show given up to it: each the
+/// signature, by the owner of the input at its index, of the spend, plain
+/// or with the grant of head `grant`, whose unlock is then its key's.
+fn signed_by(
+    keyset: &Keyset,
+    body: &[u8],
+    signers: &[(u32, Signature)],
+    grant: Option<&(GrantHead, Unlock)>,
+) -> Result<(ProposalId, BTreeSet<Point>), Error> {
+    let id = body_id(body);
+    let digest = match grant {
+        None => plain_digest(&id),
+        Some((head, unlock)) => {
+            head.verify_unlock(unlock)?;
+            granted_digest(&id, head)
+        }
+    };
+    if signers.is_empty() {
+        return Err(bad("a spend cited with no signature"));
+    }
+    if signers.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return Err(bad("a spend's signers out of order"));
+    }
+    let mut spent = BTreeSet::new();
+    for (index, sig) in signers {
+        let input = body_input(keyset.id(), body, *index)?;
+        crypto::schnorr_verify(input.owner(), &digest, sig)?;
+        spent.insert(input.identifier()?);
+    }
+    Ok((id, spent))
+}
+
+/// `evidence` as the Hub cites it against `claim`: an owner-signed spend by
+/// the signatures it relies on ([`Evidence::Signed`]), anything else as it
+/// is. The inputs relied on are those the claim speaks of: each that is an
+/// item of it, each of the spend if the claim names it as a Plain source,
+/// which it then executes whole, and, of each other source the spend shares
+/// an input with, one, which voids its outputs as well as all would. A
+/// spend that touches nothing of the claim keeps one signature, and voids
+/// nothing, as it did.
+///
+/// What it cites so costs the statement what the claim names, whatever the
+/// spend took and made: it decides on it exactly as on the spend whole.
+pub fn cite(claim: &UnsignedClaim, evidence: Evidence) -> Result<Evidence, Error> {
+    let Evidence::Spend {
+        signed,
+        notes: _,
+        unlock,
+    } = evidence
+    else {
+        return Ok(evidence);
+    };
+    let parts = claim.parts();
+    let mut items = BTreeSet::new();
+    for item in &parts.items {
+        items.insert(item.message().identifier()?);
+    }
+    let proposal = signed.proposal();
+    let id = proposal.id();
+    let inputs = (proposal.inputs().iter())
+        .map(Message::identifier)
+        .collect::<Result<Vec<_>, _>>()?;
+    let whole = (parts.sources.iter())
+        .any(|s| matches!(s, Source::Plain { id: source, .. } if *source == id));
+    let mut relied: BTreeSet<usize> = (0..inputs.len())
+        .filter(|&i| whole || items.contains(&inputs[i]))
+        .collect();
+    for source in parts.sources.iter().filter(|s| s.id() != id) {
+        let shared = |i: &usize| source.inputs().contains(&inputs[*i]);
+        if !relied.iter().any(shared) {
+            relied.extend((0..inputs.len()).find(shared));
+        }
+    }
+    if relied.is_empty() {
+        relied.insert(0);
+    }
+    by_signature(&signed, unlock, &relied)
+}
+
+/// The owner-signed spend `signed`, with its `unlock` if granted, cited by
+/// the signatures of its inputs at `relied` ([`Evidence::Signed`]).
+pub fn by_signature(
+    signed: &SignedProposal,
+    unlock: Option<Unlock>,
+    relied: &BTreeSet<usize>,
+) -> Result<Evidence, Error> {
+    let grant = match (signed.authorization(), unlock) {
+        (Authorization::Plain, None) => None,
+        (Authorization::Granted(grant), Some(unlock)) => Some((grant.head()?, unlock)),
+        _ => return Err(bad("a granted spend is cited with its unlock")),
+    };
+    let signers = relied
+        .iter()
+        .map(|&i| {
+            let sig = signed
+                .signatures()
+                .get(i)
+                .ok_or_else(|| bad("a spend cited by an input it has not"))?;
+            Ok((u32::try_from(i).map_err(|_| bad("input index"))?, *sig))
+        })
+        .collect::<Result<_, Error>>()?;
+    Ok(Evidence::Signed {
+        body: signed.proposal().commitment_bytes(),
+        signers,
+        grant,
+    })
 }
 
 /// Most evidence a statement's input carries: one per item it voids, and
@@ -702,14 +843,36 @@ pub fn evidence_to_bytes(evidence: &[Evidence]) -> Vec<u8> {
                 bytes.push(3);
                 bytes.extend(source.as_bytes());
             }
+            Evidence::Signed {
+                body,
+                signers,
+                grant,
+            } => {
+                bytes.push(4);
+                put_blob(&mut bytes, body);
+                put_count(&mut bytes, signers.len());
+                for (index, sig) in signers {
+                    bytes.extend(index.to_be_bytes());
+                    bytes.extend(sig.0);
+                }
+                match grant {
+                    None => bytes.push(0),
+                    Some((head, unlock)) => {
+                        bytes.push(1);
+                        bytes.extend(head.to_bytes());
+                        bytes.extend(unlock);
+                    }
+                }
+            }
         }
     }
     bytes
 }
 
 /// Strict canonical decoding of [`evidence_to_bytes`]: every note verified
-/// under `keyset`, every signed spend against its notes. Whether the
-/// evidence voids anything is [`owed`]'s to decide.
+/// under `keyset`, every signed spend against its notes; of a spend cited
+/// by its signatures ([`Evidence::Signed`]) nothing is, here. Whether the
+/// evidence verifies and voids anything is [`owed`]'s to decide.
 pub fn evidence_from_bytes(
     keyset: &Keyset,
     limit: usize,
@@ -749,6 +912,28 @@ pub fn evidence_from_bytes(
             3 => Evidence::Expired {
                 source: ProposalId::from_bytes(r.array()?),
             },
+            4 => {
+                let body = r.blob()?;
+                if body.len() > MAX_BODY_BYTES {
+                    return Err(bad("evidence spend body too long"));
+                }
+                let signers = (0..r.count(MAX_INPUTS)?)
+                    .map(|_| Ok((r.u32()?, Signature(r.array()?))))
+                    .collect::<Result<Vec<_>, Error>>()?;
+                let grant = match r.byte()? {
+                    0 => None,
+                    1 => Some((
+                        GrantHead::from_bytes(&r.array::<GRANT_HEAD_BYTES>()?),
+                        r.array()?,
+                    )),
+                    _ => return Err(bad("evidence grant tag")),
+                };
+                Evidence::Signed {
+                    body: body.to_vec(),
+                    signers,
+                    grant,
+                }
+            }
             _ => return Err(bad("evidence tag")),
         });
     }
@@ -761,22 +946,31 @@ pub fn evidence_from_bytes(
 /// The secrets the Hub publishes with its response: the unlock of every
 /// granted spend it cites and every Pay preimage, one slot per source in
 /// source-id order, zero padded. Its statement holds only if its response
-/// disclosed these exact bytes (when any slot is set).
+/// disclosed these exact bytes (when any slot is set). A source has one
+/// slot: two secrets cited of one are an error, so that none is cited and
+/// kept unpublished.
 pub fn disclosures(evidence: &[Evidence]) -> Result<Disclosures, Error> {
     let mut by_source = BTreeMap::new();
     for e in evidence {
-        match e {
+        let (source, secret) = match e {
             Evidence::Spend {
                 signed,
                 unlock: Some(unlock),
                 ..
-            } => {
-                by_source.insert(signed.proposal().id(), *unlock);
-            }
-            Evidence::PayPreimage { source, preimage } => {
-                by_source.insert(*source, *preimage);
-            }
-            _ => {}
+            } => (signed.proposal().id(), *unlock),
+            Evidence::Signed {
+                body,
+                grant: Some((_, unlock)),
+                ..
+            } => (body_id(body), *unlock),
+            Evidence::PayPreimage { source, preimage } => (*source, *preimage),
+            _ => continue,
+        };
+        if by_source
+            .insert(source, secret)
+            .is_some_and(|other| other != secret)
+        {
+            return Err(bad("two secrets disclosed of one source"));
         }
     }
     if by_source.len() > SLOTS {
@@ -835,6 +1029,13 @@ pub fn voids_note(keyset: &Keyset, note: &Message, evidence: &Evidence) -> Resul
             notes,
             unlock,
         } => Ok(spent_by(keyset, signed, notes, unlock.as_ref())?.contains(&note.identifier()?)),
+        Evidence::Signed {
+            body,
+            signers,
+            grant,
+        } => Ok(signed_by(keyset, body, signers, grant.as_ref())?
+            .1
+            .contains(&note.identifier()?)),
         Evidence::SecondClaim { context, record } => {
             verify_second_claim(context, record)?;
             Ok(&record.message == note)
@@ -867,14 +1068,30 @@ fn void(
         let before = mask;
         let mut values_fallback = false;
         match e {
-            Evidence::Spend {
-                signed,
-                notes,
-                unlock,
-            } => {
-                let spent = spent_by(keyset, signed, notes, unlock.as_ref())?;
-                let id = signed.proposal().id();
-                values_fallback = matches!(sources.get(&id), Some(Source::Plain { .. }));
+            Evidence::Spend { .. } | Evidence::Signed { .. } => {
+                let (id, spent) = match e {
+                    Evidence::Spend {
+                        signed,
+                        notes,
+                        unlock,
+                    } => (
+                        signed.proposal().id(),
+                        spent_by(keyset, signed, notes, unlock.as_ref())?,
+                    ),
+                    Evidence::Signed {
+                        body,
+                        signers,
+                        grant,
+                    } => signed_by(keyset, body, signers, grant.as_ref())?,
+                    _ => unreachable!("a spend, matched above"),
+                };
+                if let Some(source @ Source::Plain { .. }) = sources.get(&id) {
+                    // Its fallbacks are owed for its inputs, every one.
+                    if !source.inputs().iter().all(|y| spent.contains(y)) {
+                        return Err(bad("a source executed by a part of its inputs"));
+                    }
+                    values_fallback = true;
+                }
                 executed.insert(id);
                 for (i, item) in items.iter().enumerate() {
                     let own = spent.contains(&item.message().identifier()?);

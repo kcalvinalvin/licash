@@ -5,10 +5,12 @@
 //! ([`licash::recovery::evidence_from_bytes`]) under its Base's limits, and
 //! a spend it cannot read is no evidence. The hub would then answer nothing,
 //! and her timeout pay her for a note already spent. So nothing is retired
-//! but by a [`Citable`]: the spend as its evidence would be, encoded and read
-//! back under limits every contract's statement admits, and no larger than
-//! [`MAX_EVIDENCE_BYTES`]. The same knowledge finds the spends a ledger of an
-//! earlier release retired that cannot be cited ([`uncitable`]).
+//! but by a [`Citable`]: the spend as the hub cites it, by its owners'
+//! signatures ([`licash::recovery::Evidence::Signed`]), every one of them,
+//! encoded, read back under limits every contract's statement admits, no
+//! larger than [`MAX_EVIDENCE_BYTES`], and verified as the statement does.
+//! The same knowledge finds the spends a ledger of an earlier release
+//! retired that cannot be cited ([`uncitable`]).
 
 use std::path::Path;
 
@@ -16,7 +18,9 @@ use licash::{
     authorization::{SignedProposal, Unlock},
     crypto::Point,
     note::{Keyset, Note},
-    recovery::{evidence_from_bytes, evidence_to_bytes, Evidence, MAX_PUBLICATION_BYTES},
+    recovery::{
+        by_signature, evidence_from_bytes, evidence_to_bytes, voids_note, MAX_PUBLICATION_BYTES,
+    },
     spend::MAX_INPUTS,
 };
 use licash_store::Kind;
@@ -46,19 +50,23 @@ impl<'a> Citable<'a> {
         notes: &'a [Note],
         unlock: Option<Unlock>,
     ) -> Result<Self, Error> {
-        if notes.len() > MAX_INPUTS {
+        let inputs = signed.proposal().inputs();
+        if notes.len() > MAX_INPUTS || inputs.len() > MAX_INPUTS {
             return Err(Refusal::TooLarge.into());
         }
-        let evidence = Evidence::Spend {
-            signed: signed.clone(),
-            notes: notes.to_vec(),
-            unlock,
-        };
+        let evidence = by_signature(signed, unlock, &(0..inputs.len()).collect())?;
         let bytes = evidence_to_bytes(std::slice::from_ref(&evidence));
         if bytes.len() > MAX_EVIDENCE_BYTES {
             return Err(Refusal::TooLarge.into());
         }
-        evidence_from_bytes(keyset, MAX_INPUTS, &bytes)?;
+        let [read] = <[_; 1]>::try_from(evidence_from_bytes(keyset, MAX_INPUTS, &bytes)?)
+            .map_err(|_| Error::Invalid(licash::Error::Protocol("one spend cited".into())))?;
+        // As a statement would: every signature, and the unlock of a grant.
+        if !voids_note(keyset, &inputs[0], &read)? {
+            return Err(Error::Invalid(licash::Error::Protocol(
+                "a spend cited does not void its input".into(),
+            )));
+        }
         let ys = signed
             .proposal()
             .inputs()

@@ -3240,3 +3240,243 @@ fn the_largest_spend_a_proposal_may_be_is_evidence_under_every_base() {
     assert!(refund.is_err());
     assert!(TimedLock::new(terms(), to(MAX_OUTPUTS)).is_ok());
 }
+
+/// A spend cited by the signatures of the inputs a claim relies on decides
+/// exactly as the spend whole, and costs what the claim names: the Hub's
+/// way to cite ([`recovery::cite`]).
+#[test]
+fn a_spend_cited_by_its_signatures_decides_as_the_spend_whole() {
+    let o = open();
+    let keyset = o.base.parts().keyset.clone();
+    let hold = hold();
+    // Alice paid Bob 4 of her two notes, keeping a change of 4; her third
+    // note she spent with a stranger's 15 others, the Hub says.
+    let a: Vec<_> = (0..3).map(|i| derive(SPEND, &hold, 4, 23, i)).collect();
+    let notes: Vec<_> = a.iter().map(|d| mint(&o.issuer, &keyset, d)).collect();
+    let change = derive(SPEND, &hold, 4, 71, 0);
+    let paid = spend(
+        &o,
+        &notes[..2],
+        &[owner(SPEND, 23, 0), owner(SPEND, 23, 1)],
+        vec![bob(4, 0), Output::from_derivation(&change).unwrap()],
+    );
+    let id = paid.proposal().id();
+    let strangers: Vec<_> = (0..15).map(|i| derive(SPEND, &hold, 4, 37, i)).collect();
+    let mut mixed_notes: Vec<_> = strangers
+        .iter()
+        .map(|d| mint(&o.issuer, &keyset, d))
+        .collect();
+    mixed_notes.insert(9, notes[2].clone());
+    let mut owners: Vec<_> = (0..15).map(|i| owner(SPEND, 37, i)).collect();
+    owners.insert(9, owner(SPEND, 23, 2));
+    let mixed = spend(
+        &o,
+        &mixed_notes,
+        &owners,
+        (0..16).map(|i| bob(4, 10 + i)).collect(),
+    );
+    let items = vec![
+        Item::Settled(a[0].message().clone()),
+        Item::Settled(a[1].message().clone()),
+        Item::Settled(a[2].message().clone()),
+        Item::Pending {
+            message: change.message().clone(),
+            source: id,
+            branch: Branch::Pay,
+            index: 1,
+            blinding: *change.blinding(),
+            preimage: None,
+        },
+    ];
+    let sources = vec![Source::Plain {
+        id,
+        inputs: notes[..2]
+            .iter()
+            .map(|n| n.message().identifier().unwrap())
+            .collect(),
+    }];
+    let held: Vec<_> = a.iter().cloned().chain([change.clone()]).collect();
+    let unsigned = claim(&o, items, sources, vec![], &held, 12);
+    let p = Publication::sign(unsigned.clone(), &hold_keys(&held), LIMIT).unwrap();
+    let request = Request {
+        amount: 12,
+        claim_digest: *p.claim().digest(),
+    };
+    let witness = Witness {
+        notes: notes.clone(),
+        sources: vec![SourceWitness::Signed {
+            signed: paid.clone(),
+            notes: notes[..2].to_vec(),
+        }],
+        activations: vec![],
+        funded: vec![],
+    };
+    let owed = |e: &[Evidence]| decide(&o, &request, &p, &witness, e, None);
+    let whole = |signed: &SignedProposal, notes: &[Note]| Evidence::Spend {
+        signed: signed.clone(),
+        notes: notes.to_vec(),
+        unlock: None,
+    };
+    let relied = |e: &Evidence| match e {
+        Evidence::Signed { signers, grant, .. } => {
+            assert!(grant.is_none());
+            signers.iter().map(|(i, _)| *i).collect::<Vec<_>>()
+        }
+        _ => panic!("cited by its signatures"),
+    };
+
+    // The mixed spend: the one input of Alice's, whatever else it took.
+    let spent = whole(&mixed, &mixed_notes);
+    let cited = recovery::cite(&unsigned, spent.clone()).unwrap();
+    assert_eq!(relied(&cited), [9]);
+    let (by_whole, by_sig) = (
+        owed(std::slice::from_ref(&spent)).unwrap(),
+        owed(std::slice::from_ref(&cited)).unwrap(),
+    );
+    assert_eq!((by_sig.mask, by_sig.owed), (0b0100, 8));
+    assert_eq!((by_whole.mask, by_whole.owed), (by_sig.mask, by_sig.owed));
+    let bytes = evidence_to_bytes(std::slice::from_ref(&cited));
+    assert!(bytes.len() * 3 < evidence_to_bytes(std::slice::from_ref(&spent)).len());
+    let read = evidence_from_bytes(&keyset, LIMIT, &bytes).unwrap();
+    assert_eq!(evidence_to_bytes(&read), bytes);
+    assert_eq!(owed(&read).unwrap().mask, 0b0100);
+
+    // Her own payment, a Plain source she names: executed whole, so every
+    // input of it is relied on, and its change is owed by fallback.
+    let executed = recovery::cite(&unsigned, whole(&paid, &notes[..2])).unwrap();
+    assert_eq!(relied(&executed), [0, 1]);
+    let c = owed(std::slice::from_ref(&executed)).unwrap();
+    assert_eq!((c.mask, c.owed), {
+        let w = owed(&[whole(&paid, &notes[..2])]).unwrap();
+        (w.mask, w.owed)
+    });
+    assert_eq!(c.mask, 0b0011);
+    // By a part of its inputs it executes nothing: refused.
+    let part = recovery::by_signature(&paid, None, &[0].into()).unwrap();
+    assert!(owed(&[part]).is_err());
+
+    // A spend of nothing she names keeps one signature, and voids nothing.
+    let elsewhere = spend(&o, &mixed_notes[..1], &owners[..1], vec![bob(4, 40)]);
+    let unrelated = recovery::cite(&unsigned, whole(&elsewhere, &mixed_notes[..1])).unwrap();
+    assert_eq!(relied(&unrelated), [0]);
+    assert!(owed(&[unrelated]).is_err());
+
+    // Evidence the statement refuses, however it is framed.
+    let Evidence::Signed { body, signers, .. } = &cited else {
+        unreachable!()
+    };
+    let refused = |body: Vec<u8>, signers: Vec<(u32, crypto::Signature)>, grant| {
+        owed(&[Evidence::Signed {
+            body,
+            signers,
+            grant,
+        }])
+    };
+    // No signature, a signature moved to another input, or signers out of
+    // order or repeated.
+    assert!(refused(body.clone(), vec![], None).is_err());
+    assert!(refused(body.clone(), vec![(8, signers[0].1)], None).is_err());
+    let two = recovery::by_signature(&mixed, None, &[3, 9].into()).unwrap();
+    let Evidence::Signed { signers: both, .. } = &two else {
+        unreachable!()
+    };
+    assert_eq!(owed(std::slice::from_ref(&two)).unwrap().mask, 0b0100);
+    assert!(refused(body.clone(), vec![both[1], both[0]], None).is_err());
+    assert!(refused(body.clone(), vec![both[1], both[1]], None).is_err());
+    // An input index the body has not.
+    assert!(refused(body.clone(), vec![(16, signers[0].1)], None).is_err());
+    // A body changed anywhere is another spend, which she did not sign;
+    // one of another keyset or framing is not read.
+    for at in [0, 20, body.len() / 2, body.len() - 1] {
+        let mut changed = body.clone();
+        changed[at] ^= 1;
+        assert!(
+            refused(changed, signers.clone(), None).is_err(),
+            "byte {at}"
+        );
+    }
+    let mut long = body.clone();
+    long.resize(licash::spend::MAX_BODY_BYTES + 1, 0);
+    assert!(refused(long, signers.clone(), None).is_err());
+    // A plain spend cited with an unlock is a granted one she never signed.
+    let head = licash::authorization::GrantHead {
+        unlock_key: point(5),
+        rest: [0; 32],
+    };
+    let five = crypto::ScalarBytes::from_scalar(&Scalar::from(5u64)).0;
+    assert!(refused(body.clone(), signers.clone(), Some((head, five))).is_err());
+    assert!(recovery::by_signature(&mixed, Some(five), &[9].into()).is_err());
+}
+
+/// A granted spend cited by its signatures voids under its released unlock
+/// alone, and discloses it: one equation, whatever its packets.
+#[test]
+fn a_granted_spend_cited_by_its_signatures_voids_only_with_its_unlock() {
+    let w = withheld();
+    let keyset = w.o.base.parts().keyset.clone();
+    let owed = |e: &[Evidence]| decide(&w.o, &w.request, &w.publication, &w.witness, e, None);
+    let spend = |unlock| Evidence::Spend {
+        signed: w.signed.clone(),
+        notes: vec![w.note.clone()],
+        unlock,
+    };
+    let cited = recovery::cite(w.publication.claim(), spend(Some(w.unlock))).unwrap();
+    let Evidence::Signed {
+        body,
+        signers,
+        grant: Some((head, unlock)),
+    } = &cited
+    else {
+        panic!("cited by its signatures, with its grant");
+    };
+    assert_eq!(*unlock, w.unlock);
+    let c = owed(std::slice::from_ref(&cited)).unwrap();
+    assert_eq!((c.mask, c.owed), (1, 78));
+    let posted = disclosures(std::slice::from_ref(&cited)).unwrap();
+    assert_eq!(posted, disclosures(&[spend(Some(w.unlock))]).unwrap());
+    assert_eq!(c.disclosures, posted);
+    let bytes = evidence_to_bytes(std::slice::from_ref(&cited));
+    assert_eq!(
+        evidence_to_bytes(&evidence_from_bytes(&keyset, LIMIT, &bytes).unwrap()),
+        bytes
+    );
+    // Without its unlock it is no evidence, nor with another, nor as plain.
+    assert!(recovery::cite(w.publication.claim(), spend(None)).is_err());
+    let with = |grant| {
+        owed(&[Evidence::Signed {
+            body: body.clone(),
+            signers: signers.clone(),
+            grant,
+        }])
+    };
+    assert!(with(None).is_err());
+    let other = crypto::ScalarBytes::from_scalar(&Scalar::from(5u64)).0;
+    assert!(with(Some((*head, other))).is_err());
+    assert!(with(Some((*head, [0; 32]))).is_err());
+    // Nor under another head: what the owners signed is the grant's.
+    let mut forged = *head;
+    forged.rest[0] ^= 1;
+    assert!(with(Some((forged, *unlock))).is_err());
+    let rekeyed = licash::authorization::GrantHead {
+        unlock_key: point(5),
+        rest: head.rest,
+    };
+    assert!(with(Some((rekeyed, other))).is_err());
+    // Two unlocks cited of one spend: refused, so that none is kept back.
+    let twice = [
+        cited.clone(),
+        Evidence::Signed {
+            body: body.clone(),
+            signers: signers.clone(),
+            grant: Some((*head, other)),
+        },
+    ];
+    assert!(disclosures(&twice).is_err());
+    assert!(disclosures(&[cited.clone(), cited.clone()]).is_ok());
+    // Nor with a preimage of the same source.
+    let preimage = Evidence::PayPreimage {
+        source: w.signed.proposal().id(),
+        preimage: [5; 32],
+    };
+    assert!(disclosures(&[cited, preimage]).is_err());
+}

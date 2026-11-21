@@ -925,10 +925,22 @@ impl Openings {
         }
         let named = recovery::named(&o.base, filed).map_err(|e| anyhow!("{e}"))?;
         let found = ledger(named.claim(), published_at)?;
-        let mut selected = cited(found.evidence, &none, owed, |evidence| {
+        // Each spend by the signatures her claim makes it rely on, so that
+        // its proof costs what she names, not what the spend took and made.
+        let mut unread = found.unread;
+        let candidates = (found.evidence.into_iter())
+            .filter_map(|e| match recovery::cite(named.claim(), e) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    unread.push(format!("a spend not cited by its signatures: {e}"));
+                    None
+                }
+            })
+            .collect();
+        let mut selected = cited(candidates, &none, owed, |evidence| {
             pinned_evidence(o, &recovery::evidence_to_bytes(evidence))
         });
-        selected.uncited.splice(0..0, found.unread);
+        selected.uncited.splice(0..0, unread);
         Ok(selected)
     }
 

@@ -29,6 +29,19 @@ pub const MAX_INPUTS: usize = 64;
 pub const MAX_OUTPUTS: usize = 128;
 pub const TIMED_TERMS_BYTES: usize = 1 + 32 + 4 + 4 + 32;
 
+/// A proposal's commitment bytes before its inputs' count: its tag, keyset
+/// and ephemeral key.
+const BODY_HEAD_BYTES: usize = TAG.len() + 32 + 33;
+
+/// The most bytes a proposal commits to ([`Proposal::commitment_bytes`]): a
+/// lock of [`MAX_INPUTS`] notes with [`MAX_OUTPUTS`] outputs on each branch.
+pub const MAX_BODY_BYTES: usize = BODY_HEAD_BYTES
+    + 4
+    + MAX_INPUTS * MESSAGE_BYTES
+    + 2 * (4 + MAX_OUTPUTS * OUTPUT_BYTES)
+    + 1
+    + TIMED_TERMS_BYTES;
+
 fn bad(reason: &str) -> Error {
     Error::Protocol(reason.into())
 }
@@ -511,10 +524,7 @@ impl Proposal {
     }
 
     pub fn id(&self) -> ProposalId {
-        ProposalId(tagged_hash(
-            "licash/source-proposal/v2",
-            &[&self.commitment_bytes()],
-        ))
+        body_id(&self.commitment_bytes())
     }
 
     /// Structural decoding only. A valid body can still have no valid issuer
@@ -574,6 +584,48 @@ fn bounded<T>(items: &[T], most: usize) -> Result<u32, Error> {
         return Err(bad("more inputs or outputs than a proposal may have"));
     }
     count(items)
+}
+
+/// The id of the proposal that commits to `body`
+/// ([`Proposal::commitment_bytes`]), with nothing of it read. Whoever signed
+/// the id knows what the bytes say; whoever only cites her signature need
+/// not ([`body_input`]).
+pub fn body_id(body: &[u8]) -> ProposalId {
+    ProposalId(tagged_hash("licash/source-proposal/v2", &[body]))
+}
+
+/// Input `index` of the proposal of `keyset` that commits to `body`, read
+/// where it lies: nothing else of the body is decoded, so reading it costs
+/// the same whatever the proposal spends and makes. The body is one a
+/// proposal may have as far as it is read: its tag, its keyset, from one
+/// to [`MAX_INPUTS`] inputs, no more than [`MAX_BODY_BYTES`]. Whether the
+/// rest of it is a proposal is for whoever signed its id to have known.
+pub fn body_input(keyset: &[u8; 32], body: &[u8], index: u32) -> Result<Message, Error> {
+    if body.len() > MAX_BODY_BYTES {
+        return Err(bad("proposal body too long"));
+    }
+    let head = body
+        .get(..BODY_HEAD_BYTES + 4)
+        .ok_or_else(|| bad("truncated proposal body"))?;
+    if &head[..TAG.len()] != TAG {
+        return Err(bad("proposal tag"));
+    }
+    if &head[TAG.len()..TAG.len() + 32] != keyset {
+        return Err(bad("proposal keyset"));
+    }
+    let inputs = u32::from_be_bytes(head[BODY_HEAD_BYTES..].try_into().expect("four bytes"));
+    if inputs == 0 || inputs as usize > MAX_INPUTS {
+        return Err(bad("proposal body input count"));
+    }
+    if index >= inputs {
+        return Err(bad("proposal body input index"));
+    }
+    // Bounded by MAX_INPUTS, so nothing here overflows.
+    let at = BODY_HEAD_BYTES + 4 + index as usize * MESSAGE_BYTES;
+    let bytes = body
+        .get(at..at + MESSAGE_BYTES)
+        .ok_or_else(|| bad("truncated proposal body"))?;
+    Message::from_bytes(bytes)
 }
 
 /// The commitment a Base makes to the outputs its holder funds, in
