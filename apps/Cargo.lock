@@ -3670,6 +3670,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-observatory"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "licash",
+ "licash-api",
+ "licash-nostr",
+ "licash-tor",
+ "licash-transport",
+ "licash-wallet",
+ "rand_core 0.6.4",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tower",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "webpki-roots 1.0.12",
+]
+
+[[package]]
 name = "licash-onchain"
 version = "0.0.1"
 dependencies = [
