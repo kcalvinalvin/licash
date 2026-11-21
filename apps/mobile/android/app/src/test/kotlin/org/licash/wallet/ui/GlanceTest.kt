@@ -97,7 +97,7 @@ class GlanceTest {
     }
 
     @Test
-    fun a_payment_comes_before_protection_then_a_problem_then_catching_up() {
+    fun a_payment_comes_before_protection_then_a_problem() {
         val all = Ui(
             history = listOf(line(Kind.SENT)), opening = "https://hub.example", problem = "No hub answered",
             hubs = listOf(hub()),
@@ -109,9 +109,9 @@ class GlanceTest {
         val behind = opening.copy(opening = null)
         assertEquals(Glance.Behind("No hub answered"), glance(behind, now))
         assertEquals("Not up to date", glance(behind, now)?.text)
+        // Catching up is the connections' to say, not this line's.
         val syncing = behind.copy(problem = null)
-        assertEquals(Glance.Syncing, glance(syncing, now))
-        assertEquals("Catching up", glance(syncing, now)?.text)
+        assertNull(glance(syncing, now))
         assertNull(glance(syncing.copy(chain = synced), now))
     }
 }

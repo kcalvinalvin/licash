@@ -67,6 +67,71 @@ class SyncTest {
     }
 
     @Test
+    fun downloaded_the_pinned_headers_are_prepared_for_a_time_untold() {
+        val stage = stages(Ui(chain = ChainStatus(importing = 100), hubs = listOf(hub()))).first()
+        assertEquals(PREPARING, stage.detail)
+        assertNull(stage.fraction)
+        assertTrue(stage.timed)
+        assertFalse(stages(Ui(chain = ChainStatus(importing = 99))).first().timed)
+    }
+
+    @Test
+    fun the_step_under_way_is_said_plainly_and_in_full_in_advanced_mode() {
+        val ui = Ui(chain = ChainStatus(peers = 1, headers = 400, peerHeight = 800), hubs = listOf(hub()))
+        val step = stages(ui)[1]
+        assertEquals("Catching up with Bitcoin (50%)", said(step, developer = false))
+        assertEquals("Block headers: Block 400 of 800 (50%)", said(step, developer = true))
+        val importing = stages(Ui(chain = ChainStatus(importing = 42))).first()
+        assertEquals("Downloading block headers (42%)", said(importing, developer = false))
+        val nodes = stages(Ui(chain = ChainStatus())).first()
+        assertEquals("Looking for Bitcoin nodes", said(nodes, developer = false))
+        val hub = stages(Ui(chain = caughtUp, hubs = listOf(hub()), scan = scan(800u, 896u, 895u))).last()
+        assertEquals("Waiting for your hub to catch up", said(hub, developer = false))
+    }
+
+    @Test
+    fun the_connections_are_tor_if_on_then_bitcoin() {
+        val hubs = listOf(hub())
+        val done = scan(800u, 901u, 900u)
+        assertEquals(listOf(Link("Bitcoin", Reach.UP, "Up to date")), links(Ui(chain = caughtUp, hubs = hubs, scan = done)))
+        assertEquals(
+            Link("Bitcoin", Reach.UP, "Up to date, block 900, 2 nodes"),
+            links(Ui(chain = caughtUp, hubs = hubs, scan = done, developer = true)).single(),
+        )
+        // No hub yet: payments are not looked for, and Bitcoin is not behind.
+        assertEquals(Reach.UP, links(Ui(chain = caughtUp)).single().reach)
+        assertEquals(Link("Bitcoin", Reach.GOING, "Looking for Bitcoin nodes"), links(Ui(hubs = hubs)).single())
+
+        val ready = TorStatus(percent = 100u.toUByte(), ready = true, summary = "done", blocked = null)
+        val stuck = TorStatus(percent = 10u.toUByte(), ready = false, summary = "connecting", blocked = "clock skew")
+        val starting = TorStatus(percent = 30u.toUByte(), ready = false, summary = "connecting", blocked = null)
+        val tor = Ui(tor = true, chain = caughtUp, hubs = hubs, scan = done)
+        assertEquals(listOf(Reach.UP, Reach.UP), links(tor.copy(torStatus = ready)).map { it.reach })
+        assertEquals(Link("Tor", Reach.DOWN, "Stuck: clock skew"), links(tor.copy(torStatus = stuck)).first())
+        assertEquals(Link("Tor", Reach.GOING, "Connecting (30%)"), links(tor.copy(torStatus = starting)).first())
+        assertEquals("Waiting for Tor", links(tor.copy(torStatus = starting)).last().detail)
+        assertEquals(Reach.DOWN, links(tor.copy(torStatus = stuck)).maxOf { it.reach })
+    }
+
+    @Test
+    fun turning_tor_off_is_offered_once_it_keeps_the_app_from_bitcoin() {
+        val ready = TorStatus(percent = 100u.toUByte(), ready = true, summary = "done", blocked = null)
+        val stuck = TorStatus(percent = 10u.toUByte(), ready = false, summary = "connecting", blocked = "clock skew")
+        val tor = Ui(tor = true, torStatus = ready, chain = caughtUp)
+        assertFalse(torInTheWay(tor))
+        assertFalse(offerTorOff(tor, null))
+        // Connected to Tor, but no Bitcoin node through it: after a while.
+        val noNodes = tor.copy(chain = ChainStatus())
+        assertTrue(torInTheWay(noNodes))
+        assertFalse(offerTorOff(noNodes, TOR_PATIENCE_MS - 1))
+        assertTrue(offerTorOff(noNodes, TOR_PATIENCE_MS))
+        // Stuck by its own word: at once.
+        assertTrue(offerTorOff(tor.copy(torStatus = stuck), null))
+        // Off, nothing to offer.
+        assertFalse(offerTorOff(noNodes.copy(tor = false), TOR_PATIENCE_MS))
+    }
+
+    @Test
     fun no_peer_height_no_fraction() {
         val ui = Ui(chain = ChainStatus(peers = 1, headers = 400), hubs = listOf(hub()))
         val headers = stages(ui)[1]

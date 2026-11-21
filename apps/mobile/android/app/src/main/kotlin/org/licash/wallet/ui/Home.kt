@@ -102,6 +102,7 @@ fun Home(
             Wordmark()
             Spacer(Modifier.width(10.dp))
             NetworkChip(ui.network)
+            Connections(engine, ui)
             Spacer(Modifier.weight(1f))
             IconButton(onClick = settings) { Icon(Icons.Default.Settings, contentDescription = "Settings") }
         }
@@ -118,7 +119,7 @@ fun Home(
                     ChooseHub(engine, ui)
                 } else {
                     Total(ui) { money(null) }
-                    Going(engine, ui, money, history, open)
+                    Going(ui, money, history, open)
                     Offer(engine, ui)
                     Waiting(ui, money)
                     Unprotected(engine, ui, money)
@@ -129,7 +130,7 @@ fun Home(
                             Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
                                 .background(MaterialTheme.colorScheme.surfaceContainer).padding(horizontal = 16.dp, vertical = 8.dp),
                         ) {
-                            SyncStages(engine, ui)
+                            CatchingUp(engine, ui)
                             Text(
                                 "You can leave the app: it keeps catching up, its progress in a notification.",
                                 modifier = Modifier.padding(bottom = 8.dp),
@@ -212,10 +213,9 @@ private fun Total(ui: Ui, open: () -> Unit) {
 
 /** What is going on, in a line: see [glance]. */
 @Composable
-private fun Going(engine: Engine, ui: Ui, money: (String?) -> Unit, history: () -> Unit, open: (Activity) -> Unit) {
+private fun Going(ui: Ui, money: (String?) -> Unit, history: () -> Unit, open: (Activity) -> Unit) {
     val going = glance(ui, System.currentTimeMillis() / 1000) ?: return
     var why by remember { mutableStateOf<String?>(null) }
-    var steps by remember { mutableStateOf(false) }
     Spacer(Modifier.height(8.dp))
     Pill(
         icon = Icons.Default.Warning,
@@ -227,11 +227,9 @@ private fun Going(engine: Engine, ui: Ui, money: (String?) -> Unit, history: () 
             is Glance.Many -> history
             is Glance.Protecting -> ({ money(going.hub) })
             is Glance.Behind -> ({ why = going.reason })
-            Glance.Syncing -> ({ steps = true })
         },
     )
     why?.let { Sheet("Not up to date", dismiss = { why = null }) { Say(it) } }
-    if (steps) Sheet("Catching up", dismiss = { steps = false }) { SyncStages(engine, ui) }
 }
 
 /**

@@ -253,6 +253,11 @@ class WatchJob : JobService() {
         return true
     }
 
+    /** Another network while looking: the round goes on over it, a sync started now rather than later. */
+    override fun onNetworkChanged(params: JobParameters) {
+        (application as LicashApp).engine.poke()
+    }
+
     companion object {
         private const val ID = 1
         private const val PERIOD_MS = 15 * 60 * 1000L
@@ -298,6 +303,11 @@ class ScanJob : JobService() {
     override fun onStopJob(params: JobParameters): Boolean {
         looking?.cancel()
         return true
+    }
+
+    /** As [WatchJob.onNetworkChanged]. */
+    override fun onNetworkChanged(params: JobParameters) {
+        (application as LicashApp).engine.poke()
     }
 
     companion object {

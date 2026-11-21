@@ -12,8 +12,8 @@ import org.licash.wallet.unpaid
 /**
  * What Home says is going on, in one line at most, and what a tap on it
  * opens: a payment under way before anything else, then protection being
- * set up, then what keeps the app from being up to date. Nothing going
- * on, nothing said.
+ * set up, then what kept the last sync short. Nothing going on, nothing
+ * said; catching up with Bitcoin is said by the connections ([links]).
  */
 sealed interface Glance {
     val text: String
@@ -35,11 +35,6 @@ sealed interface Glance {
     data class Behind(val reason: String) : Glance {
         override val text: String get() = "Not up to date"
     }
-
-    /** Catching up with Bitcoin: nothing to open. */
-    data object Syncing : Glance {
-        override val text: String get() = "Catching up"
-    }
 }
 
 /**
@@ -59,7 +54,6 @@ fun glance(ui: Ui, now: Long): Glance? {
         lines.size > 1 -> Glance.Many(lines.size)
         opening != null -> Glance.Protecting(opening)
         ui.problem != null -> Glance.Behind(ui.problem)
-        !ui.chain.synced && ui.hubs.isNotEmpty() -> Glance.Syncing
         else -> null
     }
 }

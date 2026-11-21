@@ -15,8 +15,11 @@ cost and how it was made behind its line, what a word means
 behind its (i). Times are said as times, never as blocks; ids, notes and
 providers show in advanced mode only. With no hub yet, Home lists the hubs
 announced on Nostr to pick from, or takes one by its address. While a new
-wallet first catches up with Bitcoin, Home lists each step and its
-progress; later, its "Catching up" line opens them.
+wallet first catches up with Bitcoin, Home says the step under way in
+plain words and how far (each step, block numbers and all, in advanced
+mode). A dot beside the network shows how the connections stand (Tor if
+on, then Bitcoin); tapped, it says each, and offers turning Tor off once
+Tor keeps the app from Bitcoin for 3 minutes, or says it is stuck.
 
 Home says when bitcoin paid to the wallet waits outside the balance and no
 protection is offered for it ("N sat on Bitcoin, not in your balance"); it
