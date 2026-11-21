@@ -91,26 +91,45 @@ class SyncTest {
 
     @Test
     fun the_connections_are_tor_if_on_then_bitcoin() {
+        // Tor and Bitcoin alone: the hubs and relays are said after them.
+        fun chain(ui: Ui) = links(ui).filter { it.name == TOR || it.name == BITCOIN }
         val hubs = listOf(hub())
         val done = scan(800u, 901u, 900u)
-        assertEquals(listOf(Link("Bitcoin", Reach.UP, "Up to date")), links(Ui(chain = caughtUp, hubs = hubs, scan = done)))
+        assertEquals(listOf(Link("Bitcoin", Reach.UP, "Up to date")), chain(Ui(chain = caughtUp, hubs = hubs, scan = done)))
         assertEquals(
             Link("Bitcoin", Reach.UP, "Up to date, block 900, 2 nodes"),
-            links(Ui(chain = caughtUp, hubs = hubs, scan = done, developer = true)).single(),
+            chain(Ui(chain = caughtUp, hubs = hubs, scan = done, developer = true)).single(),
         )
         // No hub yet: payments are not looked for, and Bitcoin is not behind.
-        assertEquals(Reach.UP, links(Ui(chain = caughtUp)).single().reach)
-        assertEquals(Link("Bitcoin", Reach.GOING, "Looking for Bitcoin nodes"), links(Ui(hubs = hubs)).single())
+        assertEquals(Reach.UP, chain(Ui(chain = caughtUp)).single().reach)
+        assertEquals(Link("Bitcoin", Reach.GOING, "Looking for Bitcoin nodes"), chain(Ui(hubs = hubs)).single())
 
         val ready = TorStatus(percent = 100u.toUByte(), ready = true, summary = "done", blocked = null)
         val stuck = TorStatus(percent = 10u.toUByte(), ready = false, summary = "connecting", blocked = "clock skew")
         val starting = TorStatus(percent = 30u.toUByte(), ready = false, summary = "connecting", blocked = null)
         val tor = Ui(tor = true, chain = caughtUp, hubs = hubs, scan = done)
-        assertEquals(listOf(Reach.UP, Reach.UP), links(tor.copy(torStatus = ready)).map { it.reach })
-        assertEquals(Link("Tor", Reach.DOWN, "Stuck: clock skew"), links(tor.copy(torStatus = stuck)).first())
-        assertEquals(Link("Tor", Reach.GOING, "Connecting (30%)"), links(tor.copy(torStatus = starting)).first())
-        assertEquals("Waiting for Tor", links(tor.copy(torStatus = starting)).last().detail)
-        assertEquals(Reach.DOWN, links(tor.copy(torStatus = stuck)).maxOf { it.reach })
+        assertEquals(listOf(Reach.UP, Reach.UP), chain(tor.copy(torStatus = ready)).map { it.reach })
+        assertEquals(Link("Tor", Reach.DOWN, "Stuck: clock skew"), chain(tor.copy(torStatus = stuck)).first())
+        assertEquals(Link("Tor", Reach.GOING, "Connecting (30%)"), chain(tor.copy(torStatus = starting)).first())
+        assertEquals("Waiting for Tor", chain(tor.copy(torStatus = starting)).last().detail)
+        assertEquals(Reach.DOWN, chain(tor.copy(torStatus = stuck)).maxOf { it.reach })
+    }
+
+    @Test
+    fun each_hub_and_the_mailbox_relays_say_whether_they_answered_when_last_asked() {
+        val ui = Ui(chain = caughtUp, hubs = listOf(hub()), scan = scan(800u, 901u, 900u))
+        fun hubLink(reached: Map<String, Boolean>) = links(ui.copy(hubsReached = reached)).last()
+        assertEquals(Reach.GOING, hubLink(emptyMap()).reach)
+        assertEquals(Reach.UP, hubLink(mapOf("https://hub.example" to true)).reach)
+        val down = hubLink(mapOf("https://hub.example" to false))
+        assertEquals(Reach.DOWN, down.reach)
+        assertEquals("hub.example", down.name)
+        // No mailbox: no relays looked in, none said.
+        assertTrue(links(ui).none { it.name == RELAYS })
+        val mail = ui.copy(hubs = listOf(hub().copy(mailbox = true)), hubsReached = mapOf("https://hub.example" to true))
+        assertEquals(Reach.GOING, links(mail).last().reach)
+        assertEquals(Link(RELAYS, Reach.UP, "Reached"), links(mail.copy(relaysReached = true)).last())
+        assertEquals(Reach.DOWN, links(mail.copy(relaysReached = false)).maxOf { it.reach })
     }
 
     @Test

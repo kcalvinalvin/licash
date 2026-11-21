@@ -197,9 +197,30 @@ fun links(ui: Ui): List<Link> {
     }
     val chain = ui.chain
     val up = "Up to date" + if (ui.developer) ", block ${block(chain.height.toLong())}, ${chain.peers} nodes" else ""
-    out += Link("Bitcoin", if (step == null) Reach.UP else Reach.GOING, step?.let { said(it, ui.developer) } ?: up)
+    out += Link(BITCOIN, if (step == null) Reach.UP else Reach.GOING, step?.let { said(it, ui.developer) } ?: up)
+    for (hub in ui.hubs) {
+        out += when (ui.hubsReached[hub.url]) {
+            true -> Link(name(hub.url), Reach.UP, "Reached")
+            false -> Link(name(hub.url), Reach.DOWN, "Not answering")
+            null -> Link(name(hub.url), Reach.GOING, "Not asked yet")
+        }
+    }
+    // Only a wallet with a mailbox looks in one.
+    if (ui.hubs.any { it.mailbox }) {
+        out += when (ui.relaysReached) {
+            true -> Link(RELAYS, Reach.UP, "Reached")
+            false -> Link(RELAYS, Reach.DOWN, "None reached: payments to you wait there until one is")
+            null -> Link(RELAYS, Reach.GOING, "Not looked in yet")
+        }
+    }
     return out
 }
+
+/** Bitcoin, as a connection is named. */
+internal const val BITCOIN = "Bitcoin"
+
+/** The mailbox's relays, as a connection is named. */
+internal const val RELAYS = "Mailbox relays"
 
 /** How long Tor may not get through before turning it off is offered: a first start takes a minute or two. */
 internal const val TOR_PATIENCE_MS = 180_000L
@@ -295,7 +316,7 @@ fun Connections(engine: Engine, ui: Ui) {
     Sheet("Connections", dismiss = { open = false }) {
         KeptFresh(engine)
         for (link in links) LinkRow(link)
-        if (ui.developer && links.last().reach != Reach.UP) SyncStages(engine, ui)
+        if (ui.developer && links.first { it.name == BITCOIN }.reach != Reach.UP) SyncStages(engine, ui)
         val since = stuck.since
         if (offerTorOff(ui, since?.let { SystemClock.elapsedRealtime() - it })) {
             Spacer(Modifier.height(8.dp))

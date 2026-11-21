@@ -112,6 +112,10 @@ data class Ui(
     val incoming: List<Activity> = emptyList(),
     /** Why the last round of syncing fell short, if it did. */
     val problem: String? = null,
+    /** Whether each hub answered when last asked, by URL: none before it is asked. In memory only. */
+    val hubsReached: Map<String, Boolean> = emptyMap(),
+    /** Whether the mailbox's relays were reached when last looked in, if looked in. In memory only. */
+    val relaysReached: Boolean? = null,
     /** The recovery contracts with hubs, the newest first. */
     val contracts: List<Contract> = emptyList(),
     /** The contracts forced closed, the oldest first. */
@@ -799,11 +803,14 @@ class Engine(context: Context) {
             }
         }
         if (hubs.any { it.mailbox }) {
-            try {
+            val reached = try {
                 collect()
+                true
             } catch (e: LicashException) {
                 failed("the mailbox", e)
+                false
             }
+            state.update { it.copy(relaysReached = reached) }
         }
         // Only with every coin found: a partial look could move part.
         if (caughtUp) {
@@ -893,13 +900,17 @@ class Engine(context: Context) {
 
     /** Learn again what each hub trusted serves: it may have changed since added. */
     private suspend fun learnHubs(hubs: List<Hub>) {
+        val reached = mutableMapOf<String, Boolean>()
         for (hub in hubs) {
-            try {
+            reached[hub.url] = try {
                 locked { it.addHub(hub.url) }
+                true
             } catch (e: LicashException) {
                 AppLog.warn("learning what ${hub.url} serves", e)
+                false
             }
         }
+        state.update { it.copy(hubsReached = reached) }
         hubsLearned = true
         hubsLearnedAt = System.currentTimeMillis()
     }

@@ -20,7 +20,8 @@ announced on Nostr to pick from, or takes one by its address. While a new
 wallet first catches up with Bitcoin, Home says the step under way in
 plain words and how far (each step, block numbers and all, in advanced
 mode). A dot beside the network shows how the connections stand (Tor if
-on, then Bitcoin); tapped, it says each, and offers turning Tor off once
+on, Bitcoin, each hub as it answered when last asked, every 5 minutes, and
+the mailbox's relays as last looked in, kept in memory only); tapped, it says each, and offers turning Tor off once
 Tor keeps the app from Bitcoin for 3 minutes, or says it is stuck.
 
 Home says when bitcoin paid to the wallet waits outside the balance and no
