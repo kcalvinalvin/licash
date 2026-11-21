@@ -213,7 +213,7 @@ private fun About(ui: Ui) {
     var exporting by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(Unit) { kept = withContext(Dispatchers.IO) { storage(context) } }
     Group("") {
-        Line("Version", BuildConfig.VERSION_NAME, tag = "version")
+        Line("Version", "${BuildConfig.VERSION_NAME} (${BuildConfig.COMMIT})", tag = "version")
         Divider()
         Entry("Storage", value = kept?.let { bytes(context, it.total) } ?: "…", tag = "storage") {
             // Opened once measured, if tapped before.

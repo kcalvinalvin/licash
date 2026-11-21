@@ -3,6 +3,14 @@ plugins {
     alias(libs.plugins.compose)
 }
 
+// The commit built, shown beside the version: "unknown" outside a git checkout.
+val commit: String = runCatching {
+    providers.exec {
+        commandLine("git", "rev-parse", "--short", "HEAD")
+        isIgnoreExitValue = true
+    }.standardOutput.asText.get().trim()
+}.getOrDefault("").ifEmpty { "unknown" }
+
 // What ../native.sh builds: the wallet core, its bindings and the chain.
 val native = layout.buildDirectory.dir("native").get().asFile
 
@@ -16,6 +24,7 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.0.1"
+        buildConfigField("String", "COMMIT", "\"$commit\"")
         // The ABIs ../native.sh builds the wallet core for.
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")

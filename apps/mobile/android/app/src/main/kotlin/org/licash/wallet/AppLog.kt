@@ -68,7 +68,7 @@ fun exportLogs(context: Context, ui: Ui): Intent {
     val logs = File(context.filesDir, "logs")
     out.bufferedWriter().use { w ->
         w.appendLine(
-            "Licash ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) on Android " +
+            "Licash ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}, ${BuildConfig.COMMIT}) on Android " +
                 "${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.MANUFACTURER} ${Build.MODEL}",
         )
         val chain = ui.chain
