@@ -18,7 +18,7 @@ use licash_nostr::{wallet::swap_providers, Role, Route};
 use licash_transport::Http;
 use licash_wallet::{
     Deposit, DepositState, Error, Invoice, InvoiceState, Lock, LockState, Payable, PaymentCode,
-    State, Swap, SwapLimits, SwapState, Wallet,
+    PaymentNote, State, Swap, SwapLimits, SwapState, Wallet,
 };
 use rand_core::{OsRng, RngCore};
 use serde_json::json;
@@ -132,6 +132,15 @@ enum Command {
         /// Also show the payment ID and the hub's full URL.
         #[arg(long)]
         details: bool,
+        /// A few words for the payee, sealed for it alone: refused at a hub
+        /// that would not keep them with the payment.
+        #[arg(long)]
+        note: Option<String>,
+        /// Tell the payee this wallet's payment code, as `code` writes it,
+        /// proved this wallet's to the payee alone: so that it knows who
+        /// paid and may pay back.
+        #[arg(long)]
+        share_code: bool,
     },
     /// Receive the payments the wallet's hubs keep for it and those sent to
     /// its mailbox, on the relays its hubs name, and unlink their notes;
@@ -754,10 +763,27 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             out,
             max_fee,
             details,
+            note,
+            share_code,
         } => {
+            let from = match share_code {
+                true => {
+                    let hubs = contract::code_hubs(&wallet, &path)?;
+                    wallet.payment_code(&hubs)?.licash
+                }
+                false => None,
+            };
+            let note = PaymentNote { text: note, from };
             let route = route(tor.clone(), cli.proxy.as_deref())?;
             let out = out.as_deref();
-            pay(&wallet, &route, &code, amount, max_fee, out, json, details).await?;
+            let how = Paying {
+                max_fee,
+                out,
+                json,
+                details,
+                note: &note,
+            };
+            pay(&wallet, &route, &code, amount, how).await?;
         }
         Command::Mailbox => {
             let route = route(tor.clone(), cli.proxy.as_deref())?;
@@ -914,11 +940,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::History => {
             let sends = wallet.sends()?;
+            let notes = wallet.payment_notes()?;
             let rows = sends.iter().map(|s| {
+                let (note, from) = note_json(notes.get(&s.id));
                 json!({
                     "id": s.id, "hub": s.hub, "payee": encode(&s.payee), "amount": s.amount,
                     "fee": s.fee, "state": state(&s.state), "created_at": s.created_at,
                     "optimization": s.is_optimization(&wallet.address()),
+                    "note": note, "shared_code": from.is_some(),
                 })
             });
             let lines = sends.iter().map(|s| {
@@ -927,8 +956,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 } else {
                     say::plus(s.amount, s.fee)
                 };
+                let said = (notes.get(&s.id))
+                    .and_then(|n| n.text.as_deref())
+                    .map_or_else(String::new, |text| format!("  \"{}\"", say::terminal(text)));
                 format!(
-                    "{}  {}  {}  via {}  {}",
+                    "{}  {}  {}  via {}  {}{said}",
                     say::when(s.created_at),
                     state(&s.state),
                     amount,
@@ -940,12 +972,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Received => {
             let receipts = wallet.receipts()?;
+            let notes = wallet.payment_notes()?;
             let rows = receipts.iter().map(|r| {
-                json!({ "id": r.id, "hub": r.hub, "amount": r.amount, "received_at": r.received_at })
+                let (note, from) = note_json(notes.get(&r.id));
+                json!({
+                    "id": r.id, "hub": r.hub, "amount": r.amount, "received_at": r.received_at,
+                    "note": note, "from": from,
+                })
             });
             let lines = receipts.iter().map(|r| {
                 let (at, amount) = (say::when(r.received_at), say::sat(r.amount));
-                format!("{at}  {amount}  via {}  {}", r.hub, r.id)
+                let said = note_said(notes.get(&r.id));
+                format!("{at}  {amount}  via {}  {}{said}", r.hub, r.id)
             });
             show(json, rows.collect(), lines.collect::<Vec<_>>().join("\n"));
         }
@@ -1675,17 +1713,20 @@ async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
 /// once a swap brought it there, fees of `max_fee` at most: sent to its
 /// mailbox on the relays that hub names, if it has one, else written to
 /// `out` or stdout to hand over. A swap is only made with a `max_fee`.
-#[allow(clippy::too_many_arguments)]
 async fn pay(
     wallet: &Wallet<Http>,
     route: &Route,
     text: &str,
     amount: Option<u64>,
-    max_fee: Option<u64>,
-    out: Option<&Path>,
-    json: bool,
-    details: bool,
+    how: Paying<'_>,
 ) -> anyhow::Result<()> {
+    let Paying {
+        max_fee,
+        out,
+        json,
+        details,
+        note,
+    } = how;
     let code: PaymentCode = text.parse()?;
     let progress = !json && std::io::stderr().is_terminal();
     if progress {
@@ -1734,7 +1775,7 @@ async fn pay(
     if progress {
         eprintln!("Sending {}…", say::sat(plan.amount));
     }
-    let paid = licash_nostr::wallet::pay_planned(wallet, &code, &plan).await?;
+    let paid = licash_nostr::wallet::pay_planned(wallet, &code, &plan, note).await?;
     let (id, hub, amount, kept) = (&paid.paid.id, &paid.hub, paid.amount, paid.paid.kept);
     if json || details {
         eprintln!("payment {id}");
@@ -1976,13 +2017,20 @@ async fn mailbox(wallet: &Wallet<Http>, route: &Route, json: bool) -> anyhow::Re
         }
     };
     let (unlinked, _) = tokio::join!(unlinking, deliver_due(wallet, route));
+    let notes = wallet.payment_notes()?;
     let rows: Vec<_> = received
         .iter()
-        .map(|r| json!({ "id": r.id, "hub": r.hub, "amount": r.amount }))
+        .map(|r| {
+            let (note, from) = note_json(notes.get(&r.id));
+            json!({ "id": r.id, "hub": r.hub, "amount": r.amount, "note": note, "from": from })
+        })
         .collect();
     let mut lines: Vec<String> = received
         .iter()
-        .map(|r| format!("received {} at {}", say::sat(r.amount), r.hub))
+        .map(|r| {
+            let said = note_said(notes.get(&r.id));
+            format!("received {} at {}{said}", say::sat(r.amount), r.hub)
+        })
         .collect();
     if lines.is_empty() {
         lines.push("nothing new".into());
@@ -1993,6 +2041,34 @@ async fn mailbox(wallet: &Wallet<Http>, route: &Route, json: bool) -> anyhow::Re
         lines.join("\n"),
     );
     Ok(())
+}
+
+/// How [`pay`] pays: its fees at most, where to write a payment not
+/// mailed, how it says so, and the note for its payee.
+struct Paying<'a> {
+    max_fee: Option<u64>,
+    out: Option<&'a Path>,
+    json: bool,
+    details: bool,
+    note: &'a PaymentNote,
+}
+
+/// A payment's note, as JSON: its text and the payer's code, if any.
+fn note_json(note: Option<&PaymentNote>) -> (Option<&str>, Option<String>) {
+    let text = note.and_then(|n| n.text.as_deref());
+    let from = note.and_then(|n| n.from.as_ref()).map(|c| c.to_string());
+    (text, from)
+}
+
+/// A payment's note, as a line ends with it: its text quoted, and the
+/// payer's code.
+fn note_said(note: Option<&PaymentNote>) -> String {
+    let Some(note) = note else {
+        return String::new();
+    };
+    let text = (note.text.as_deref()).map(|t| format!("  \"{}\"", say::terminal(t)));
+    let from = (note.from.as_ref()).map(|c| format!("  from {c}"));
+    text.unwrap_or_default() + &from.unwrap_or_default()
 }
 
 /// How to reach Nostr relays: through the wallet's own Tor client, else

@@ -47,7 +47,7 @@ async fn a_wallet_pays_a_code_at_a_hub_it_does_not_trust_once_it_proves_it_is_th
     assert_eq!(alice.hubs()?.len(), 1);
     assert_eq!(alice.visited()?.len(), 1);
 
-    let paid = wallet::pay_planned(&alice, &code, &plan).await?;
+    let paid = wallet::pay_planned(&alice, &code, &plan, &Default::default()).await?;
     assert_eq!((paid.hub.as_str(), paid.amount), (hub2, 5_000));
     // Kept at hub 2, which Alice only visits, for Bob to collect there.
     assert!(paid.paid.kept, "{paid:?}");
@@ -78,7 +78,7 @@ async fn a_wallet_pays_a_code_at_a_hub_it_does_not_trust_once_it_proves_it_is_th
     let plan = wallet::plan(&alice, &code, Some(2_000), &Route::Direct).await?;
     assert!(!plan.trusted && plan.swap.is_none(), "{plan:?}");
     assert_eq!(plan.hub, hub2);
-    let paid = wallet::pay_planned(&alice, &code, &plan).await?;
+    let paid = wallet::pay_planned(&alice, &code, &plan, &Default::default()).await?;
     assert_eq!((paid.hub.as_str(), paid.amount), (hub2, 2_000));
     let got = until("Bob's second payment", 60, || async {
         let collected = wallet::collect(&bob, &Route::Direct).await?;

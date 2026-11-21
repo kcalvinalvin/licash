@@ -88,7 +88,17 @@ stopped. Keep `watch` running, or schedule `deliver`, to send fallback mail
 while the wallet is otherwise idle. `pay` does not mail older receipts:
 a slow relay must not delay a new payment kept at its hub. Its change is
 still unlinked before exit. Payments kept at the hub appear on Nostr only
-if they missed the hour. Where the wallet holds
+if they missed the hour. `pay --note TEXT` tells the payee TEXT (its words
+one space apart, at most 200 bytes), and `--share-code` the wallet's own
+code, proved to the payee alone (a proof they could have forged
+themselves, so it convinces no one else): both sealed for the payee, of one
+size whatever they say, so neither the hub nor a relay reads them. Every
+payment to a code at a hub naming the `note` feature in its info carries
+one, empty if nothing is said; a note is asked only of such a hub, its info
+fetched again first if it named none (so the first note after a hub's
+upgrade may stand out), and another refuses the payment, nothing paid. `received`, `history`
+and `mailbox` show what a payment's note said, and who paid, once proved.
+Where the wallet holds
 too little, it swaps what it lacks there first through a provider
 announced on its hubs' relays, only if given `--max-fee` (all fees,
 swap included): without it, it says what the payment would cost. A code

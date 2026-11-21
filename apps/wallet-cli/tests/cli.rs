@@ -1570,6 +1570,59 @@ fn payments_to_codes_are_kept_at_the_hub_and_mailed_only_if_not_collected_within
 }
 
 #[test]
+fn a_payment_to_a_code_tells_its_payee_a_note_and_who_paid() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (_relay, relay) = support::relay(&runtime);
+    let hub = Server::keeping(FEE, vec![relay.clone()]);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, alice_address) = party(dir.path(), "alice", Some(&hub));
+    let (bob, _) = party(dir.path(), "bob", Some(&hub));
+    let funding = serde_json::to_string(&hub.pay(&address(&alice_address), 100)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funding)));
+    let code = json(&bob, &["code"])["code"].as_str().unwrap().to_owned();
+    let alices = json(&alice, &["code"])["code"].as_str().unwrap().to_owned();
+
+    let args = [
+        "pay",
+        &code,
+        "30",
+        "--note",
+        " for the  pizza",
+        "--share-code",
+    ];
+    let paid = json(&alice, &args);
+    assert_eq!(paid["kept"], true);
+    let got = json(&bob, &["collect"]);
+    let received = &got["received"][0];
+    assert_eq!(received["note"], "for the pizza");
+    let from = received["from"].as_str().unwrap();
+    assert!(alices.ends_with(from), "{alices} {from}");
+    let listed = ok(wallet(&bob, &["received"], None));
+    assert!(listed.contains("\"for the pizza\"  from "), "{listed}");
+    assert_eq!(json(&alice, &["history"])[0]["note"], "for the pizza");
+    // A note says nothing more than words.
+    failed(
+        wallet(&alice, &["pay", &code, "5", "--note", "a\u{202e}b"], None),
+        1,
+        "reordering",
+    );
+
+    // A hub keeping no payments keeps no note: refused, nothing paid.
+    let plain = Server::with_relays(FEE, vec![relay]);
+    let (carol, carol_address) = party(dir.path(), "carol", Some(&plain));
+    let (dave, _) = party(dir.path(), "dave", Some(&plain));
+    let funding = serde_json::to_string(&plain.pay(&address(&carol_address), 100)).unwrap();
+    ok(wallet(&carol, &["receive"], Some(&funding)));
+    let code = json(&dave, &["code"])["code"].as_str().unwrap().to_owned();
+    failed(
+        wallet(&carol, &["pay", &code, "30", "--note", "hi"], None),
+        1,
+        "keeps no note with a payment",
+    );
+    assert_eq!(available(&carol), (100, 0));
+}
+
+#[test]
 fn paying_a_code_does_not_wait_for_older_payments_to_be_mailed() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (_relay, relay) = support::relay(&runtime);

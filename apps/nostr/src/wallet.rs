@@ -18,8 +18,8 @@ use futures_util::{
 };
 use licash_api::{Info, Payment};
 use licash_wallet::{
-    DonationAddress, Error, HubId, LicashCode, Paid, PaymentCode, PayoutQuote, PayoutState,
-    Received, SwapLimits, SwapQuote, SwapState, Transport, ViaQuote, Wallet,
+    DonationAddress, Error, HubId, LicashCode, Paid, PaymentCode, PaymentNote, PayoutQuote,
+    PayoutState, Received, SwapLimits, SwapQuote, SwapState, Transport, ViaQuote, Wallet,
 };
 
 use crate::{mailbox, watch::Watch, Found, Role, Route, LIFETIME};
@@ -332,7 +332,8 @@ pub struct CodePaid {
 
 /// Pay `amount`, or the amount the code asks, to the wallet of `code` in
 /// notes, at a hub it names that `wallet` trusts and holds enough at, its
-/// hub asked to keep the payment for the payee ([`Wallet::pay_code`]).
+/// hub asked to keep the payment for the payee, with `note`
+/// ([`Wallet::pay_code_saying`]).
 /// Returned once its hub released it: nothing is mailed here, but by
 /// [`deliver`]. Refused, saying where to pay on Bitcoin if the code says,
 /// when no such hub is named.
@@ -340,6 +341,7 @@ pub async fn pay<T: Transport>(
     wallet: &Wallet<T>,
     code: &PaymentCode,
     amount: Option<u64>,
+    note: &PaymentNote,
 ) -> anyhow::Result<CodePaid> {
     let amount = asked(wallet, code, amount)?;
     let hub = match &code.licash {
@@ -349,7 +351,7 @@ pub async fn pay<T: Transport>(
     let Some(hub) = hub else {
         return Err(unpayable(code, amount));
     };
-    send(wallet, code, hub, amount).await
+    send(wallet, code, hub, amount, note).await
 }
 
 /// How [`pay_planned`] pays a payment code in notes.
@@ -607,16 +609,19 @@ async fn charges_as_planned<T: Transport>(wallet: &Wallet<T>, plan: &Plan) -> an
 /// Pay as `plan` says, to the wallet of `code`: swap first if it says, on
 /// the provider's terms as quoted, then pay as [`pay`] does at the hub it
 /// names. Refused, nothing paid, if the swap fails or is still under way:
-/// paying again once it is done pays from what it brought.
+/// paying again once it is done pays from what it brought. Refused before
+/// any swap if the hub keeps no `note` ([`Wallet::note_for`]).
 pub async fn pay_planned<T: Transport>(
     wallet: &Wallet<T>,
     code: &PaymentCode,
     plan: &Plan,
+    note: &PaymentNote,
 ) -> anyhow::Result<CodePaid> {
     let amount = asked(wallet, code, Some(plan.amount))?;
     if !plan.trusted {
         charges_as_planned(wallet, plan).await?;
     }
+    let note = wallet.note_for(&plan.hub, note).await?;
     if let Some(swap) = &plan.swap {
         let (provider, hub) = (&swap.provider, &plan.hub);
         let quote = &provider.quote;
@@ -650,7 +655,7 @@ pub async fn pay_planned<T: Transport>(
             plan.fee
         );
     }
-    send(wallet, code, plan.hub.clone(), amount).await
+    send(wallet, code, plan.hub.clone(), amount, &note).await
 }
 
 /// Whether a swap to the hub at `hub` is under way.
@@ -701,18 +706,19 @@ fn unpayable(code: &PaymentCode, amount: u64) -> anyhow::Error {
 }
 
 /// Pay `amount` to the wallet of `code` at `hub`, kept there for the
-/// payee if the hub does.
+/// payee if the hub does, with `note`.
 async fn send<T: Transport>(
     wallet: &Wallet<T>,
     code: &PaymentCode,
     hub: String,
     amount: u64,
+    note: &PaymentNote,
 ) -> anyhow::Result<CodePaid> {
     let Some(licash) = &code.licash else {
         return Err(unpayable(code, amount));
     };
     let started = Instant::now();
-    let paid = wallet.pay_code(&hub, licash, amount).await?;
+    let paid = wallet.pay_code_saying(&hub, licash, amount, note).await?;
     tracing::info!(
         hub = %hub,
         took = ?started.elapsed(),
