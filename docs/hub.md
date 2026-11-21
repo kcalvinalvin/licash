@@ -544,7 +544,11 @@ deadline costs the hub (the claim it would pay beyond what it responded,
 and its reserve for the assertion); the hub alerts once above that, and
 once a link is in no block halfway to its deadline. Its answer to a
 challenge and its terminals take a larger fee coin the same way. Its
-children and their coins are kept in `hub.sqlite` before broadcast.
+children and their coins are kept in `hub.sqlite` before broadcast. A
+wallet that funds no fee coin (out of coins, locked, not loaded) takes
+nothing from a link: the hub posts it with the child its other coins make,
+or alone at its presigned fee, and alerts once a contract. Its terminals pay
+no fee of their own and wait for a coin, so keep the wallet funded.
 
 A response commits the hub to a proof: its assertion must confirm within
 the assert window (48 blocks on signet, 2 of them to confirm in), or the

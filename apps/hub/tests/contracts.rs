@@ -2869,6 +2869,63 @@ async fn a_hub_whose_ledger_gives_no_evidence_answers_on_what_it_proves_without(
     Ok(())
 }
 
+/// A hub whose wallet funds no fee coin, as one out of coins or locked,
+/// answers a stale claim all the same: its response goes at its presigned
+/// fee, with no fee child, and its operator is told once. A hub that gave
+/// up its response for want of the coin that would have raised its fee
+/// answered nothing, and her timeout paid her all she claimed. Its wallet
+/// funded again, it plays on to the payout of what it responded.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_whose_wallet_funds_no_fee_coin_responds_at_its_presigned_fee() -> Result<()> {
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let s = stale_claim([24; 32]).await?;
+    let told = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let alerts = told.clone();
+    s.openings.alert_with(Arc::new(move |message: &str| {
+        alerts.lock().unwrap().push(message.to_owned())
+    }));
+    s.openings.fund_no_fee_coins(true);
+    let mut response = None;
+    for _ in 0..800 {
+        s.rt.mine(1)?;
+        // A round that cannot pay for all it would post fails, and posts
+        // what needs no coin.
+        s.openings.answer_requests().await?;
+        let r = recovery::advance(&s.wallet, &s.chain, &s.mine.join("wallet.sqlite"), s.rate)
+            .await?[0]
+            .clone();
+        ensure!(r.stage != Stage::Lost && r.timeout.is_none(), "{r:?}");
+        ensure!(r.stage != Stage::Done, "paid with no response: {r:?}");
+        if let Some(x) = r.response {
+            if s.rt.confirmations(&x)?.is_some() {
+                response = Some(x);
+                break;
+            }
+        }
+    }
+    let x = response.context("no response")?;
+    // At its presigned fee, its anchor unspent: no fee child.
+    paid_its_way(&s.rt, &x)?;
+    ensure!(s.rt.is_unspent(&bitcoin::OutPoint { txid: x, vout: 1 })?);
+    let unfunded = || {
+        let told = told.lock().unwrap();
+        told.iter()
+            .filter(|m| m.contains("funds no fee coin"))
+            .count()
+    };
+    ensure!(unfunded() == 1, "{:?}", told.lock().unwrap());
+
+    s.openings.fund_no_fee_coins(false);
+    let done = played(&s, |_| true).await?;
+    ensure!(done.response == Some(x), "{done:?}");
+    ensure!(done.corrected == Some(98_304), "{done:?}");
+    ensure!(done.payout.is_some() && done.timeout.is_none(), "{done:?}");
+    ensure!(unfunded() == 1, "{:?}", told.lock().unwrap());
+    Ok(())
+}
+
 /// A lock of hers the hub certified and never settled is refunded on
 /// Bitcoin: her force close past its expiry at depth claims its refund
 /// beside her notes, and the hub, once its ledger scanned her claim's

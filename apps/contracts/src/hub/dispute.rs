@@ -109,6 +109,10 @@ pub(super) struct Watch {
     /// ([`Openings::refuse_evidence`]).
     #[cfg(feature = "faults")]
     no_evidence: std::sync::atomic::AtomicBool,
+    /// The hub's wallet funds no fee coin, as one out of coins or locked
+    /// ([`Openings::fund_no_fee_coins`]).
+    #[cfg(feature = "faults")]
+    no_coins: std::sync::atomic::AtomicBool,
 }
 
 /// A fold offered a holder: the hub's secret nonce, its holder's public
@@ -539,6 +543,15 @@ impl Openings {
         self.watch
             .no_evidence
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the hub's wallet funds no fee coin from now on, as one out
+    /// of coins or locked would: for tests of what the hub posts without.
+    #[cfg(feature = "faults")]
+    pub fn fund_no_fee_coins(&self, none: bool) {
+        self.watch
+            .no_coins
+            .store(none, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Assert proofs of another statement from now on, as a dishonest hub
@@ -1470,7 +1483,7 @@ impl Openings {
                     .fee_vb(size * 2)
                     .context("fee overflow")?
                     .max(Amount::from_sat(330));
-                let coin = self.fund_coin(&script, value).await?;
+                let coin = self.fund_coin(id, &script, value).await?;
                 // Kept at once: a restart pays with this one, not another.
                 self.store().keep_fee_coin(id, name, &coin)?
             }
@@ -1501,7 +1514,10 @@ impl Openings {
     /// coin, a larger coin is funded, `stake` at most, what missing the
     /// deadline costs the hub, and taken in place of the first once it is
     /// in a block (a replacement spends no other unconfirmed coin,
-    /// BIP125). Kept beside the first, which stays valid.
+    /// BIP125). Kept beside the first, which stays valid. A larger coin
+    /// its wallet does not fund, or one of those kept whose state its node
+    /// does not tell, takes nothing from the terminal: it pays with the
+    /// best coin it has.
     #[allow(clippy::too_many_arguments)]
     async fn with_fee_by(
         &self,
@@ -1520,10 +1536,20 @@ impl Openings {
         let mut extra = Vec::new();
         let kept = self.store().extra_coins(id, name)?;
         for c in kept {
-            // In a block and unspent, else in the mempool, unspent.
-            let state = match self.unspent(c.0, false).await? {
-                true => Some(true),
-                false => self.unspent(c.0, true).await?.then_some(false),
+            // In a block and unspent, else in the mempool, unspent. Not
+            // told which: as one in the mempool, neither spent yet nor
+            // funded again.
+            let waits = |e| {
+                unknown_coin(id, name, &e);
+                Some(false)
+            };
+            let state = match self.unspent(c.0, false).await {
+                Ok(true) => Some(true),
+                Ok(false) => match self.unspent(c.0, true).await {
+                    Ok(unspent) => unspent.then_some(false),
+                    Err(e) => waits(e),
+                },
+                Err(e) => waits(e),
             };
             extra.push((c, state));
         }
@@ -1540,18 +1566,64 @@ impl Openings {
         let (coin, fund) = terminal_coin(first_coin, &extra, needed, stake);
         if let Some(value) = fund {
             let key = &hub.keys().party.payment;
-            let more = self.fund_coin(&dispute::fee_script(key)?, value).await?;
-            self.store().keep_extra_coin(id, name, &more)?;
-            tracing::warn!(
-                id = %crate::hex_id(id), %rate, %value, deadline, tip,
-                "{name} pays too little to be in a block in time: a larger fee coin funded"
-            );
+            // Not funded, or funded and not kept: posted with the coin it
+            // has, which is better than not posted.
+            let funded = async {
+                let more = self
+                    .fund_coin(id, &dispute::fee_script(key)?, value)
+                    .await?;
+                self.store().keep_extra_coin(id, name, &more)
+            };
+            match funded.await {
+                Ok(_) => tracing::warn!(
+                    id = %crate::hex_id(id), %rate, %value, deadline, tip,
+                    "{name} pays too little to be in a block in time: a larger fee coin funded"
+                ),
+                Err(e) => tracing::warn!(
+                    id = %crate::hex_id(id), %rate, %value, deadline, tip,
+                    "{name} pays too little to be in a block in time, and no larger fee \
+                     coin is funded: {e:#}"
+                ),
+            }
         }
         dispute::add_fee(tx, prevout, coin, &hub.keys().party.payment)
     }
 
-    /// A coin of `value` paying `script`, from the hub's wallet.
-    async fn fund_coin(&self, script: &ScriptBuf, value: Amount) -> Result<(OutPoint, TxOut)> {
+    /// A coin of `value` paying `script`, from the hub's wallet, for a
+    /// transaction of the contract `id`. A wallet that funds none (out of
+    /// coins, locked, not loaded) is told its operator, once a contract:
+    /// its links are posted at their presigned fee and no more, and its
+    /// terminals, which pay no fee of their own, are not posted at all.
+    async fn fund_coin(
+        &self,
+        id: &[u8; 32],
+        script: &ScriptBuf,
+        value: Amount,
+    ) -> Result<(OutPoint, TxOut)> {
+        let funded = self.funded_coin(script, value).await;
+        if let Err(e) = &funded {
+            if self.once(id, "unfunded") {
+                self.alert(&format!(
+                    "contract {}: the hub's wallet funds no fee coin of {value} ({e:#}). \
+                     Without one its response and assertion are posted at their presigned \
+                     fee, which may not be in a block in time, and its payouts are not \
+                     posted at all.",
+                    crate::hex_id(id)
+                ));
+            }
+        }
+        funded
+    }
+
+    async fn funded_coin(&self, script: &ScriptBuf, value: Amount) -> Result<(OutPoint, TxOut)> {
+        #[cfg(feature = "faults")]
+        if self
+            .watch
+            .no_coins
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            bail!("no coins, for a test");
+        }
         let network = self.source.network().await?;
         let address = bitcoin::Address::from_script(script, network)?;
         let txid: String = self
@@ -1593,7 +1665,10 @@ impl Openings {
     /// the operator is told, as when the link is in no block halfway
     /// through its window. The child's fee coins come from the hub's
     /// wallet, each kept before it is used; the child is kept before it is
-    /// broadcast. Whether the node took the link.
+    /// broadcast. A coin its wallet does not fund, or one whose state its
+    /// node does not tell, takes nothing from the link: it is posted with
+    /// the child its other coins make, or the one made before, or alone at
+    /// its presigned fee. Whether the node took the link.
     #[allow(clippy::too_many_arguments)]
     async fn post_link(
         &self,
@@ -1644,7 +1719,16 @@ impl Openings {
             let spent_before = old
                 .as_ref()
                 .is_some_and(|old| old.input.iter().any(|i| i.previous_output == coin.0));
-            if old.is_none() || spent_before || self.unspent(coin.0, false).await? {
+            // Not told whether it is in a block: as one that waits for a
+            // block, neither spent by a replacement nor funded again.
+            let confirmed = || async {
+                let confirmed = self.unspent(coin.0, false).await;
+                confirmed.unwrap_or_else(|e| {
+                    unknown_coin(id, name, &e);
+                    false
+                })
+            };
+            if old.is_none() || spent_before || confirmed().await {
                 usable.push(coin);
             }
         }
@@ -1687,10 +1771,22 @@ impl Openings {
             .unwrap_or(Amount::ZERO)
             .clamp(Amount::from_sat(1_000), stake.max(Amount::from_sat(1_000)));
             let key = &hub.keys().party.payment;
-            let coin = self.fund_coin(&dispute::fee_script(key)?, value).await?;
-            self.store().keep_extra_coin(id, name, &coin)?;
-            if old.is_none() {
-                usable.push(coin);
+            // Not funded, or funded and not kept, so not used: the link
+            // goes with what it has.
+            let funded = async {
+                let coin = self
+                    .fund_coin(id, &dispute::fee_script(key)?, value)
+                    .await?;
+                self.store().keep_extra_coin(id, name, &coin)?;
+                anyhow::Ok(coin)
+            };
+            match funded.await {
+                Ok(coin) if old.is_none() => usable.push(coin),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    id = %crate::hex_id(id), %rate, %value, deadline, tip,
+                    "{name}'s fee child is short of a coin, and none is funded: {e:#}"
+                ),
             }
         }
         let change = match &old {
@@ -2216,6 +2312,12 @@ fn terminal_coin(
         .any(|(c, s)| *s == Some(false) && c.1.value >= needed);
     let fund = (coin.1.value < needed && !waiting).then(|| (needed * 2).min(stake.max(needed)));
     (coin, fund)
+}
+
+/// Say that the hub's node did not tell the state of a fee coin of `name`,
+/// of the contract `id` (`why`): each poll, so at debug.
+fn unknown_coin(id: &[u8; 32], name: &str, why: &anyhow::Error) {
+    tracing::debug!(id = %crate::hex_id(id), "a fee coin of {name} of unknown state: {why:#}");
 }
 
 /// About the virtual size of a link's fee child of `inputs` inputs, each
