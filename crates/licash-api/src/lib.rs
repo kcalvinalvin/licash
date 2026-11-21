@@ -478,6 +478,11 @@ pub struct Payment {
     #[serde(flatten)]
     pub release: Release,
     pub unlock: Hex,
+    /// A note for the payee, sealed under the receipt secret
+    /// ([`inbox::Keep::note`]): one of any other size says nothing, and the
+    /// payment stands without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<Hex>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1320,6 +1325,15 @@ impl Payment {
             hub: hub.to_owned(),
             release: Release::new(signed, notes),
             unlock: Hex(unlock.to_vec()),
+            note: None,
+        }
+    }
+
+    /// The same, with the sealed `note`.
+    pub fn with_note(self, note: Option<Vec<u8>>) -> Self {
+        Self {
+            note: note.map(Hex),
+            ..self
         }
     }
 

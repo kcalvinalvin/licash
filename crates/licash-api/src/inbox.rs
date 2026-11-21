@@ -74,6 +74,15 @@ pub fn commitment(ack: &[u8; 32]) -> [u8; 32] {
     tagged_hash("licash/inbox/commitment", &[ack])
 }
 
+/// The [`crate::Info::features`] of a hub keeping a payment's [`Keep::note`]
+/// with it. Older hubs drop one: a payer sends one only to a hub naming this.
+pub const FEATURE_NOTE: &str = "note";
+
+/// The bytes of a sealed note, whatever it says, so that all look alike.
+/// Fixed for good: a hub refuses another size, and a payer retrying a
+/// payment sends the same bytes again, so another size is another feature.
+pub const NOTE_SEALED: usize = 512 + 16;
+
 /// The tag, key and commitment of a [`Keep`].
 pub type Keeping = ([u8; TAG], [u8; 32], [u8; 32]);
 
@@ -84,6 +93,11 @@ pub struct Keep {
     pub tag: Hex,
     pub key: Hex,
     pub commitment: Hex,
+    /// A note for the payee, sealed under the receipt secret: of
+    /// [`NOTE_SEALED`] bytes, kept with the payment by a hub naming
+    /// [`FEATURE_NOTE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<Hex>,
 }
 
 impl Keep {
@@ -95,12 +109,23 @@ impl Keep {
             tag: Hex(tag(shared).to_vec()),
             key: Hex(key(shared).to_vec()),
             commitment: Hex(commitment(&ack).to_vec()),
+            note: None,
         };
         (keep, ack)
     }
 
-    /// Its tag, key and commitment.
+    /// The same, with the sealed `note`.
+    pub fn with_note(self, note: Option<Vec<u8>>) -> Self {
+        Self {
+            note: note.map(Hex),
+            ..self
+        }
+    }
+
+    /// Its tag, key and commitment: its note, if any, of [`NOTE_SEALED`]
+    /// bytes.
     pub fn decode(&self) -> Result<Keeping, Problem> {
+        sealed_note(self.note.as_ref())?;
         Ok((
             self.tag.array("tag")?,
             self.key.array("key")?,
@@ -189,6 +214,9 @@ pub struct Receipt {
     #[serde(flatten)]
     pub release: crate::Release,
     pub unlock: Hex,
+    /// Its [`Keep::note`], if its payer sent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<Hex>,
 }
 
 impl Receipt {
@@ -198,7 +226,18 @@ impl Receipt {
             hub: hub.to_owned(),
             release: self.release,
             unlock: self.unlock,
+            note: self.note,
         }
+    }
+}
+
+/// `note`, if any, as sealed: of [`NOTE_SEALED`] bytes, else refused.
+pub fn sealed_note(note: Option<&Hex>) -> Result<Option<&[u8]>, Problem> {
+    match note {
+        Some(Hex(bytes)) if bytes.len() != NOTE_SEALED => {
+            Err(Problem::invalid(format!("a note of {NOTE_SEALED} bytes")))
+        }
+        note => Ok(note.map(|Hex(bytes)| bytes.as_slice())),
     }
 }
 

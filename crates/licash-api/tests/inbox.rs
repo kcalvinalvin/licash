@@ -20,6 +20,7 @@ fn keep() -> Keep {
         tag: Hex(vec![4; 4]),
         key: Hex(vec![5; 32]),
         commitment: Hex(vec![6; 32]),
+        note: None,
     }
 }
 
@@ -133,11 +134,39 @@ fn a_payment_kept_is_one_at_the_hub_its_payee_takes_it_at() {
     let receipt = Receipt {
         release: release(),
         unlock: Hex(vec![7; 32]),
+        note: None,
     };
     let read: Receipt = serde_json::from_str(&text(&receipt)).unwrap();
     let payment = read.at("http://hub.example");
     assert_eq!(payment.hub, "http://hub.example");
     assert_eq!(text(&payment.release), text(&release()));
     assert_eq!(payment.unlock, Hex(vec![7; 32]));
+    assert_eq!(payment.note, None);
     assert_eq!(inbox::feed(42), "/v1/inbox?after=42");
+}
+
+#[test]
+fn a_note_goes_with_its_payment_and_is_of_one_size() {
+    let note = vec![8; inbox::NOTE_SEALED];
+    let noted = keep().with_note(Some(note.clone()));
+    assert!(noted.decode().is_ok());
+    // Absent, it is written as before notes.
+    assert!(!text(&keep()).contains("\"note\""));
+    for size in [0, 16, inbox::NOTE_SEALED - 1, inbox::NOTE_SEALED + 1] {
+        let odd = keep().with_note(Some(vec![8; size]));
+        assert_eq!(odd.decode().unwrap_err().code, Code::Invalid, "{size}");
+    }
+    let receipt = Receipt {
+        release: release(),
+        unlock: Hex(vec![7; 32]),
+        note: noted.note.clone(),
+    };
+    let read: Receipt = serde_json::from_str(&text(&receipt)).unwrap();
+    let payment = read.at("http://hub.example");
+    assert_eq!(payment.note, Some(Hex(note.clone())));
+    // A payment read by a wallet of before notes is the payment.
+    let plain: licash_api::Payment = serde_json::from_str(&text(&payment)).unwrap();
+    assert_eq!(plain.note, Some(Hex(note)));
+    let older = text(&payment.clone().with_note(None));
+    assert!(!older.contains("\"note\""));
 }
