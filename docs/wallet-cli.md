@@ -104,7 +104,9 @@ and its fees; `code --extra N` shows one, and `pay --share-extra N` shares
 it instead of the wallet's own. `mailbox`, `collect` and `watch` (any
 inbox collect) take what each was paid at its hubs first, from a wallet
 file of its own (`WALLET.codes/N.sqlite`), and pay it on to the wallet's
-own code, less the hub's fee (an amount below the fee waits): shown as
+own code after a delay of between 1 and 30 minutes of each payment's own
+(at once on regtest), less the hub's fee (an amount below the fee waits):
+shown as
 received at the extra code, the payment on as moved in. A hub keeps a
 payment in its inbox for 14 days, after which its payer must hand it over.
 A wallet restored from its seed has no extra codes until made again, in
@@ -407,5 +409,9 @@ swap providers.
 
 With `--tor`, the wallet reaches hubs, swap providers and Nostr relays,
 onion services included, through a Tor client of its own (Arti), which
-keeps its state in `tor/` next to the wallet file. `--proxy
-socks5h://127.0.0.1:9050` goes through a Tor daemon instead.
+keeps its state in `tor/` next to the wallet file. Each payment it takes
+from an inbox, each payment on from an extra code, each check of whether a
+payee collected a payment and each unlinking at a hub runs on circuits and
+connections of its own; the rest shares one circuit per host. `--proxy
+socks5h://127.0.0.1:9050` goes through a Tor daemon instead, without
+that split.

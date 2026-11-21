@@ -238,11 +238,17 @@ impl Http {
             Route::Tor(tor) => {
                 let tor = if apart { tor.apart() } else { tor.clone() };
                 let url = url.to_owned();
+                let downloading = apart;
                 let timeout = timeout.unwrap_or(licash_tor::TIMEOUT);
                 let onion = self.onions.route(&url, Instant::now());
                 // Boxed: Arti's futures are too deep a type to nest in the
                 // callers'.
                 let tor: futures_util::future::BoxFuture<'_, _> = Box::pin(async move {
+                    // In the wallet's lane as it is first polled
+                    // ([`licash_wallet::in_lane`]): a download on circuits
+                    // of its own already.
+                    let lane = licash_wallet::current_lane().filter(|_| !downloading);
+                    let tor = tor.in_lane(lane);
                     if let Some((base, at)) = onion {
                         let opened =
                             tor.request_opened(&at, body.clone(), max, ONION_OPEN, timeout);

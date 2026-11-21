@@ -57,6 +57,32 @@ const OLDEST: Duration = Duration::from_secs(10 * 60);
 /// The most idle connections kept open at once.
 const MOST_KEPT: usize = 16;
 
+/// How long an operation's connection stays open, idle: its next request
+/// comes at once, if at all. Its operation over, it goes first.
+const LANE_KEPT_FOR: Duration = Duration::from_secs(60);
+
+/// The most operations' lanes told apart at once: past it, the least
+/// lately used is forgotten.
+const MOST_LANES: usize = 4096;
+
+/// How long a spare lane of a host's is handed out, since it was made:
+/// short of [`OLDEST`] and Tor's 10 min for an onion service's circuit
+/// unused, so that the operation taking it finds it still open.
+const SPARE_FOR: Duration = Duration::from_secs(8 * 60);
+
+/// The most hosts kept a spare lane at once.
+const MOST_SPARES: usize = 8;
+
+/// Of each predicted port (443, the hubs' own), at least so many exit
+/// circuits are built ahead, unused, for a wallet's operations to take
+/// ([`Tor::for_wallet`]): Arti's default is 2.
+const SPARE_CIRCUITS: usize = 3;
+
+/// Past so many circuits open, the wallet's included, none are built
+/// ahead: Arti's default of 12 is soon reached by operations' lanes, each
+/// circuit used for up to 10 min.
+const CIRCUITS_AHEAD_UP_TO: usize = 32;
+
 /// How long a connection kept may take to be ready for the next request:
 /// its own task taking in the last answer's end, not the network.
 const READY: Duration = Duration::from_secs(1);
@@ -73,17 +99,89 @@ pub struct Tor {
     tls: TlsConnector,
     isolation: Arc<Isolation>,
     kept: Arc<Kept>,
+    spares: Arc<Spares>,
+    /// The runtime it was made in, which spare lanes are made on: not
+    /// whichever runtime a request happens to run on.
+    runtime: Option<tokio::runtime::Handle>,
     /// Whether a [`Tor::bootstrap`] is under way.
     connecting: Arc<AtomicBool>,
+    /// The operation whose lane this clone's streams keep to, if any
+    /// ([`Tor::in_lane`]).
+    lane: Option<u64>,
 }
 
 /// Which circuits streams may share: those to the same host only, so that
 /// no exit or onion service sees two of them on one circuit, and no host
-/// learns which others the application reaches.
+/// learns which others the application reaches; and of those, those of
+/// the same operation's lane only, if in one ([`Tor::in_lane`]).
 #[derive(Default)]
-struct Isolation(Mutex<HashMap<String, IsolationToken>>);
+struct Isolation(Mutex<HashMap<String, IsolationToken>>, Lanes);
+
+/// The tokens of operations' lanes, by [`Target::isolated`], and when each
+/// was last used: apart from the hosts', so that many operations never
+/// start the hosts' over.
+#[derive(Default)]
+struct Lanes(Mutex<HashMap<String, (IsolationToken, Instant)>>);
+
+impl Lanes {
+    /// The token of the lane `key`, made if new: the least lately used
+    /// forgotten past [`MOST_LANES`], and those unused for [`OLDEST`].
+    fn of(&self, key: &str) -> IsolationToken {
+        let mut lanes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if !lanes.contains_key(key) {
+            lanes.retain(|_, (_, used)| now.duration_since(*used) < OLDEST);
+            if lanes.len() >= MOST_LANES {
+                let least = lanes.iter().min_by_key(|(_, (_, used))| *used);
+                if let Some(least) = least.map(|(key, _)| key.clone()) {
+                    lanes.remove(&least);
+                }
+            }
+        }
+        let (token, used) = lanes
+            .entry(key.to_owned())
+            .or_insert_with(|| (IsolationToken::new(), now));
+        *used = now;
+        *token
+    }
+
+    /// Whether the lane `key` has a token yet.
+    fn has(&self, key: &str) -> bool {
+        let lanes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        lanes.contains_key(key)
+    }
+
+    /// The lane `key` on the circuits of `token` from now on.
+    fn set(&self, key: &str, token: IsolationToken) {
+        let mut lanes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        lanes.insert(key.to_owned(), (token, Instant::now()));
+    }
+
+    fn renew(&self, key: &str) {
+        let mut lanes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((token, _)) = lanes.get_mut(key) {
+            *token = IsolationToken::new();
+        }
+    }
+}
 
 impl Isolation {
+    /// What streams to `target` share their circuits with.
+    fn token(&self, target: &Target) -> IsolationToken {
+        match target.lane {
+            Some(_) => self.1.of(&target.isolated()),
+            None => self.of(&target.isolated()),
+        }
+    }
+
+    /// Streams to `target` on new circuits from now on ([`Isolation::renew`]).
+    fn renew_target(&self, target: &Target) {
+        match target.lane {
+            Some(_) => self.1.renew(&target.isolated()),
+            None => self.renew(&target.isolated()),
+        }
+    }
+
     /// What streams to `host` share their circuits with.
     fn of(&self, host: &str) -> IsolationToken {
         let mut hosts = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -107,10 +205,29 @@ impl Isolation {
 
     /// Stream preferences keeping streams to `host` to their own circuits.
     fn prefs(&self, host: &str) -> StreamPrefs {
-        let mut prefs = StreamPrefs::new();
-        prefs.set_isolation(self.of(host));
-        prefs
+        prefs(self.of(host))
     }
+}
+
+/// Stream preferences keeping streams to the circuits of `token`.
+fn prefs(token: IsolationToken) -> StreamPrefs {
+    let mut prefs = StreamPrefs::new();
+    prefs.set_isolation(token);
+    prefs
+}
+
+/// For each host operations reach, a lane made ahead: its circuit built,
+/// through to an onion service too, and a connection open over it, for
+/// the next operation's first request to take rather than wait for. Made
+/// again once taken.
+#[derive(Default)]
+struct Spares(Mutex<HashMap<Target, Spare>>);
+
+struct Spare {
+    /// None while it is made.
+    token: Option<IsolationToken>,
+    open: Option<Open>,
+    made: Instant,
 }
 
 impl Tor {
@@ -118,10 +235,30 @@ impl Tor {
     /// `dir/state` and its directory cache in `dir/cache`. It connects to
     /// the Tor network once first used. Within a Tokio runtime.
     pub fn new(dir: &Path) -> anyhow::Result<Self> {
+        Self::configured(dir, |_| {})
+    }
+
+    /// [`Tor::new`], for a wallet: more exit circuits built ahead, for its
+    /// operations' lanes to take at once ([`Tor::in_lane`]).
+    pub fn for_wallet(dir: &Path) -> anyhow::Result<Self> {
+        Self::configured(dir, |config| {
+            config
+                .preemptive_circuits()
+                .min_exit_circs_for_port(SPARE_CIRCUITS)
+                .disable_at_threshold(CIRCUITS_AHEAD_UP_TO);
+        })
+    }
+
+    fn configured(
+        dir: &Path,
+        set: impl FnOnce(&mut TorClientConfigBuilder),
+    ) -> anyhow::Result<Self> {
         // Arti's TLS needs a process-wide provider.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let config = TorClientConfigBuilder::from_directories(dir.join("state"), dir.join("cache"))
-            .build()?;
+        let mut config =
+            TorClientConfigBuilder::from_directories(dir.join("state"), dir.join("cache"));
+        set(&mut config);
+        let config = config.build()?;
         let client = TorClient::builder()
             .config(config)
             .create_unbootstrapped()?;
@@ -136,7 +273,10 @@ impl Tor {
             tls: TlsConnector::from(Arc::new(tls)),
             isolation: Arc::default(),
             kept: Arc::new(Kept::new(KEPT_FOR, OLDEST)),
+            spares: Arc::default(),
+            runtime: tokio::runtime::Handle::try_current().ok(),
             connecting: Arc::default(),
+            lane: None,
         })
     }
 
@@ -180,8 +320,44 @@ impl Tor {
             tls: self.tls.clone(),
             isolation: Arc::default(),
             kept: Arc::new(Kept::new(KEPT_FOR, OLDEST)),
+            spares: Arc::default(),
+            runtime: self.runtime.clone(),
             connecting: self.connecting.clone(),
+            lane: None,
         }
+    }
+
+    /// This client, its streams in the lane of operation `lane`, if any:
+    /// to each host on circuits and connections of the lane's own, shared
+    /// with no other lane's, nor with streams in none. A lane's first
+    /// request to a host takes the host's spare lane, made ahead, if any,
+    /// and has the next made: an operation waits for no circuit, nor for
+    /// an onion service's rendezvous.
+    pub fn in_lane(&self, lane: Option<u64>) -> Self {
+        Self {
+            lane,
+            ..self.clone()
+        }
+    }
+
+    /// Where a stream to `uri` goes, in this clone's lane.
+    fn target(&self, uri: &Uri) -> Result<Target, String> {
+        Ok(Target {
+            lane: self.lane,
+            ..Target::of(uri)?
+        })
+    }
+
+    /// The request for `url`, and where it goes, in this clone's lane.
+    fn prepare(&self, url: &str, body: Option<Vec<u8>>) -> Result<(Target, Asked), String> {
+        let (target, request) = prepare(url, body)?;
+        Ok((
+            Target {
+                lane: self.lane,
+                ..target
+            },
+            request,
+        ))
     }
 
     /// GET `url`, or POST `body` to it as JSON, over Tor: its status and
@@ -213,8 +389,8 @@ impl Tor {
 
     /// Requests to the host of `url` on new circuits: one timed out.
     fn renew(&self, url: &str) {
-        if let Ok((target, _)) = prepare(url, None) {
-            self.isolation.renew(&target.host);
+        if let Ok((target, _)) = self.prepare(url, None) {
+            self.isolation.renew_target(&target);
         }
     }
 
@@ -230,9 +406,9 @@ impl Tor {
         timeout: Duration,
     ) -> Result<(u16, Vec<u8>), Failed> {
         let deadline = tokio::time::Instant::now() + timeout;
-        let (target, request) = prepare(url, body).map_err(Failed::Unsent)?;
+        let (target, request) = self.prepare(url, body).map_err(Failed::Unsent)?;
         let get = request.method() == Method::GET;
-        let reused = tokio::time::timeout_at(deadline, self.kept.reuse(&target, request, max));
+        let reused = tokio::time::timeout_at(deadline, self.reuse(&target, request, max));
         let request = match reused.await {
             Err(_) => {
                 let why = format!("no answer over Tor in {} s", timeout.as_secs());
@@ -255,15 +431,15 @@ impl Tor {
         let stream = opening
             .await
             .map_err(|_| {
-                self.isolation.renew(&target.host);
+                self.isolation.renew_target(&target);
                 Failed::Unsent(format!("no stream over Tor in {} s", open.as_secs()))
             })?
             .map_err(Failed::Unsent)?;
-        let host = target.host.clone();
+        let renewed = target.clone();
         tokio::time::timeout_at(deadline, self.kept.first(target, stream, request, max))
             .await
             .map_err(|_| {
-                self.isolation.renew(&host);
+                self.isolation.renew_target(&renewed);
                 Failed::Sent(format!("no answer over Tor in {} s", timeout.as_secs()))
             })?
             .map_err(Failed::Sent)
@@ -275,9 +451,9 @@ impl Tor {
         body: Option<Vec<u8>>,
         max: usize,
     ) -> Result<(u16, Vec<u8>), String> {
-        let (target, request) = prepare(url, body)?;
+        let (target, request) = self.prepare(url, body)?;
         let get = request.method() == Method::GET;
-        let request = match self.kept.reuse(&target, request, max).await {
+        let request = match self.reuse(&target, request, max).await {
             Ok(Ok(answer)) => return Ok(answer),
             // The connection kept may have closed as it was asked: a GET is
             // asked again.
@@ -303,18 +479,135 @@ impl Tor {
     /// `ws[s]://` URL, within TLS for `https://` and `wss://`.
     pub async fn connect(&self, url: &str) -> Result<Box<dyn Stream>, String> {
         let uri: Uri = url.parse().map_err(|e| format!("not a URL: {e}"))?;
-        self.stream(Target::of(&uri)?).await
+        let target = self.target(&uri)?;
+        // A lane's first stream to the host on its spare's circuits.
+        if let Some(open) = self.claim(&target) {
+            drop(open);
+        }
+        self.stream(target).await
+    }
+
+    /// `request` on a connection kept to `target`, else on its lane's
+    /// spare ([`Kept::reuse`]).
+    async fn reuse(
+        &self,
+        target: &Target,
+        request: Asked,
+        max: usize,
+    ) -> Result<Result<Answer, String>, Box<Asked>> {
+        let request = match self.kept.reuse(target, request, max).await {
+            Err(request) => request,
+            done => return done,
+        };
+        match self.claim(target) {
+            Some(open) => self.kept.on(target.clone(), open, *request, max).await,
+            None => Err(request),
+        }
+    }
+
+    /// For the first stream of a lane to `target`'s host: its spare lane's
+    /// circuits, and its connection, if still open; another spare made
+    /// next. None in no lane, nor once the lane has circuits of its own.
+    fn claim(&self, target: &Target) -> Option<Open> {
+        target.lane?;
+        let key = target.isolated();
+        if self.isolation.1.has(&key) {
+            return None;
+        }
+        let base = target.base();
+        let spare = {
+            let mut spares = self.spares.0.lock().unwrap_or_else(|e| e.into_inner());
+            let ready = spares
+                .get(&base)
+                .is_some_and(|s| s.token.is_some() && s.made.elapsed() < SPARE_FOR);
+            match ready {
+                true => spares.remove(&base),
+                false => None,
+            }
+        };
+        self.make_spare(base);
+        let spare = spare?;
+        self.isolation.1.set(&key, spare.token?);
+        tracing::debug!(host = %target.host, "a lane takes its spare");
+        spare.open.filter(|open| !open.sender.is_closed())
+    }
+
+    /// A spare lane to the host of `base` made, in the background, unless
+    /// one is or is being made: the least lately made let go past
+    /// [`MOST_SPARES`].
+    fn make_spare(&self, base: Target) {
+        {
+            let mut spares = self.spares.0.lock().unwrap_or_else(|e| e.into_inner());
+            let fresh = |s: &Spare| s.token.is_none() || s.made.elapsed() < SPARE_FOR;
+            if spares.get(&base).is_some_and(fresh) {
+                return;
+            }
+            spares.remove(&base);
+            if spares.len() >= MOST_SPARES {
+                let oldest = spares.iter().min_by_key(|(_, s)| s.made);
+                if let Some(oldest) = oldest.map(|(t, _)| t.clone()) {
+                    spares.remove(&oldest);
+                }
+            }
+            let made = Instant::now();
+            spares.insert(
+                base.clone(),
+                Spare {
+                    token: None,
+                    open: None,
+                    made,
+                },
+            );
+        }
+        let tor = self.in_lane(None);
+        let making = async move {
+            let token = IsolationToken::new();
+            let made = match tor.open_with(&base, token).await {
+                Ok(stream) => Open::over(stream).await.ok().map(|open| (token, open)),
+                Err(e) => {
+                    tracing::debug!(host = %base.host, "no spare lane: {e}");
+                    None
+                }
+            };
+            let mut spares = tor.spares.0.lock().unwrap_or_else(|e| e.into_inner());
+            match made {
+                Some((token, open)) => {
+                    let spare = Spare {
+                        token: Some(token),
+                        open: Some(open),
+                        made: Instant::now(),
+                    };
+                    spares.insert(base, spare);
+                }
+                None => {
+                    spares.remove(&base);
+                }
+            }
+        };
+        match &self.runtime {
+            Some(runtime) => drop(runtime.spawn(making)),
+            None => drop(tokio::spawn(making)),
+        }
     }
 
     /// A stream to `target`, within TLS if it asks: on new circuits once
     /// more should one fail, and next time should that one fail too.
     async fn stream(&self, target: Target) -> Result<Box<dyn Stream>, String> {
-        let renew = || self.isolation.renew(&target.isolated());
+        let renew = || self.isolation.renew_target(&target);
         twice(|| self.open(&target), renew).await
     }
 
     async fn open(&self, target: &Target) -> Result<Box<dyn Stream>, String> {
-        let prefs = self.isolation.prefs(&target.isolated());
+        self.open_with(target, self.isolation.token(target)).await
+    }
+
+    /// A stream to `target` on the circuits of `token`.
+    async fn open_with(
+        &self,
+        target: &Target,
+        token: IsolationToken,
+    ) -> Result<Box<dyn Stream>, String> {
+        let prefs = prefs(token);
         let host = &target.host;
         let started = Instant::now();
         let stream = self
@@ -414,7 +707,8 @@ impl socks::Exit for Tor {
             host,
             port,
             tls,
-            lane,
+            socks: lane,
+            lane: None,
         })
         .await
     }
@@ -435,13 +729,16 @@ pub trait Stream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Stream for T {}
 
 /// Where a stream goes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Target {
     host: String,
     port: u16,
     tls: bool,
-    /// The circuits of a lane of the host's, apart from its others.
-    lane: Option<u8>,
+    /// The circuits of a lane of the host's, apart from its others, for a
+    /// download of the light client's.
+    socks: Option<u8>,
+    /// The circuits of an operation's lane ([`Tor::in_lane`]).
+    lane: Option<u64>,
 }
 
 impl Target {
@@ -458,15 +755,29 @@ impl Target {
             host: authority.host().to_owned(),
             port: authority.port_u16().unwrap_or(if tls { 443 } else { 80 }),
             tls,
+            socks: None,
             lane: None,
         })
     }
 
     /// Which streams share its circuits: those to its host, in its lane.
     fn isolated(&self) -> String {
-        match self.lane {
-            Some(lane) => format!("{}#{lane}", self.host),
-            None => self.host.clone(),
+        let mut key = self.host.to_ascii_lowercase();
+        if let Some(socks) = self.socks {
+            key.push_str(&format!("#{socks}"));
+        }
+        if let Some(lane) = self.lane {
+            key.push_str(&format!("@{lane}"));
+        }
+        key
+    }
+
+    /// Where it goes, in no operation's lane: what a spare lane is made
+    /// for ([`Tor::claim`]).
+    fn base(&self) -> Self {
+        Self {
+            lane: None,
+            ..self.clone()
         }
     }
 }
@@ -607,8 +918,12 @@ impl Kept {
     fn kept(&self) -> std::sync::MutexGuard<'_, Vec<(Target, Instant, Open)>> {
         let mut kept = self.open.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        kept.retain(|(_, at, open)| {
-            now.duration_since(*at) < self.keep
+        kept.retain(|(to, at, open)| {
+            let keep = match to.lane {
+                Some(_) => self.keep.min(LANE_KEPT_FOR),
+                None => self.keep,
+            };
+            now.duration_since(*at) < keep
                 && now.duration_since(open.opened) < self.oldest
                 && !open.sender.is_closed()
         });
@@ -638,7 +953,9 @@ impl Kept {
         }
         let mut kept = self.kept();
         if kept.len() >= MOST_KEPT {
-            kept.remove(0);
+            // An operation's first, likely over.
+            let at = kept.iter().position(|(to, ..)| to.lane.is_some());
+            kept.remove(at.unwrap_or(0));
         }
         kept.push((target, Instant::now(), open));
     }
@@ -677,13 +994,51 @@ impl Kept {
         max: usize,
     ) -> Result<Answer, String> {
         let started = Instant::now();
-        let mut open = Open::over(stream).await?;
+        let open = Open::over(stream).await?;
+        let answer = self.asked(&target, open, request, max).await;
+        tracing::debug!(host = %target.host, ms = ms(started), "asked on a new connection");
+        answer
+    }
+
+    /// `request` on `open`, a connection to `target` made ahead: its
+    /// answer, or how it failed once sent; or, the connection closed, the
+    /// request back.
+    async fn on(
+        &self,
+        target: Target,
+        mut open: Open,
+        request: Asked,
+        max: usize,
+    ) -> Result<Result<Answer, String>, Box<Asked>> {
+        if !matches!(
+            tokio::time::timeout(READY, open.sender.ready()).await,
+            Ok(Ok(()))
+        ) {
+            return Err(Box::new(request));
+        }
+        match open.ask(request, max).await {
+            Ok(answer) => {
+                self.put(target, open);
+                Ok(Ok(answer))
+            }
+            Err(Lost::Unsent(back)) => Err(back),
+            Err(Lost::Sent(why)) => Ok(Err(why)),
+        }
+    }
+
+    /// `request` on `open`, new, to `target`: kept once read whole.
+    async fn asked(
+        &self,
+        target: &Target,
+        mut open: Open,
+        request: Asked,
+        max: usize,
+    ) -> Result<Answer, String> {
         let answer = open.ask(request, max).await.map_err(|lost| match lost {
             Lost::Unsent(_) => "the connection closed".to_owned(),
             Lost::Sent(why) => why,
         })?;
-        tracing::debug!(host = %target.host, ms = ms(started), "asked on a new connection");
-        self.put(target, open);
+        self.put(target.clone(), open);
         Ok(answer)
     }
 }
@@ -716,6 +1071,7 @@ mod tests {
             host: host.into(),
             port,
             tls,
+            socks: None,
             lane: None,
         }
     }
@@ -782,10 +1138,91 @@ mod tests {
     }
 
     #[test]
+    fn an_operations_lane_keeps_to_circuits_of_its_own_and_many_leave_the_hosts_alone() {
+        let isolation = Isolation::default();
+        let to = |lane| Target {
+            lane,
+            ..target("hub.example", 443, true)
+        };
+        let host = isolation.token(&to(None));
+        let first = isolation.token(&to(Some(1)));
+        assert_ne!(first, host);
+        assert_ne!(isolation.token(&to(Some(2))), first);
+        assert_eq!(isolation.token(&to(Some(1))), first);
+        // A lane's request timing out renews its lane alone.
+        isolation.renew_target(&to(Some(1)));
+        let renewed = isolation.token(&to(Some(1)));
+        assert_ne!(renewed, first);
+        assert_eq!(isolation.token(&to(None)), host);
+        // Ever more lanes: the least lately used forgotten, the hosts' kept.
+        for lane in 3..(MOST_LANES as u64 + 10) {
+            isolation.token(&to(Some(lane)));
+        }
+        assert!(isolation.1 .0.lock().unwrap().len() <= MOST_LANES);
+        assert_eq!(isolation.token(&to(None)), host);
+        assert_ne!(isolation.token(&to(Some(1))), renewed, "forgotten");
+    }
+
+    #[tokio::test]
+    async fn a_lanes_first_request_takes_its_hosts_spare_made_lately_and_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let tor = Tor::new(dir.path()).unwrap();
+        let to = |lane| Target {
+            lane,
+            ..target("hub.example", 443, true)
+        };
+        let spare = |token, made| Spare {
+            token: Some(token),
+            open: None,
+            made,
+        };
+        let token = IsolationToken::new();
+        tor.spares
+            .0
+            .lock()
+            .unwrap()
+            .insert(to(None), spare(token, Instant::now()));
+        // In no lane: no spare taken.
+        assert!(tor.claim(&to(None)).is_none());
+        assert!(tor.spares.0.lock().unwrap()[&to(None)].token == Some(token));
+        // A lane's first: on the spare's circuits; another made.
+        let lane = tor.in_lane(Some(7));
+        assert!(
+            lane.claim(&to(Some(7))).is_none(),
+            "no connection kept open"
+        );
+        assert_eq!(tor.isolation.token(&to(Some(7))), token);
+        assert!(
+            tor.spares.0.lock().unwrap()[&to(None)].token.is_none(),
+            "being made"
+        );
+        // Once the lane has its own, no other spare is taken.
+        let next = IsolationToken::new();
+        tor.spares
+            .0
+            .lock()
+            .unwrap()
+            .insert(to(None), spare(next, Instant::now()));
+        lane.claim(&to(Some(7)));
+        assert_eq!(tor.isolation.token(&to(Some(7))), token);
+        // A spare made too long ago is not handed out.
+        let stale = Instant::now()
+            .checked_sub(SPARE_FOR + Duration::from_secs(1))
+            .unwrap();
+        tor.spares
+            .0
+            .lock()
+            .unwrap()
+            .insert(to(None), spare(next, stale));
+        tor.claim(&to(Some(8)));
+        assert_ne!(tor.isolation.token(&to(Some(8))), next);
+    }
+
+    #[test]
     fn each_lane_of_a_host_keeps_to_circuits_of_its_own() {
         let isolation = Isolation::default();
-        let lane = |lane| Target {
-            lane,
+        let lane = |socks| Target {
+            socks,
             ..target("cdn.example", 443, false)
         };
         let host = isolation.of(&lane(None).isolated());

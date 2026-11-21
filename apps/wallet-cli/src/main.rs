@@ -696,7 +696,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let tor = match cli.tor {
         true => {
             let dir = path.parent().unwrap_or(Path::new(".")).join("tor");
-            Some(licash_tor::Tor::new(&dir).context("a Tor client")?)
+            Some(licash_tor::Tor::for_wallet(&dir).context("a Tor client")?)
         }
         false => None,
     };
