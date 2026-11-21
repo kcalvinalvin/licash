@@ -6,6 +6,8 @@ under a Jetpack Compose UI.
 
 ## What it shows
 
+### Home
+
 Home is the balance, how much of it is protected, one line while something
 is going on, Receive and Send. The rest waits behind a tap: where the money
 is behind the balance (a page for each hub, to cash out and protect, and
@@ -39,6 +41,8 @@ short haptic, which follows the system's touch feedback setting and asks no
 permission, and an outcome's title is announced by a screen reader. Screens
 fade and slide a little the way they go, and the steps of a payment fade;
 the system's animation setting scales both, or turns them off.
+
+### Fees and Stats
 
 Tap a fee in a payment review or its history for the amount, percentage,
 and supplied recipient split. Current direct-payment estimates show base
@@ -80,6 +84,8 @@ nothing is claimed. The table is in backups and restored with them, but its
 rows alone are no reason to write one, and an unreadable `stats` component
 (another version, or half made) leaves everything else working.
 
+### Settings
+
 Settings is one page: the hubs (each tapped for its fees, more added by
 address or found on Nostr), Backup, Bitcoin (each step of catching up:
 Tor, the nodes, the block headers and filters against the best peer's
@@ -108,110 +114,7 @@ the next address, and how to bring funds back: send them to a Bitcoin
 address shown in Receive. How the app looks and speaks, and the shared parts to build a screen of, are in
 [apps/DESIGN.md](../apps/DESIGN.md).
 
-## Backup and restore
-
-- **Recovery words**: 24 words, shown after a warning, kept out of
-  screenshots. They encode the wallet's existing 256-bit seed as BIP39
-  entropy (not a BIP39 PBKDF seed, so other wallets do not read them). They
-  bring back the keys and coins on Bitcoin only: notes held at hubs and
-  contracts need the backup file. They are shown with the wallet's birthday,
-  the first block its payments are looked for from (learned on its first
-  scan if not known when it was made); restoring with it scans from there,
-  without it from block 1.
-- **Backup file**: everything the wallet holds as of when it is saved (the
-  wallet's database, which holds its contracts too, the birthday, the
-  instances a contract's recovery needs, contacts), in a checksummed,
-  unencrypted tar (format 2: a backup of an earlier format, which kept the
-  contracts in a database of their own, is refused) the user saves through the
-  system file picker. Tor state, proofs made on the phone and the light
-  client's blocks are left out. Payments after it are not in it. Restore a
-  backup on one phone only: two live copies can reuse one-time recovery
-  keys and lose money.
-- **Automatic backup**: off until the user chooses a folder (through the
-  system folder picker), meant for one a sync app such as Syncthing or
-  Nextcloud carries off the phone. From then on, each change worth a backup
-  (anything but the progress of looking through Bitcoin) is written once
-  the wallet rests for 30 seconds, 5 minutes after the change at the
-  latest, at once when the app leaves the screen, once a day if nothing
-  changed, and as soon as the folder no longer holds the last one. A
-  failed backup is tried again 5 minutes later. The backups are in `Licash-<id>/` in that folder, `id`
-  of the seed and network, telling nothing of the wallet; every file is
-  written once under a new name and never changed, so a sync app never
-  sees half a file nor two versions of one:
-  - `s-<generation>-<writer>.lcb`: a snapshot of everything the backup file
-    holds, gzipped, but the contract states of 64 KiB or more (each
-    megabytes that do not compress), which it names. The newest three of
-    the phone are kept.
-  - `b-<name>.lcb`: one such state, named by a keyed hash of its bytes,
-    written once however many snapshots name it.
-
-  Each file is sealed with XChaCha20-Poly1305 under a key of the seed and
-  network, its header (generation and writer included) authenticated: a
-  file cut short, renamed or of another wallet is refused whole. A
-  snapshot of a wallet without contracts is tens to hundreds of KB. The
-  phone records what it wrote in `autobackup.json` beside the wallet,
-  before writing, and deletes only its own files no kept snapshot names.
-  Contract work under way delays a backup until it is done.
-- **Restore**, from the first screen: from a backup folder (with the
-  recovery words, the newest snapshot that restores whole, its date shown,
-  and told when newer ones there do not, as when still syncing, or when
-  several phones backed up there; automatic
-  backups go on to that folder), from a backup file (its network is
-  the wallet's) or from the recovery words (of the network chosen). It never
-  lands over existing wallet state; a backup this build cannot carry on
-  ("needs a newer version of the app") or one missing a file a recovery
-  needs is refused before anything is installed.
-- **Reset chain state**, in advanced mode, after a confirmation: the wallet
-  looks for payments again from its first block and the light client's
-  blocks are fetched afresh. Notes, contracts, recoveries and payments under
-  way are untouched. Nothing runs on its own: existing wallets see no change
-  until a backup, restore or reset is asked for.
-
-## Upgrading from note format v2
-
-A wallet of the release before note format v3 (wallet schema 3) holds notes
-whose issuance proofs this version does not verify. It is refused when the
-app starts ("a wallet of an earlier version"), shown as the wallet's
-problem, and its file is left as it is; a backup of one is refused on
-restore. Before updating, spend or pay out its notes, and let its contracts
-close, with the release before. Its APK installs over this one with the
-wallet's files kept (the version code does not change), so keep a copy.
-Then clear the app's data and create a new wallet: hubs of v3 are new hubs.
-
-## Build
-
-Needs a JDK 17 or later, the Android SDK (platform 37) with the NDK at
-`ANDROID_NDK_HOME`, Rust with the `aarch64-linux-android` and
-`x86_64-linux-android` targets, Go and gomobile.
-
-```sh
-./native.sh                 # the core, its Kotlin bindings and the chain AAR
-./gradlew assembleDebug     # app/build/outputs/apk/debug/app-debug.apk
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-```
-
-## Releases
-
-Once every CI job passes on main, CI publishes the app signed, as
-`licash-main.apk` with its `SHA256SUMS`, on the `main-build` prerelease,
-replaced on each push. The `android` job builds the release APK unsigned;
-only `publish-app` signs it, with the key in two repository secrets: the
-debug key the app has been signed with so far, from the machine that built
-it, so that the published app installs as an update over those builds (its
-certificate's SHA-256 is `0bfd0c83...d474c1e2`, as `apksigner verify
---print-certs` shows):
-
-```sh
-base64 -w0 ~/.android/debug.keystore | gh secret set ANDROID_KEYSTORE
-gh secret set ANDROID_KEYSTORE_PASSWORD --body android
-```
-
-Android updates an app only with an APK signed by the same key: keep that
-keystore backed up, since without it every user must uninstall (and restore
-the wallet from its backup). Its password is the debug default, so whoever
-has the file can sign updates.
-
-## Test networks
+## Networks and advanced mode
 
 A wallet is made on Bitcoin unless "Use a test network", on the first
 screen, picks signet, Mutinynet or regtest first: a wallet keeps the network
@@ -226,6 +129,8 @@ take precedence, and contracts that cannot be read hold every hub to no fee
 until they can, under Privacy), the notes of
 each denomination, and how each payment was made: its transactions, block
 heights and providers.
+
+### Notes and background work
 
 Like the CLI, each sync reshapes the notes of a wallet that mostly
 receives, within the same fee authority and the rolling 1% daily budget
@@ -244,6 +149,8 @@ remint as "Optimized notes",
 its fee alone. In advanced mode, a hub's sheet in Settings offers "Optimize
 notes": a preview, then a remint within the fee shown, bypassing the rests
 and the daily budget but never the contract ceilings.
+
+## Hubs and payments
 
 The app needs a hub taking deposits on the same network: `licash-hub run
 --network signet --chain URL --deposit-sweep-address ADDRESS`, with
@@ -279,13 +186,6 @@ the balance, cashes out notes there to an address that way, all of them or
 an amount chosen. A `licash:` code is paid in notes only, through a swap to
 a hub it names if the app trusts none.
 
-The core can find a contract's reserve with only the seed when the wallet
-file and the hub are both gone: `hub_keys` lists each hub's address and
-deposit root (keep them with the seed), and once the wallet found its coins
-again, `recover_closes(chain, address, root, from)` finds the payments of
-defaults to the close deposits of the contracts those coins opened and hands the network a refund of each 2016 blocks old, paid to the
-fallback address. The app has no screen for it yet.
-
 Lightning invoices are paid the cheapest way found: through a trusted hub's
 gateway, or through a swap provider announced the same way that pays
 invoices from its own node (`licash-swaps run --lnd URL --lnd-macaroon
@@ -304,6 +204,75 @@ code names, a swap brings notes there from a hub of the app's, and the payment
 shows its fees for review first. What the swap brought past the payment stays
 at that hub, shown apart behind the balance, as not in it, where adding the
 hub counts it.
+
+Payout deadlines are checked for every pending payout, independently of
+the ordinary progress display limit. A payment to a payment code is done
+once its hub releases it, kept there for the payee, who collects it at the
+hub and tells the payer so through it. One not collected within an hour,
+or that its hub does not keep, is sent to the payee's mailbox by the app
+in the background: the periodic job runs while any is on its way. The
+wallet file records where each stands; a `deliveries.json` left by an
+earlier version is no longer read.
+
+Paying a code, a note may be typed for the payee, and "Share my code"
+(off by default) tells them who paid, proved to them alone: both sealed
+for the payee, the hub and relays reading neither. A hub that would not
+keep a note with a payment refuses it, nothing paid, and the app offers
+to send it without the note. The history shows a payment's note, and its
+details who paid: a contact, or a code to save as one.
+
+Receive, showing the Licash code, lets the user pick which code: the
+wallet's own, or a separate one made there under a name only the user
+sees. A separate code has keys of its own, derived from the seed by its
+number, and names no mailbox, so no one can tell it belongs to the wallet
+or to another of its codes: two pseudonyms posted online share nothing.
+What it is paid is collected with the wallet's payments, from the inbox
+of its hub (which keeps a payment there for 14 days; after that the payer
+still holds it and must hand it over), and paid on to the wallet's own
+code after a delay of between 1 and 30 minutes, a different one for each
+payment, less the hub's fee: an amount below that fee waits for more. The
+history shows each payment at the code, named "To" it, its fee
+that of moving it to the balance. "Share my code" may share a separate
+code instead ("Share as"). Each code is kept in a wallet file of its own
+beside the wallet's (`wallet.sqlite.codes/`), deleted with it, outside
+the state bundle and the automatic backup: a wallet restored from either
+makes the files again, and one restored from the seed shows no separate
+codes until made again, numbered as before. Over Tor, each payment taken
+and each payment on runs on a circuit and connection of its own (see
+below), but a hub can still link a code to the wallet by the amount paid
+on and its timing, more easily when payments are few.
+
+### Tor
+
+Over the app's own Tor client, every operation you start (a payment, an
+invoice, adding a hub, a payout, moving notes) runs on Tor circuits and
+connections of its own, shared with no other operation's, so a hub or exit
+cannot link two operations by their circuit. Background polling shares
+one circuit per host, as the inbox's feed is public, and asks for what
+the wallet was paid each on a circuit of its own, only when there is
+something to take; checking whether a payee collected a payment also uses
+a circuit per payment. So that this costs no wait, the app keeps a spare
+circuit (with its connection open) to each hub it uses, taken by the next
+operation and replaced in the background, and has Tor build a few more
+exit circuits ahead. A new circuit to an onion service under load costs a
+proof of work. With Tor off, or through an external SOCKS proxy, requests
+are not split this way.
+
+### Testing against the command line
+
+A counterpart on the command line:
+
+```sh
+export LICASH_WALLET_NETWORK=signet LICASH_WALLET_CHAIN=URL
+licash-wallet init && licash-wallet add-hub HUB_URL
+licash-wallet code                # for the app to scan and pay in notes
+licash-wallet code --onchain      # for the app to pay on Bitcoin
+licash-wallet mailbox             # the payments it sent
+licash-wallet pay 'CODE' 1000     # pay the code the app shows
+licash-wallet onchain scan        # coins paid on Bitcoin
+```
+
+## Protection
 
 A hub's page sets up protection, a recovery contract, at the hubs that open
 them (`licash-hub run --contracts`: under the mock authority on regtest,
@@ -426,70 +395,119 @@ activated on Bitcoin with a coin of her wallet as its expiry nears, if a
 contract of hers there can still claim it; that contract is then not
 closed early but forced closed, its claim taking the lock's pay branch.
 
-A counterpart on the command line:
+### Recovering a reserve from the seed
+
+The core can find a contract's reserve with only the seed when the wallet
+file and the hub are both gone: `hub_keys` lists each hub's address and
+deposit root (keep them with the seed), and once the wallet found its coins
+again, `recover_closes(chain, address, root, from)` finds the payments of
+defaults to the close deposits of the contracts those coins opened and hands the network a refund of each 2016 blocks old, paid to the
+fallback address. The app has no screen for it yet.
+
+## Backup and restore
+
+- **Recovery words**: 24 words, shown after a warning, kept out of
+  screenshots. They encode the wallet's existing 256-bit seed as BIP39
+  entropy (not a BIP39 PBKDF seed, so other wallets do not read them). They
+  bring back the keys and coins on Bitcoin only: notes held at hubs and
+  contracts need the backup file. They are shown with the wallet's birthday,
+  the first block its payments are looked for from (learned on its first
+  scan if not known when it was made); restoring with it scans from there,
+  without it from block 1.
+- **Backup file**: everything the wallet holds as of when it is saved (the
+  wallet's database, which holds its contracts too, the birthday, the
+  instances a contract's recovery needs, contacts), in a checksummed,
+  unencrypted tar (format 2: a backup of an earlier format, which kept the
+  contracts in a database of their own, is refused) the user saves through the
+  system file picker. Tor state, proofs made on the phone and the light
+  client's blocks are left out. Payments after it are not in it. Restore a
+  backup on one phone only: two live copies can reuse one-time recovery
+  keys and lose money.
+- **Automatic backup**: off until the user chooses a folder (through the
+  system folder picker), meant for one a sync app such as Syncthing or
+  Nextcloud carries off the phone. From then on, each change worth a backup
+  (anything but the progress of looking through Bitcoin) is written once
+  the wallet rests for 30 seconds, 5 minutes after the change at the
+  latest, at once when the app leaves the screen, once a day if nothing
+  changed, and as soon as the folder no longer holds the last one. A
+  failed backup is tried again 5 minutes later. The backups are in `Licash-<id>/` in that folder, `id`
+  of the seed and network, telling nothing of the wallet; every file is
+  written once under a new name and never changed, so a sync app never
+  sees half a file nor two versions of one:
+  - `s-<generation>-<writer>.lcb`: a snapshot of everything the backup file
+    holds, gzipped, but the contract states of 64 KiB or more (each
+    megabytes that do not compress), which it names. The newest three of
+    the phone are kept.
+  - `b-<name>.lcb`: one such state, named by a keyed hash of its bytes,
+    written once however many snapshots name it.
+
+  Each file is sealed with XChaCha20-Poly1305 under a key of the seed and
+  network, its header (generation and writer included) authenticated: a
+  file cut short, renamed or of another wallet is refused whole. A
+  snapshot of a wallet without contracts is tens to hundreds of KB. The
+  phone records what it wrote in `autobackup.json` beside the wallet,
+  before writing, and deletes only its own files no kept snapshot names.
+  Contract work under way delays a backup until it is done.
+- **Restore**, from the first screen: from a backup folder (with the
+  recovery words, the newest snapshot that restores whole, its date shown,
+  and told when newer ones there do not, as when still syncing, or when
+  several phones backed up there; automatic
+  backups go on to that folder), from a backup file (its network is
+  the wallet's) or from the recovery words (of the network chosen). It never
+  lands over existing wallet state; a backup this build cannot carry on
+  ("needs a newer version of the app") or one missing a file a recovery
+  needs is refused before anything is installed.
+- **Reset chain state**, in advanced mode, after a confirmation: the wallet
+  looks for payments again from its first block and the light client's
+  blocks are fetched afresh. Notes, contracts, recoveries and payments under
+  way are untouched. Nothing runs on its own: existing wallets see no change
+  until a backup, restore or reset is asked for.
+
+## Upgrading from note format v2
+
+A wallet of the release before note format v3 (wallet schema 3) holds notes
+whose issuance proofs this version does not verify. It is refused when the
+app starts ("a wallet of an earlier version"), shown as the wallet's
+problem, and its file is left as it is; a backup of one is refused on
+restore. Before updating, spend or pay out its notes, and let its contracts
+close, with the release before. Its APK installs over this one with the
+wallet's files kept (the version code does not change), so keep a copy.
+Then clear the app's data and create a new wallet: hubs of v3 are new hubs.
+
+## Build
+
+Needs a JDK 17 or later, the Android SDK (platform 37) with the NDK at
+`ANDROID_NDK_HOME`, Rust with the `aarch64-linux-android` and
+`x86_64-linux-android` targets, Go and gomobile.
 
 ```sh
-export LICASH_WALLET_NETWORK=signet LICASH_WALLET_CHAIN=URL
-licash-wallet init && licash-wallet add-hub HUB_URL
-licash-wallet code                # for the app to scan and pay in notes
-licash-wallet code --onchain      # for the app to pay on Bitcoin
-licash-wallet mailbox             # the payments it sent
-licash-wallet pay 'CODE' 1000     # pay the code the app shows
-licash-wallet onchain scan        # coins paid on Bitcoin
+./native.sh                 # the core, its Kotlin bindings and the chain AAR
+./gradlew assembleDebug     # app/build/outputs/apk/debug/app-debug.apk
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
+## Releases
+
+Once every CI job passes on main, CI publishes the app signed, as
+`licash-main.apk` with its `SHA256SUMS`, on the `main-build` prerelease,
+replaced on each push. The `android` job builds the release APK unsigned;
+only `publish-app` signs it, with the key in two repository secrets: the
+debug key the app has been signed with so far, from the machine that built
+it, so that the published app installs as an update over those builds (its
+certificate's SHA-256 is `0bfd0c83...d474c1e2`, as `apksigner verify
+--print-certs` shows):
+
+```sh
+base64 -w0 ~/.android/debug.keystore | gh secret set ANDROID_KEYSTORE
+gh secret set ANDROID_KEYSTORE_PASSWORD --body android
+```
+
+Android updates an app only with an APK signed by the same key: keep that
+keystore backed up, since without it every user must uninstall (and restore
+the wallet from its backup). Its password is the debug default, so whoever
+has the file can sign updates.
+
 ## Logs and tests
-
-Payout deadlines are checked for every pending payout, independently of
-the ordinary progress display limit. A payment to a payment code is done
-once its hub releases it, kept there for the payee, who collects it at the
-hub and tells the payer so through it. One not collected within an hour,
-or that its hub does not keep, is sent to the payee's mailbox by the app
-in the background: the periodic job runs while any is on its way. The
-wallet file records where each stands; a `deliveries.json` left by an
-earlier version is no longer read.
-
-Paying a code, a note may be typed for the payee, and "Share my code"
-(off by default) tells them who paid, proved to them alone: both sealed
-for the payee, the hub and relays reading neither. A hub that would not
-keep a note with a payment refuses it, nothing paid, and the app offers
-to send it without the note. The history shows a payment's note, and its
-details who paid: a contact, or a code to save as one.
-
-Receive, showing the Licash code, lets the user pick which code: the
-wallet's own, or a separate one made there under a name only the user
-sees. A separate code has keys of its own, derived from the seed by its
-number, and names no mailbox, so no one can tell it belongs to the wallet
-or to another of its codes: two pseudonyms posted online share nothing.
-What it is paid is collected with the wallet's payments, from the inbox
-of its hub (which keeps a payment there for 14 days; after that the payer
-still holds it and must hand it over), and paid on to the wallet's own
-code after a delay of between 1 and 30 minutes, a different one for each
-payment, less the hub's fee: an amount below that fee waits for more. The
-history shows each payment at the code, named "To" it, its fee
-that of moving it to the balance. "Share my code" may share a separate
-code instead ("Share as"). Each code is kept in a wallet file of its own
-beside the wallet's (`wallet.sqlite.codes/`), deleted with it, outside
-the state bundle and the automatic backup: a wallet restored from either
-makes the files again, and one restored from the seed shows no separate
-codes until made again, numbered as before. Over Tor, each payment taken
-and each payment on runs on a circuit and connection of its own (see
-below), but a hub can still link a code to the wallet by the amount paid
-on and its timing, more easily when payments are few.
-
-Over the app's own Tor client, every operation you start (a payment, an
-invoice, adding a hub, a payout, moving notes) runs on Tor circuits and
-connections of its own, shared with no other operation's, so a hub or exit
-cannot link two operations by their circuit. Background polling shares
-one circuit per host, as the inbox's feed is public, and asks for what
-the wallet was paid each on a circuit of its own, only when there is
-something to take; checking whether a payee collected a payment also uses
-a circuit per payment. So that this costs no wait, the app keeps a spare
-circuit (with its connection open) to each hub it uses, taken by the next
-operation and replaced in the background, and has Tor build a few more
-exit circuits ahead. A new circuit to an onion service under load costs a
-proof of work. With Tor off, or through an external SOCKS proxy, requests
-are not split this way.
 
 Settings, About, Export logs shares the app's log and the light client's as
 one file; Storage shows what the app keeps on the phone: the wallet, the Bitcoin
