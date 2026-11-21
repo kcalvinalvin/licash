@@ -13,7 +13,7 @@ use licash_nostr::{
     Route,
 };
 use licash_transport::Http;
-use licash_wallet::{DepositState, PartTo, PaymentCode, PaymentNote, Unlinking};
+use licash_wallet::{in_lane, DepositState, Lane, PartTo, PaymentCode, PaymentNote, Unlinking};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
@@ -406,7 +406,7 @@ impl Wallet {
             false => format!("https://{url}"),
         };
         let url = url.as_str();
-        let info = self.runtime.block_on(self.wallet.add_hub(url))?;
+        let info = self.operation(self.wallet.add_hub(url))?;
         self.onions();
         // Its URL as the wallet keeps it.
         let mut kept = self.wallet.hubs()?.into_iter();
@@ -674,7 +674,7 @@ impl Wallet {
         let _timed = crate::log::timed("pay_invoice");
         let invoice = self.wallet.read_invoice(&text)?;
         let pay = self.wallet.pay_invoice(&hub, &invoice.request);
-        let lock = self.runtime.block_on(pay)?;
+        let lock = self.operation(pay)?;
         Ok(lightning_activity(&lock, &invoice.request))
     }
 
@@ -692,7 +692,7 @@ impl Wallet {
         let pay = self
             .wallet
             .pay_invoice_within(&hub, &invoice.request, Some(max_fee));
-        let lock = self.runtime.block_on(pay)?;
+        let lock = self.operation(pay)?;
         Ok(lightning_activity(&lock, &invoice.request))
     }
 
@@ -773,7 +773,14 @@ impl Wallet {
     /// it stands.
     pub fn follow_invoice(&self, hash: String) -> Result<LightningInvoice, LicashError> {
         let _timed = crate::log::timed("follow_invoice");
-        let followed = self.runtime.block_on(self.wallet.follow_invoice(&hash));
+        // Each poll of one invoice on the same lane: no new circuit each.
+        let lane = Lane::Of(licash::crypto::tagged_hash(
+            "licash/mobile/invoice",
+            &[hash.as_bytes()],
+        ));
+        let followed = self
+            .runtime
+            .block_on(in_lane(lane, self.wallet.follow_invoice(&hash)));
         self.invoice_now(followed)
     }
 
@@ -985,6 +992,15 @@ impl Wallet {
 }
 
 impl Wallet {
+    /// `run` to its end, as an operation the owner asked for: in a lane
+    /// of its own, its requests on connections and Tor circuits no other
+    /// operation's share ([`Lane::Operation`]). What runs by itself, in
+    /// the background, on those of its hubs' instead, as it polls,
+    /// [`licash_wallet`] taking each payment in a lane of its own.
+    fn operation<F: std::future::Future>(&self, run: F) -> F::Output {
+        self.runtime.block_on(in_lane(Lane::Operation, run))
+    }
+
     /// The payments the wallet's hubs keep for it, and those in its
     /// mailbox, taken, each once, their notes still linked. Its hubs
     /// naming no relays, only those they keep.
@@ -1064,16 +1080,13 @@ impl Wallet {
         }
         let _delivering = self.delivering();
         let paid = match &planned {
-            Some(plan) => self.runtime.block_on(licash_nostr::wallet::pay_planned(
+            Some(plan) => self.operation(licash_nostr::wallet::pay_planned(
                 &self.wallet,
                 &code,
                 plan,
                 note,
             )),
-            None => {
-                self.runtime
-                    .block_on(licash_nostr::wallet::pay(&self.wallet, &code, amount, note))
-            }
+            None => self.operation(licash_nostr::wallet::pay(&self.wallet, &code, amount, note)),
         };
         let paid =
             paid.map_err(|e| LicashError::from_any(e, |reason| LicashError::Invalid { reason }))?;
@@ -1150,7 +1163,7 @@ impl Wallet {
             .map_err(|_| LicashError::invalid("not a payment"))?;
         let received = match self.wallet.receive(&payment) {
             Err(licash_wallet::Error::UnknownHub(url)) if trust => {
-                self.runtime.block_on(self.wallet.add_hub(&url))?;
+                self.operation(self.wallet.add_hub(&url))?;
                 self.wallet.receive(&payment)?
             }
             received => received?,
@@ -1689,7 +1702,7 @@ impl Wallet {
         let code: PaymentCode = text.parse().map_err(LicashError::invalid)?;
         code.check(self.wallet.network())?;
         let plans = plans_with(&self.wallet, &code, amount, &self.route, &self.announced);
-        match self.runtime.block_on(plans) {
+        match self.operation(plans) {
             Ok(plans) => Ok((text, plans)),
             Err(e) => {
                 // Lacking notes says the most: what is needed.
@@ -1796,8 +1809,7 @@ impl Wallet {
                 available: 0,
             })?;
         let (deposit, tx) =
-            self.runtime
-                .block_on(self.wallet.deposit_silent(&hub, coin.outpoint, rate))?;
+            self.operation(self.wallet.deposit_silent(&hub, coin.outpoint, rate))?;
         if let Err(e) = chain.broadcast(bitcoin::consensus::serialize(&tx)) {
             // Relay may have succeeded before the response failed. Keep
             // the signed transaction and inputs; scanning retries it.

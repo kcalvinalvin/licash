@@ -171,11 +171,11 @@ impl Wallet {
             quote.fee,
             claim_rate(),
         );
-        Ok(self.runtime.block_on(ask)?)
+        Ok(self.operation(ask)?)
     }
 
     fn pay_ticketed(&self, quote: &licash_wallet::PayoutQuote) -> Result<Activity, LicashError> {
-        let payout = self.runtime.block_on(self.wallet.payout(quote))?;
+        let payout = self.operation(self.wallet.payout(quote))?;
         tracing::info!(hash = %payout.hash, address = %payout.address, "paying out");
         Ok(activity(&payout, self.lock_fee(&payout)?))
     }
@@ -218,8 +218,7 @@ impl Wallet {
             limits,
         );
         let found = self
-            .runtime
-            .block_on(found)
+            .operation(found)
             .map_err(|e| LicashError::from_any(e, |reason| LicashError::Unavailable { reason }))?;
         let asked = Asked {
             address: address.to_owned(),
@@ -330,7 +329,7 @@ impl Wallet {
                 max_fee(amount),
                 claim_rate(),
             );
-            quote = match self.runtime.block_on(asked) {
+            quote = match self.operation(asked) {
                 Ok(quote) => quote,
                 // Past what the provider pays out, say.
                 Err(e) if best.is_some() => {

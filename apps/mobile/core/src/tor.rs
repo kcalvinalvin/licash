@@ -39,7 +39,7 @@ impl TorClient {
             .map_err(LicashError::failed)?;
         let tor = {
             let _inside = runtime.enter();
-            licash_tor::Tor::new(&dir).map_err(LicashError::failed)?
+            licash_tor::Tor::for_wallet(&dir).map_err(LicashError::failed)?
         };
         Ok(Arc::new(Self {
             runtime,

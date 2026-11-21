@@ -59,8 +59,7 @@ impl Wallet {
             SwapLimits::usual(first),
         );
         let found = self
-            .runtime
-            .block_on(found)
+            .operation(found)
             .map_err(|e| LicashError::from_any(e, |reason| LicashError::Unavailable { reason }))?;
         let mut offers = Vec::new();
         for provider in found {
@@ -104,7 +103,7 @@ impl Wallet {
                 offer.amount,
                 limits,
             );
-            match self.runtime.block_on(moving) {
+            match self.operation(moving) {
                 Ok(swap) => return Ok(activity(&swap, self.swap_lock_fee(&swap)?)),
                 Err(e) => {
                     // Newest first: the one this attempt recorded, if any.
@@ -202,7 +201,7 @@ impl Wallet {
             let asked =
                 self.wallet
                     .swap_quote(provider, from, to, amount, SwapLimits::usual(amount));
-            quote = match self.runtime.block_on(asked) {
+            quote = match self.operation(asked) {
                 Ok(quote) => quote,
                 Err(e) if best.is_some() => {
                     tracing::debug!(amount, %e, "moving all: no more");

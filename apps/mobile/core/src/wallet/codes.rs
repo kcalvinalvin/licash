@@ -25,7 +25,7 @@ impl Wallet {
     /// wallet's hubs.
     pub fn add_code(&self, label: String) -> Result<ExtraCode, LicashError> {
         let _timed = crate::log::timed("add_code");
-        let made = self.runtime.block_on(self.wallet.add_code(&label))?;
+        let made = self.operation(self.wallet.add_code(&label))?;
         let codes = self.codes()?;
         let code = codes.into_iter().find(|c| c.index == made.index);
         code.ok_or_else(|| LicashError::failed("an extra code made, then gone"))

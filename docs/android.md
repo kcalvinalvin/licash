@@ -452,16 +452,32 @@ or to another of its codes: two pseudonyms posted online share nothing.
 What it is paid is collected with the wallet's payments, from the inbox
 of its hub (which keeps a payment there for 14 days; after that the payer
 still holds it and must hand it over), and paid on to the wallet's own
-code at once, less the hub's fee: an amount below that fee waits for
-more. The history shows each payment at the code, named "To" it, its fee
+code after a delay of between 1 and 30 minutes, a different one for each
+payment, less the hub's fee: an amount below that fee waits for more. The
+history shows each payment at the code, named "To" it, its fee
 that of moving it to the balance. "Share my code" may share a separate
 code instead ("Share as"). Each code is kept in a wallet file of its own
 beside the wallet's (`wallet.sqlite.codes/`), deleted with it, outside
 the state bundle and the automatic backup: a wallet restored from either
 makes the files again, and one restored from the seed shows no separate
-codes until made again, numbered as before. Hubs reached for different
-codes at the same time can link them by network timing until per-operation
-Tor circuits land.
+codes until made again, numbered as before. Over Tor, each payment taken
+and each payment on runs on a circuit and connection of its own (see
+below), but a hub can still link a code to the wallet by the amount paid
+on and its timing, more easily when payments are few.
+
+Over the app's own Tor client, every operation you start (a payment, an
+invoice, adding a hub, a payout, moving notes) runs on Tor circuits and
+connections of its own, shared with no other operation's, so a hub or exit
+cannot link two operations by their circuit. Background polling shares
+one circuit per host, as the inbox's feed is public, and asks for what
+the wallet was paid each on a circuit of its own, only when there is
+something to take; checking whether a payee collected a payment also uses
+a circuit per payment. So that this costs no wait, the app keeps a spare
+circuit (with its connection open) to each hub it uses, taken by the next
+operation and replaced in the background, and has Tor build a few more
+exit circuits ahead. A new circuit to an onion service under load costs a
+proof of work. With Tor off, or through an external SOCKS proxy, requests
+are not split this way.
 
 Settings, About, Export logs shares the app's log and the light client's as
 one file; Storage shows what the app keeps on the phone: the wallet, the Bitcoin

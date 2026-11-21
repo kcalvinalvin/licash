@@ -32,9 +32,7 @@ impl Wallet {
         max_fee: u64,
     ) -> Result<Option<NoteOptimization>, LicashError> {
         self.agree_fees();
-        let optimized = self
-            .runtime
-            .block_on(self.wallet.optimize_notes(&hub, max_fee))?;
+        let optimized = self.operation(self.wallet.optimize_notes(&hub, max_fee))?;
         Ok(optimized.map(|done| shown(done.quote, Some(done.id))))
     }
 

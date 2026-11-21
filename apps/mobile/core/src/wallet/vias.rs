@@ -53,7 +53,7 @@ impl Wallet {
         let pay = self
             .wallet
             .pay_invoice_via(&provider, &hub, &invoice.request, max_fee);
-        let lock = self.runtime.block_on(pay)?;
+        let lock = self.operation(pay)?;
         Ok(super::lightning_activity(&lock, &invoice.request))
     }
 }
@@ -112,7 +112,7 @@ impl Wallet {
                 &invoice.request,
                 max_fee,
             );
-            let found = match self.runtime.block_on(found) {
+            let found = match self.operation(found) {
                 Ok(found) => found,
                 Err(e) => {
                     tracing::info!(hub = %balance.hub, "no provider pays the invoice: {e:#}");

@@ -63,7 +63,7 @@ impl Wallet {
         let trust = licash_contracts::trust(self.wallet.network());
         let trust = trust.map_err(|e| LicashError::invalid(format!("{e:#}")))?;
         let offer = holder::offer(&self.wallet, &hub, None, 0);
-        let offer = self.runtime.block_on(offer).map_err(unavailable)?;
+        let offer = self.operation(offer).map_err(unavailable)?;
         let price = offer.price();
         let coins = holder::coins(&self.wallet, self.wallet.path()).map_err(failed)?;
         let blocks = offer.bounds.lock;
@@ -272,10 +272,10 @@ impl Wallet {
         ask: Ask,
     ) -> Result<Contract, LicashError> {
         let chain = Chain(chain, self.wallet.network());
-        let tip = self.runtime.block_on(licash_wallet::Blocks::height(&chain));
+        let tip = self.operation(licash_wallet::Blocks::height(&chain));
         self.saw(tip.map_err(|reason| LicashError::Unavailable { reason })?);
         let opened = holder::open_with(&self.wallet, &chain, self.wallet.path(), hub, ask);
-        let opened = self.runtime.block_on(opened).map_err(unavailable)?;
+        let opened = self.operation(opened).map_err(unavailable)?;
         // Protecting nothing before its funding is buried.
         Ok(self.contract(&opened, 0))
     }
@@ -343,7 +343,7 @@ impl Wallet {
         // Protected only against a height the wallet knows of itself.
         let protected = protected && matches!(self.wallet.tip(), Ok(Some(_)));
         let asked = self.wallet.invoice_saying(url, amount, memo, protected);
-        self.runtime.block_on(asked)
+        self.operation(asked)
     }
 
     /// `all`, each with what it protects of the notes held now.

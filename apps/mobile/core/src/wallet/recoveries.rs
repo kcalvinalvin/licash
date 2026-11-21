@@ -240,7 +240,7 @@ impl Wallet {
             let rate = rate(&chain).await;
             recovery::force_close(&self.wallet, &chain, self.wallet.path(), &id, rate).await
         };
-        let forced = self.runtime.block_on(forced).map_err(failed)?;
+        let forced = self.operation(forced).map_err(failed)?;
         tracing::warn!(id = %hex::encode(id), stage = forced.stage.as_str(), "contract forced closed");
         Ok(shown(&forced))
     }
@@ -282,7 +282,7 @@ impl Wallet {
             .unwrap_or_else(PoisonError::into_inner);
         let chain = Chain(chain, self.wallet.network());
         let closed = licash_contracts::holder::close(&self.wallet, &chain, self.wallet.path(), &id);
-        let txid = self.runtime.block_on(closed).map_err(failed)?;
+        let txid = self.operation(closed).map_err(failed)?;
         tracing::info!(id = %hex::encode(id), %txid, "contract closed early");
         Ok(txid.to_string())
     }

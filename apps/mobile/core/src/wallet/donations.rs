@@ -312,9 +312,7 @@ impl Wallet {
     fn offer(&self, pinned: Option<Pinned>, code: &LicashCode) -> Choice {
         let kept = pinned.map(|mut pin| {
             pin.code = Some(code.to_string());
-            let asked = self
-                .runtime
-                .block_on(self.wallet.donation_address(&pin.url, code));
+            let asked = self.operation(self.wallet.donation_address(&pin.url, code));
             let asked = asked_of(&pin, asked);
             (pin, asked)
         });
@@ -332,7 +330,7 @@ impl Wallet {
         }
         let on = (&relays[..], &self.route);
         let found = donation_providers_with(&self.wallet, &self.announced, on, code);
-        self.runtime.block_on(found).unwrap_or_else(|e| {
+        self.operation(found).unwrap_or_else(|e| {
             tracing::info!("no provider found taking donations: {e:#}");
             Vec::new()
         })
