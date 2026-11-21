@@ -1,0 +1,95 @@
+//! The observatory watches the stack's hubs and provider, then moves a
+//! balance of its own between them, in Licash, through the provider and
+//! over Lightning, each move recorded with what it cost, on the stack of
+//! `apps/e2e/run.sh`, which runs these.
+
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use licash_e2e::Eco;
+use licash_nostr::Route;
+use licash_observatory::{
+    budget::Kind,
+    mover::{Mover, Moving},
+    observer::{self, Watching},
+    probe::Dialer,
+    store::{Outcome, Store},
+};
+
+/// What each move moves.
+const AMOUNT: u64 = 2_000;
+
+#[tokio::test]
+#[ignore = "needs the stack of apps/e2e/run.sh"]
+async fn the_observatory_moves_its_balance_between_hubs_and_records_each_move() -> anyhow::Result<()>
+{
+    let eco = Eco::up().await?;
+    let (hub1, hub2) = (eco.hub(1).to_owned(), eco.hub(2).to_owned());
+    eco.stock(10 * AMOUNT).await?;
+
+    let dir = tempfile::tempdir()?;
+    let store = Arc::new(Store::open(&dir.path().join("observatory.sqlite"))?);
+    // By their URLs on this host: those announced are the stack's own.
+    let watching = Watching {
+        network: "regtest".into(),
+        relays: Vec::new(),
+        route: Route::Direct,
+        dialer: Dialer::direct(),
+        hubs: vec![hub1.clone(), hub2.clone()],
+        providers: vec![eco.swaps().to_owned()],
+        probe_every: Duration::from_secs(5),
+        discover_every: Duration::from_secs(600),
+        timeout: Duration::from_secs(20),
+    };
+    observer::discover(&store, &watching).await?;
+    observer::round(store.clone(), watching).await;
+    let probes = store.probes_since(0)?;
+    assert_eq!(probes.len(), 3);
+    assert!(probes.iter().all(|p| p.ok), "{probes:?}");
+
+    let wallet = eco.wallet("observatory")?;
+    wallet.add_hub(&hub1).await?;
+    eco.pay_in(&wallet, &hub1, 20_000).await?;
+    let shown = Arc::new(Mutex::new(None));
+    let moving = Moving {
+        store: store.clone(),
+        monthly: 100_000,
+        amount: AMOUNT,
+        fresh: 600_000,
+        shown: shown.clone(),
+    };
+    let mut mover = Mover::new(wallet, moving)?;
+
+    for kind in [Kind::Hub, Kind::Swap, Kind::Lightning] {
+        let quoted = mover
+            .move_now(kind)
+            .await
+            .map_err(|e| anyhow::anyhow!("{kind:?}: {e:?}"))?;
+        let actions = store.actions_since(0)?;
+        let made = actions.last().unwrap();
+        assert_eq!(made.kind, kind.key());
+        assert_eq!(made.outcome, Outcome::Done, "{kind:?}: {:?}", made.detail);
+        assert_eq!(made.quoted, Some(quoted));
+        let cost = made.cost.expect("a cost measured");
+        eprintln!(
+            "{kind:?}: quoted {quoted}, cost {cost}, {} ms",
+            made.ended.unwrap() - made.started
+        );
+        assert!(cost < AMOUNT, "{kind:?} cost {cost}");
+        assert!(made.ended.unwrap() >= made.started);
+    }
+    let actions = store.actions_since(0)?;
+    let swap = actions.iter().find(|a| a.kind == Kind::Swap.key()).unwrap();
+    assert_eq!(swap.via.as_deref(), Some(eco.swaps()));
+    assert_ne!(swap.source, swap.target);
+
+    let budget = shown.lock().unwrap().clone().unwrap();
+    let spent: u64 = actions.iter().filter_map(|a| a.cost).sum();
+    assert_eq!(budget.spent, spent);
+    assert!(spent > 0, "fees are paid");
+    // What was spent is what the wallet holds less, all of it.
+    assert_eq!(budget.balance, Some(20_000 - spent));
+    Ok(())
+}

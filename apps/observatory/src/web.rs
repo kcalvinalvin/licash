@@ -984,6 +984,13 @@ fn moves_body(view: &View) -> String {
              moves nothing.</p></section>",
         ),
         Some(budget) => {
+            for note in &budget.notes {
+                let _ = write!(
+                    out,
+                    "<section class=\"calm\"><p><span class=\"state warn\">! {}</span></p></section>",
+                    esc(note)
+                );
+            }
             out.push_str("<section class=\"cards\">");
             out.push_str(&card(
                 "Spent",
@@ -1074,7 +1081,7 @@ section{margin-bottom:8px;overflow-x:auto}
 .calm{padding:14px 18px}
 .dim{color:var(--dim)}
 .state{font-weight:600;white-space:nowrap}
-.state.ok{color:var(--accent)}.state.bad{color:var(--bad)}.state.idle{color:var(--idle)}
+.state.ok{color:var(--accent)}.state.bad{color:var(--bad)}.state.idle{color:var(--idle)}.state.warn{color:var(--warn)}
 .split{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
 .facts{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;margin:0;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px 18px}
 .facts dt{color:var(--dim)}.facts dd{margin:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}

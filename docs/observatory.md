@@ -60,6 +60,54 @@ Terms are read part by part. A service running another version, whose info
 has a part this one cannot read, shows that part as not known, and is still
 counted as up.
 
+## Moving a balance
+
+With `--budget SAT`, the observatory also keeps a wallet,
+`wallet.sqlite` in its data directory, made with a seed of its own on the
+first run, and moves part of it between the services it watches. This
+measures what probes cannot: whether payments go through, how long they
+take, and what they cost.
+
+| Move | What it does | Share of the budget | At most every |
+| --- | --- | --- | --- |
+| In Licash | pays itself at a hub | 10% | 10 minutes |
+| Between hubs | swaps through a provider from one hub to another | 30% | 30 minutes |
+| Over Lightning | pays another hub's invoice, from a hub's gateway or through a provider | 30% | 30 minutes |
+| On Bitcoin | not made yet | 30% | 24 hours |
+
+Each move moves `--amount` sat (2,000 by default). How often a kind of
+move comes is its share of the budget over what its last moves cost: a
+move costing 3 sat comes far more often than one costing 300, and none
+more often than the table's limit. Each wait is drawn between half and one
+and a half times that mean, so no service can tell when the next comes.
+A move is made only if the 30 days before it, with its quote, stay within
+its share and the whole budget.
+
+Moves are made one at a time, and each costs what the wallet holds less
+after it: fees, and anything lost. Only services that answered their last
+probe are used, a source hub only if it holds enough, and the rest at
+random. A move not done in time (2 minutes in Licash, 15 between hubs, 5
+over Lightning) counts as failed; the wallet takes it on later, as it does
+moves under way when the observatory stops.
+
+Fund the wallet at any hub the observatory watches, with the `licash-wallet`
+CLI beside it, and let the observatory take the payment on:
+
+```sh
+export LICASH_WALLET=./observatory/wallet.sqlite
+licash-wallet invoice 20000 --hub https://hub.example   # pay it from any node
+licash-wallet balance
+```
+
+The *Moves* page shows the budget, what each kind spent, when the next
+comes, and every move with its route, time, quote and cost. The success
+leaderboard ranks services by the share of moves through them that went
+through.
+
+The balance is unprotected, like any hub's notes without a contract:
+keep it small, as a hub that stops paying loses it. Pay it out with
+`licash-wallet` when the observatory stops.
+
 ## JSON API
 
 `GET /api/v1/view?range=7d` returns everything the pages show.
@@ -75,8 +123,10 @@ written by a later version rather than misreading them.
 
 ```sh
 docker build -f apps/observatory/Dockerfile -t licash-observatory .
-docker run -d -p 8350:8350 -v licash-observatory:/data licash-observatory run --network signet
+docker run -d --name observatory -p 8350:8350 -v licash-observatory:/data \
+  licash-observatory run --network signet --budget 5000
+docker exec observatory licash-wallet invoice 20000 --hub https://hub.example
 ```
 
-The image listens on `0.0.0.0:8350` and keeps its records and Tor's state
-in `/data`.
+The image listens on `0.0.0.0:8350` and keeps its records, wallet and
+Tor's state in `/data`; `licash-wallet` in it uses that wallet.

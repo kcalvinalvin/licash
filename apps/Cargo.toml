@@ -28,6 +28,7 @@ licash-chain-client = { path = "chain-client" }
 licash-dashboard = { path = "dashboard" }
 licash-lightning = { path = "../crates/licash-lightning", features = ["lnd"] }
 licash-nostr = { path = "nostr" }
+licash-observatory = { path = "observatory" }
 licash-notify = { path = "notify" }
 licash-tor = { path = "tor" }
 licash-transport = { path = "transport" }

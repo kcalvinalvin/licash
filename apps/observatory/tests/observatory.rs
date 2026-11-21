@@ -12,6 +12,7 @@ use http_body_util::BodyExt;
 use licash_nostr::Route;
 use licash_observatory::{
     budget::{self, Budget, Kind},
+    mover::{Mover, Moving, Skipped},
     observer::{self, Watching},
     probe::Dialer,
     store::{self, Action, Outcome, Role, Service, Store},
@@ -355,4 +356,54 @@ fn a_later_schema_is_refused() {
     drop(db);
     let refused = Store::open(&path).err().unwrap().to_string();
     assert!(refused.contains("later version"), "{refused}");
+}
+
+#[tokio::test]
+async fn an_unfunded_mover_moves_nothing_and_says_so() {
+    let w = world().await;
+    observer::round(w.store.clone(), watching()).await;
+    let mut seed = [7; 32];
+    seed[0] = 1;
+    let wallet = licash_wallet::Wallet::create(
+        &w._dir.path().join("wallet.sqlite"),
+        &seed,
+        licash::spend::ChainProfile::Core30DefaultRegtest,
+        licash_transport::Http::new(None).unwrap(),
+    )
+    .unwrap();
+    let shown = Arc::new(Mutex::new(None));
+    let moving = Moving {
+        store: w.store.clone(),
+        monthly: 10_000,
+        amount: 1_000,
+        fresh: 60_000,
+        shown: shown.clone(),
+    };
+    let mut mover = Mover::new(wallet, moving).unwrap();
+    for kind in [Kind::Hub, Kind::Swap, Kind::Lightning] {
+        let skipped = mover.move_now(kind).await.unwrap_err();
+        assert!(
+            matches!(skipped, Skipped::NoRoute(_)),
+            "{kind:?}: {skipped:?}"
+        );
+    }
+    assert!(
+        w.store.actions_since(0).unwrap().is_empty(),
+        "nothing recorded"
+    );
+    let budget = shown.lock().unwrap().clone().unwrap();
+    assert_eq!(budget.balance, Some(0));
+    assert!(
+        budget.notes.iter().any(|n| n.contains("fund it")),
+        "{:?}",
+        budget.notes
+    );
+    // The fake hub's info is not a hub the wallet can use.
+    assert!(
+        budget.notes.iter().any(|n| n.contains("can't use")),
+        "{:?}",
+        budget.notes
+    );
+    let chain = budget.kinds.iter().find(|k| k.kind == Kind::Chain).unwrap();
+    assert!(!chain.enabled);
 }

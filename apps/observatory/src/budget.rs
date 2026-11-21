@@ -130,6 +130,8 @@ pub struct Budget {
     /// What the wallet holds, if known.
     pub balance: Option<u64>,
     pub kinds: Vec<KindBudget>,
+    /// What the operator should know: the wallet empty, a hub it can't use.
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -165,6 +167,7 @@ impl Budget {
             spent: spent(last_month, None),
             balance,
             kinds,
+            notes: Vec::new(),
         }
     }
 }

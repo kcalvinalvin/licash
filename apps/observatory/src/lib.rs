@@ -10,6 +10,7 @@
 
 pub mod budget;
 pub mod format;
+pub mod mover;
 pub mod observer;
 pub mod probe;
 pub mod store;

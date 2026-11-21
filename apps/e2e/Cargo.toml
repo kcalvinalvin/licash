@@ -10,6 +10,7 @@ publish = false
 licash.workspace = true
 licash-api.workspace = true
 licash-nostr = { workspace = true, features = ["wallet"] }
+licash-observatory.workspace = true
 licash-onchain.workspace = true
 licash-transport.workspace = true
 licash-wallet.workspace = true
