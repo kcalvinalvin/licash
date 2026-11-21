@@ -10,7 +10,8 @@ Home is the balance, how much of it is protected, one line while something
 is going on, Receive and Send. The rest waits behind a tap: where the money
 is behind the balance (a page for each hub, to cash out and protect, and
 one for what is on Bitcoin), the history behind Activity (or a swipe up),
-what a payment cost and how it was made behind its line, what a word means
+and behind its chart button Stats, what the history came to, what a payment
+cost and how it was made behind its line, what a word means
 behind its (i). Times are said as times, never as blocks; ids, notes and
 providers show in advanced mode only. With no hub yet, Home lists the hubs
 announced on Nostr to pick from, or takes one by its address. While a new
@@ -40,6 +41,25 @@ split their fee by who gets it, as quoted or recorded: the hub, the payout
 or swap provider, and the Bitcoin network for a payout's claim. Historical
 rates or splits that were not saved are identified as unavailable, never
 reconstructed from today's terms.
+
+Stats covers a day, week, month, year or all of it, each stepped back to
+the one before: the fees paid (with their share of what was sent), the
+balance over the period, what came in and went out and how many, each by
+way (in Licash, over Lightning, on Bitcoin), and what each way of paying
+usually cost and took, the cheapest first, its average a tap away. Fees are
+by purpose (sending, moving, keeping notes in shape, protection) and, folded,
+by whom they were paid; times are how long each kind of payment, optimizing
+and unlinking took. It is worked out on the phone from the wallet's own
+records when it opens: nothing is stored or asked of the network, so a wallet
+of an earlier version has all its past at once. Fees count once settled (a
+payment that failed costs nothing), and the usual is the median. Renewals and
+the notes made for exact amounts, which the history hides, count as upkeep.
+A payment's time is known only for those done, and the balance is replayed
+from when notes came and were spent and coins were found and spent, so it is
+about, not exact, around a move from Bitcoin into notes. The notes a swap
+brings, and the part of a protection returned as notes, are not counted as
+received (the latter is found as the receipt of exactly that amount at that
+hub, after the contract was asked for).
 
 Settings is one page: the hubs (each tapped for its fees, more added by
 address or found on Nostr), Backup, Bitcoin (each step of catching up:
