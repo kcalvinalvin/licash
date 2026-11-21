@@ -824,11 +824,10 @@ impl Openings {
         let job = |evidence: &[Evidence]| {
             let x_at = tip.saturating_add(1);
             let release = x_at.saturating_add(o.base.parts().chain.work_depth);
-            let bytes = recovery::evidence_to_bytes(evidence).len();
             (
                 assert_deadline(o, x_at),
                 release,
-                estimated_cycles(o, bytes, release),
+                estimated_cycles(o, evidence, release),
             )
         };
         if let Some(prover) = prover.filter(|_| !responded) {
@@ -1195,12 +1194,12 @@ impl Openings {
                 }
                 let pinned = pinned.context("responded on no pinned evidence")?;
                 let release = x_at.saturating_add(depth);
-                commit(
-                    release,
-                    estimated_cycles(o, pinned.len(), release),
-                    false,
-                    false,
-                );
+                // Unread, all its bytes as others': it is not proven anyway.
+                let cycles = match pinned_evidence(o, &pinned) {
+                    Ok(evidence) => estimated_cycles(o, &evidence, release),
+                    Err(_) => estimated_bytes_cycles(o, pinned.len(), 0, release),
+                };
+                commit(release, cycles, false, false);
                 if tip < release {
                     return Ok(Err(Played::Idle));
                 }
@@ -2499,16 +2498,24 @@ fn assert_deadline(o: &HubOpening, c_at: u32) -> u32 {
         .saturating_sub(g.deadline_margin)
 }
 
-/// The cycles of the proof of `o`'s statement on `evidence` bytes of
-/// evidence, its input made at `at`: until its input is, from its headers
-/// and its size (the exit's transactions and proofs about 8 kB).
-fn estimated_cycles(o: &HubOpening, evidence: usize, at: u32) -> u64 {
+/// The cycles of the proof of `o`'s statement on `evidence`, its input made
+/// at `at`: until its input is, from its headers and its size (the exit's
+/// transactions and proofs about 8 kB), the bodies of the spends it cites
+/// by their signatures at what hashing them costs.
+fn estimated_cycles(o: &HubOpening, evidence: &[Evidence], at: u32) -> u64 {
+    let bytes = recovery::evidence_to_bytes(evidence).len();
+    estimated_bytes_cycles(o, bytes, prover::body_bytes(evidence), at)
+}
+
+/// [`estimated_cycles`] of `evidence` bytes of evidence, `bodies` of them
+/// spends' bodies.
+fn estimated_bytes_cycles(o: &HubOpening, evidence: usize, bodies: u64, at: u32) -> u64 {
     let chain = &o.base.parts().chain;
+    let other = (o.base.to_bytes().len() + evidence + 8_192) as u64;
+    let per_header = prover::header_cycles(o.base.parts().graph.id);
     if recovery::chained(o.base.parts().graph.id) {
         // not of the contract's age: its tail, openings and receipt
-        let other = o.base.to_bytes().len() + evidence + 8_192;
-        let per_header = prover::header_cycles(o.base.parts().graph.id);
-        return prover::cycles(per_header, prover::TAIL_HEADERS, other as u64)
+        return prover::cycles_with_bodies(per_header, prover::TAIL_HEADERS, other, bodies)
             + prover::SIGNATURE_CYCLES
             + prover::OPENING_CYCLES
             + prover::RESOLVE_CYCLES;
@@ -2518,9 +2525,8 @@ fn estimated_cycles(o: &HubOpening, evidence: usize, at: u32) -> u64 {
         .saturating_sub(from)
         .saturating_add(1)
         .min(chain.max_headers);
-    let other = o.base.to_bytes().len() + evidence + 8_192;
-    let per_header = prover::header_cycles(o.base.parts().graph.id);
-    prover::cycles(per_header, u64::from(headers), other as u64) + prover::SIGNATURE_CYCLES
+    prover::cycles_with_bodies(per_header, u64::from(headers), other, bodies)
+        + prover::SIGNATURE_CYCLES
 }
 
 /// The evidence pinned as `bytes`: none for empty bytes (a response pinned

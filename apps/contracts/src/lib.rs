@@ -366,10 +366,11 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
 /// `r0/programs/<image id>.bin`: the contracts opened under one are
 /// proven with it alone, so none named here or in [`SIGNET_BEFORE`] is
 /// to go while this build reads their Bases. A contract keeps its program
-/// when this one changes. Its notes are of the note format v3 (graph id
-/// [`licash::recovery::BOUND_BASE_FROM`]).
+/// when this one changes. Its notes are of the note format v4, and its
+/// hub cites spends by their owners' signatures (graph id
+/// [`licash::recovery::SIGNED_FROM`]).
 pub const SIGNET: [u8; 32] =
-    hex!("696d978c9c055a8a365ac9eb65b8ee907b3441f6f0bca1db912f787d63567d7f");
+    hex!("ff8d5db8927069ba98fbdbfcdef8fb8c4742f4b4a046e7575201b816c64e7d7a");
 
 /// Whether [`SIGNET`] decides the compact filing: true only for a program
 /// built from a tree whose `licash::recovery` reads it, and set in the
@@ -520,10 +521,10 @@ mod tests {
     fn the_hub_statement_image_is_pinned() {
         assert_eq!(
             SIGNET,
-            hex!("696d978c9c055a8a365ac9eb65b8ee907b3441f6f0bca1db912f787d63567d7f"),
+            hex!("ff8d5db8927069ba98fbdbfcdef8fb8c4742f4b4a046e7575201b816c64e7d7a"),
             "keep every funded contract's pinned guest available when changing opening trust"
         );
-        // Emptied at the note format v3, whose build reads no earlier Base:
+        // Emptied at the note format v3 and again at v4, whose builds read no earlier Base:
         // otherwise a program contracts opened under is never to go.
         assert_eq!(SIGNET_BEFORE, [[0; 32]; 0]);
     }

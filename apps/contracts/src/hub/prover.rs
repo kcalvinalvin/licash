@@ -29,7 +29,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context as _, Result};
-use licash::recovery::COMPACT_FROM;
+use licash::recovery::{Evidence, COMPACT_FROM};
 use licash::spend::ChainProfile;
 
 /// Cycles the statement takes for each header of an input, and for each
@@ -43,12 +43,32 @@ pub(super) const HEADER_CYCLES: u64 = 28_000;
 /// header once, on the zkVM's accelerator: 3,000 headers more took 28.2 M
 /// cycles on 73.0 M (9.4 k each), 10 k with a margin of its own.
 pub(super) const COMPACT_HEADER_CYCLES: u64 = 10_000;
-/// Of the program of note format v3, whose issuance proofs hash their base
-/// (one fixed-base multiplication more a linked note): the answered test
-/// input, 15 headers and 35.2 kB more, took 79.2 M cycles (73.0 M under the
-/// program before). Its like of funded notes, 27.6 kB, took 70.2 M: they
-/// cost more a byte, and the model reads them 11% under.
-pub(super) const BYTE_CYCLES: u64 = 2_250;
+/// Of the program of note format v4, which verifies each note a spend is
+/// read with once: the benchmark's answered input (`r0/host/bench.bin`, a
+/// spend cited whole), 15 headers and 35.2 kB more, took 61.1 M cycles
+/// (79.2 M under the program before). The statement's answered test input
+/// of funded notes, 18.8 kB, took 35.4 M: they cost more a byte, and the
+/// model reads them 7% under.
+pub(super) const BYTE_CYCLES: u64 = 1_740;
+
+/// Cycles each byte of a spend's body costs where the spend is cited by
+/// its owners' signatures ([`Evidence::Signed`]): hashed to its id and read
+/// at the inputs relied on alone. 32 spends of the largest bodies took
+/// 10.7 M cycles more than as many of the least, for 534.6 kB more of
+/// bodies (20 a byte): 40 with a margin.
+pub(super) const BODY_BYTE_CYCLES: u64 = 40;
+
+/// The bytes of `evidence`'s spends cited by their signatures that are
+/// their bodies, which cost [`BODY_BYTE_CYCLES`] a byte, not
+/// [`BYTE_CYCLES`].
+pub(super) fn body_bytes(evidence: &[Evidence]) -> u64 {
+    (evidence.iter())
+        .map(|e| match e {
+            Evidence::Signed { body, .. } => body.len() as u64,
+            _ => 0,
+        })
+        .sum()
+}
 
 /// Cycles a chained statement takes beyond its filing, signatures and the
 /// headers it reads itself: the openings of the blocks the exit and the
@@ -167,6 +187,13 @@ pub(super) fn cycles(per_header: u64, headers: u64, other: u64) -> u64 {
     per_header * headers + BYTE_CYCLES * other
 }
 
+/// [`cycles`] of an input of which `bodies` of the `other` bytes are spends'
+/// bodies ([`body_bytes`]).
+pub(super) fn cycles_with_bodies(per_header: u64, headers: u64, other: u64, bodies: u64) -> u64 {
+    let bodies = bodies.min(other);
+    cycles(per_header, headers, other - bodies) + BODY_BYTE_CYCLES * bodies
+}
+
 /// The cycles of the largest proof of an exit a contract commits the hub
 /// to: of each of its `headers`, from its checkpoint to its close, and of
 /// its Base (`base` bytes), its publication (`publication` bytes at most),
@@ -186,8 +213,11 @@ pub(super) fn worst_cycles(headers: u32, publication: u32, base: usize, graph: u
 }
 
 /// The cycles of the statement's input `bytes` (`HubInput::to_bytes`):
-/// Base, then the exit's headers; of a contract of graph `graph`.
+/// Base, then the exit's headers; of a contract of graph `graph`. The
+/// bodies of the spends it cites by their signatures count as such, if it
+/// reads as an input; all its bytes as others' if not.
 pub(super) fn input_cycles(bytes: &[u8], graph: u32) -> u64 {
+    let bodies = licash_hp::HubInput::from_bytes(bytes).map_or(0, |i| body_bytes(&i.evidence));
     let word = |at: usize| {
         bytes.get(at..at + 4).map_or(0, |w| {
             u32::from_be_bytes(w.try_into().unwrap_or_default()) as usize
@@ -199,7 +229,7 @@ pub(super) fn input_cycles(bytes: &[u8], graph: u32) -> u64 {
         true => OPENING_CYCLES + RESOLVE_CYCLES,
         false => 0,
     };
-    cycles(header_cycles(graph), headers, other) + chained
+    cycles_with_bodies(header_cycles(graph), headers, other, bodies) + chained
 }
 
 /// The target time between blocks of `profile`, in seconds.
@@ -1110,14 +1140,64 @@ mod tests {
             tail: 100.0,
         };
         assert_eq!(speed.seconds(500_001), MARGIN * (3.0 * 3.0 + 100.0));
-        // The statement's answered test input, 36,401 bytes of which 15
-        // headers, under the program of note format v3: 79.2 M measured.
-        let measured: f64 = 79_167_509.0;
-        let estimated = cycles(COMPACT_HEADER_CYCLES, 15, 36_401 - 15 * 80) as f64;
+        // The benchmark's answered input, 36,399 bytes of which 15
+        // headers, under the program of note format v4: 61.1 M measured.
+        let measured: f64 = 61_103_704.0;
+        let estimated = cycles(COMPACT_HEADER_CYCLES, 15, 36_399 - 15 * 80) as f64;
         assert!((estimated / measured - 1.0).abs() < 0.01, "{estimated}");
-        // Its like of funded notes, 28,775 bytes: 70.2 M, read 11% under.
-        let estimated = cycles(COMPACT_HEADER_CYCLES, 15, 28_775 - 15 * 80) as f64;
-        assert!((estimated / 70_213_532.0 - 1.0).abs() < 0.12, "{estimated}");
+        // The statement's answered test input of funded notes, 20,009
+        // bytes: 35.4 M, read 7% under.
+        let estimated = cycles(COMPACT_HEADER_CYCLES, 15, 20_009 - 15 * 80) as f64;
+        assert!((estimated / 35_358_443.0 - 1.0).abs() < 0.08, "{estimated}");
+    }
+
+    /// The bodies of spends cited by their signatures are hashed, not read:
+    /// the statement's input of 32 notes each cited from a spend of the
+    /// largest body, 565,134 bytes of which 543,360 of bodies, took 42.9 M
+    /// cycles, and of each cited from a spend of the least, 30,574 bytes of
+    /// which 8,800, 32.2 M. Read over, never under; as bytes like others,
+    /// 23 times over.
+    #[test]
+    fn a_spends_body_cited_by_signatures_costs_its_hashing() {
+        let read = |bytes: u64, bodies: u64| {
+            cycles_with_bodies(COMPACT_HEADER_CYCLES, 15, bytes - 15 * 80, bodies) as f64
+        };
+        for (bytes, bodies, measured) in [
+            (565_134, 543_360, 42_891_265.0),
+            (30_574, 8_800, 32_239_253.0),
+        ] {
+            let estimated = read(bytes, bodies);
+            assert!((1.0..1.4).contains(&(estimated / measured)), "{estimated}");
+        }
+        assert!(read(565_134, 0) > 20.0 * 42_891_265.0);
+        // Bodies are at most the bytes they are of.
+        assert_eq!(read(30_574, 10_000_000), read(30_574, 30_574 - 15 * 80));
+        // An input that does not read counts all its bytes as others'.
+        let mut bytes = Vec::new();
+        bytes.extend(3u32.to_be_bytes());
+        bytes.extend([7; 3]);
+        bytes.extend(0u32.to_be_bytes());
+        bytes.extend([1; 10]);
+        assert_eq!(
+            input_cycles(&bytes, COMPACT_FROM),
+            cycles(COMPACT_HEADER_CYCLES, 0, bytes.len() as u64)
+        );
+    }
+
+    /// The largest proof a contract of the hub citing spends by their
+    /// signatures commits it to ([`licash::recovery::SIGNED_FROM`]) is a
+    /// chained one's, and bounds the most evidence a claim may need: 42.9 M
+    /// measured with every spend's body the largest.
+    #[test]
+    fn a_contract_citing_by_signatures_bounds_its_worst_evidence() {
+        use licash::recovery::{BOUND_BASE_FROM, SIGNED_FROM};
+        let worst = |graph| worst_cycles(105_120, 64_000, 4_000, graph);
+        assert_eq!(worst(SIGNED_FROM), worst(BOUND_BASE_FROM));
+        assert!(worst(SIGNED_FROM) > 42_891_265);
+        assert_eq!(
+            worst(SIGNED_FROM),
+            worst_cycles(1, 64_000, 4_000, SIGNED_FROM)
+        );
     }
 
     #[test]

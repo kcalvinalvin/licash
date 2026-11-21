@@ -174,7 +174,7 @@ mod tests {
         std::fs::write(&path, b"packed").unwrap();
         assert_eq!(program(Some(path.to_str().unwrap())).unwrap(), b"packed");
         // The program contracts open under on signet, kept in the checkout.
-        let signet = "696d978c9c055a8a365ac9eb65b8ee907b3441f6f0bca1db912f787d63567d7f";
+        let signet = "ff8d5db8927069ba98fbdbfcdef8fb8c4742f4b4a046e7575201b816c64e7d7a";
         assert!(!program(Some(signet)).unwrap().is_empty());
         let unknown = "00".repeat(32);
         assert!(program(Some(&unknown)).is_err());
