@@ -11,6 +11,15 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedContentTransitionScope
+import androidx.compose.animation.ContentTransform
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -88,6 +97,25 @@ private fun parent(screen: Screen): Screen = when (screen) {
     else -> Screen.Home
 }
 
+/** How deep in the app `screen` is: Home, a page of it, what a page opens. */
+private fun depth(screen: Screen): Int = when (screen) {
+    Screen.Home -> 0
+    is Screen.Details -> 2
+    is Screen.Send -> if (screen.from is Screen.Money) 2 else 1
+    else -> 1
+}
+
+/**
+ * How one screen gives way to another: a fade, and a short slide the way
+ * it goes, deeper from the right and back from the left. The system's
+ * setting for animations scales it, or ends it.
+ */
+private fun AnimatedContentTransitionScope<Screen>.moving(): ContentTransform {
+    val way = if (depth(targetState) >= depth(initialState)) 1 else -1
+    return (fadeIn(tween(210, delayMillis = 70)) + slideInHorizontally(tween(280)) { it / 14 * way }) togetherWith
+        (fadeOut(tween(70)) + slideOutHorizontally(tween(280)) { -it / 14 * way })
+}
+
 class MainActivity : ComponentActivity() {
     /** A `bitcoin:` link the app was opened with, not yet shown. */
     private var link by mutableStateOf<String?>(null)
@@ -155,41 +183,50 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
                         Wordmark(size = 40)
                     }
                     !ui.wallet -> Onboarding(engine, ui)
-                    else -> when (val s = screen) {
-                        Screen.Home -> Home(
-                            engine,
-                            ui,
-                            receive = { screen = Screen.Receive },
-                            send = { screen = Screen.Send(null) },
-                            settings = { screen = Screen.Settings },
-                            money = { screen = Screen.Money(at = it) },
-                            history = { screen = Screen.History },
-                            open = { screen = Screen.Details(it, Screen.Home) },
-                        )
-                        Screen.History -> History(engine, ui, open = { screen = Screen.Details(it) }) { screen = Screen.Home }
-                        Screen.Receive -> Receive(engine) { screen = Screen.Home }
-                        is Screen.Send -> Send(
-                            engine,
-                            ui,
-                            s.link,
-                            s.cashOut,
-                            s.own,
-                            s.amount,
-                            toBitcoin = { screen = Screen.Money(Screen.Home, ON_BITCOIN) },
-                            toReceive = { screen = Screen.Receive },
-                        ) { screen = s.from }
-                        Screen.Settings -> Settings(engine, ui, balance = { screen = Screen.Money(Screen.Settings) }) {
-                            screen = Screen.Home
+                    else -> AnimatedContent(
+                        targetState = screen,
+                        modifier = Modifier.fillMaxSize(),
+                        transitionSpec = { moving() },
+                        // A page that only changes what it shows keeps its state, and does not animate.
+                        contentKey = { it::class },
+                        label = "screen",
+                    ) { s ->
+                        when (s) {
+                            Screen.Home -> Home(
+                                engine,
+                                ui,
+                                receive = { screen = Screen.Receive },
+                                send = { screen = Screen.Send(null) },
+                                settings = { screen = Screen.Settings },
+                                money = { screen = Screen.Money(at = it) },
+                                history = { screen = Screen.History },
+                                open = { screen = Screen.Details(it, Screen.Home) },
+                            )
+                            Screen.History -> History(engine, ui, open = { screen = Screen.Details(it) }) { screen = Screen.Home }
+                            Screen.Receive -> Receive(engine) { screen = Screen.Home }
+                            is Screen.Send -> Send(
+                                engine,
+                                ui,
+                                s.link,
+                                s.cashOut,
+                                s.own,
+                                s.amount,
+                                toBitcoin = { screen = Screen.Money(Screen.Home, ON_BITCOIN) },
+                                toReceive = { screen = Screen.Receive },
+                            ) { screen = s.from }
+                            Screen.Settings -> Settings(engine, ui, balance = { screen = Screen.Money(Screen.Settings) }) {
+                                screen = Screen.Home
+                            }
+                            is Screen.Money -> Money(
+                                engine,
+                                ui,
+                                at = s.at,
+                                go = { screen = s.copy(at = it) },
+                                cashOut = { hub, amount -> screen = Screen.Send(null, hub, s, amount = amount) },
+                                payOwn = { link, own -> screen = Screen.Send(link, from = s, own = own) },
+                            ) { screen = s.from }
+                            is Screen.Details -> ActivityDetails(engine, ui, s.activity) { screen = s.from }
                         }
-                        is Screen.Money -> Money(
-                            engine,
-                            ui,
-                            at = s.at,
-                            go = { screen = s.copy(at = it) },
-                            cashOut = { hub, amount -> screen = Screen.Send(null, hub, s, amount = amount) },
-                            payOwn = { link, own -> screen = Screen.Send(link, from = s, own = own) },
-                        ) { screen = s.from }
-                        is Screen.Details -> ActivityDetails(engine, ui, s.activity) { screen = s.from }
                     }
                 }
             }

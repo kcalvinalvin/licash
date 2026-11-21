@@ -1,6 +1,11 @@
 package org.licash.wallet.ui
 
 import android.content.Intent
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -309,180 +314,189 @@ fun Send(
         TopBar(if (cashOut == null && ownAddress == null) "Send" else "Cash out", back)
         Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState())) {
             CompositionLocalProvider(LocalWait provides wait) {
-                when (val s = step) {
-                    Step.Looking -> {
-                        if (cashOut != null) {
-                            Spacer(Modifier.height(8.dp))
-                            BigButton("To this wallet", Modifier.fillMaxWidth().testTag("to-own")) {
+                // Each step fades into the next; one that only changes what it shows does not.
+                AnimatedContent(
+                    targetState = step,
+                    modifier = Modifier.fillMaxWidth(),
+                    transitionSpec = { fadeIn(tween(150, delayMillis = 50)) togetherWith fadeOut(tween(50)) },
+                    contentKey = { it::class },
+                    label = "step",
+                ) { s ->
+                    when (s) {
+                        Step.Looking -> {
+                            if (cashOut != null) {
+                                Spacer(Modifier.height(8.dp))
+                                BigButton("To this wallet", Modifier.fillMaxWidth().testTag("to-own")) {
+                                    scope.launch {
+                                        engine.bitcoinAddress().fold(
+                                            { own = it; step = Step.Address(it) },
+                                            { step = Step.Failed(explain(it)) },
+                                        )
+                                    }
+                                }
+                                Text(
+                                    "Or scan an address",
+                                    modifier = Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 8.dp),
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    textAlign = TextAlign.Center,
+                                )
+                            }
+                            Scanner(Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(24.dp))) { read(it) }
+                            Spacer(Modifier.height(16.dp))
+                            BigButton("Paste", Modifier.fillMaxWidth().testTag("paste"), quiet = true) {
                                 scope.launch {
-                                    engine.bitcoinAddress().fold(
-                                        { own = it; step = Step.Address(it) },
-                                        { step = Step.Failed(explain(it)) },
-                                    )
+                                    val clip = clipboard.getClipEntry()?.clipData
+                                    val text = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()?.trim()
+                                    empty = text.isNullOrEmpty()
+                                    if (!text.isNullOrEmpty()) read(text)
                                 }
                             }
-                            Text(
-                                "Or scan an address",
-                                modifier = Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 8.dp),
-                                style = MaterialTheme.typography.labelLarge,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                textAlign = TextAlign.Center,
-                            )
-                        }
-                        Scanner(Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(24.dp))) { read(it) }
-                        Spacer(Modifier.height(16.dp))
-                        BigButton("Paste", Modifier.fillMaxWidth().testTag("paste"), quiet = true) {
-                            scope.launch {
-                                val clip = clipboard.getClipEntry()?.clipData
-                                val text = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()?.trim()
-                                empty = text.isNullOrEmpty()
-                                if (!text.isNullOrEmpty()) read(text)
+                            if (empty) {
+                                Spacer(Modifier.height(8.dp))
+                                Text(
+                                    "Nothing copied yet",
+                                    modifier = Modifier.fillMaxWidth(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    textAlign = TextAlign.Center,
+                                )
                             }
+                            // Or someone paid before, by name.
+                            if (cashOut == null) Contacts(engine) { read(it.code) }
                         }
-                        if (empty) {
-                            Spacer(Modifier.height(8.dp))
-                            Text(
-                                "Nothing copied yet",
-                                modifier = Modifier.fillMaxWidth(),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                textAlign = TextAlign.Center,
-                            )
-                        }
-                        // Or someone paid before, by name.
-                        if (cashOut == null) Contacts(engine) { read(it.code) }
-                    }
-                    is Step.Paying -> Paying(engine, ui, s) { amount, shown -> plan(s, amount, shown) }
-                    Step.Busy -> Middle("One moment…")
-                    Step.Planning -> Middle("One moment…")
-                    is Step.Review -> Review(s.quote, payee(engine, s.code), s.through.takeIf { ui.developer }, { pay(s.code, s.amount) }) {
-                        // A swap first: any provider that could, to choose.
-                        if (ui.developer && s.quote.swapFrom != null) {
-                            Providers {
-                                engine.payOffers(s.code, s.amount).map { offers ->
-                                    val swaps = offers.filter { it.provider != null }
-                                    val current = s.provider ?: swaps.firstOrNull()?.provider
-                                    swaps.map { o ->
-                                        val provider = o.provider!!
-                                        val name = o.providerName ?: host(provider)
-                                        Offer(
-                                            name,
-                                            "Fees ${feeOf(o.quote.fee, o.quote.amount)}" + if (o.known) ", used before" else "",
-                                            provider == current,
-                                        ) {
-                                            step = Step.Planning
-                                            scope.launch {
-                                                step = engine.choosePayOffer(s.code, s.amount, provider).fold(
-                                                    { Step.Review(s.code, s.amount, it, provider, name) },
-                                                    { Step.Failed(explain(it)) },
-                                                )
+                        is Step.Paying -> Paying(engine, ui, s) { amount, shown -> plan(s, amount, shown) }
+                        Step.Busy -> Middle("One moment…")
+                        Step.Planning -> Middle("One moment…")
+                        is Step.Review -> Review(s.quote, payee(engine, s.code), s.through.takeIf { ui.developer }, { pay(s.code, s.amount) }) {
+                            // A swap first: any provider that could, to choose.
+                            if (ui.developer && s.quote.swapFrom != null) {
+                                Providers {
+                                    engine.payOffers(s.code, s.amount).map { offers ->
+                                        val swaps = offers.filter { it.provider != null }
+                                        val current = s.provider ?: swaps.firstOrNull()?.provider
+                                        swaps.map { o ->
+                                            val provider = o.provider!!
+                                            val name = o.providerName ?: host(provider)
+                                            Offer(
+                                                name,
+                                                "Fees ${feeOf(o.quote.fee, o.quote.amount)}" + if (o.known) ", used before" else "",
+                                                provider == current,
+                                            ) {
+                                                step = Step.Planning
+                                                scope.launch {
+                                                    step = engine.choosePayOffer(s.code, s.amount, provider).fold(
+                                                        { Step.Review(s.code, s.amount, it, provider, name) },
+                                                        { Step.Failed(explain(it)) },
+                                                    )
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
-                    is Step.Visit -> Ask(
-                        "Pay at their hub?",
-                        "Their hub is not one of yours.",
-                        "Pay there",
-                        {
-                            val paying = Step.Paying(s.code, s.asked, visit = true)
-                            if (s.asked != null) plan(paying, null, null) else step = paying
-                        },
-                        back,
-                    )
-                    Step.Quoting -> Middle("Getting a price…")
-                    is Step.Invoice -> Invoice(s.quote, ui.hubs.size > 1, { payInvoice(s.text, s.quote) }) {
-                        if (ui.developer) {
-                            Providers {
-                                engine.invoiceOffers(s.text).map { offers ->
-                                    offers.map { o ->
-                                        val through = o.provider?.let { it.name ?: host(it.url) } ?: "${name(o.hub)}'s gateway"
-                                        Offer(
-                                            through,
-                                            "Fees ${feeOf(o.fee, o.amount)}, from ${name(o.hub)}",
-                                            o == s.quote,
-                                        ) { step = Step.Invoice(s.text, o) }
+                        is Step.Visit -> Ask(
+                            "Pay at their hub?",
+                            "Their hub is not one of yours.",
+                            "Pay there",
+                            {
+                                val paying = Step.Paying(s.code, s.asked, visit = true)
+                                if (s.asked != null) plan(paying, null, null) else step = paying
+                            },
+                            back,
+                        )
+                        Step.Quoting -> Middle("Getting a price…")
+                        is Step.Invoice -> Invoice(s.quote, ui.hubs.size > 1, { payInvoice(s.text, s.quote) }) {
+                            if (ui.developer) {
+                                Providers {
+                                    engine.invoiceOffers(s.text).map { offers ->
+                                        offers.map { o ->
+                                            val through = o.provider?.let { it.name ?: host(it.url) } ?: "${name(o.hub)}'s gateway"
+                                            Offer(
+                                                through,
+                                                "Fees ${feeOf(o.fee, o.amount)}, from ${name(o.hub)}",
+                                                o == s.quote,
+                                            ) { step = Step.Invoice(s.text, o) }
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    is Step.Address -> ToAddress(
-                        s.address,
-                        own = s.address == own,
-                        prefill = cashOutAmount.takeIf { cashOut != null },
-                        all = if (cashOut != null) "Cash out all" else "Send all",
-                    ) { amount -> quote(s.address, amount) }
-                    is Step.Payout -> Payout(s.quote, s.quote.address == own, ui.hubs.size > 1, { payOut(s.quote, s.asked) }) {
-                        if (ui.developer) {
-                            Providers {
-                                engine.payoutOffers(s.quote.address, s.asked, s.quote.hub).map { offers ->
-                                    offers.map { o ->
-                                        Offer(
-                                            o.providerName ?: host(o.provider),
-                                            "Fees ${feeOf(o.fee, o.amount)}, pays ${sat(o.amount)}",
-                                            o.provider == s.quote.provider,
-                                        ) { step = Step.Payout(o, s.asked) }
+                        is Step.Address -> ToAddress(
+                            s.address,
+                            own = s.address == own,
+                            prefill = cashOutAmount.takeIf { cashOut != null },
+                            all = if (cashOut != null) "Cash out all" else "Send all",
+                        ) { amount -> quote(s.address, amount) }
+                        is Step.Payout -> Payout(s.quote, s.quote.address == own, ui.hubs.size > 1, { payOut(s.quote, s.asked) }) {
+                            if (ui.developer) {
+                                Providers {
+                                    engine.payoutOffers(s.quote.address, s.asked, s.quote.hub).map { offers ->
+                                        offers.map { o ->
+                                            Offer(
+                                                o.providerName ?: host(o.provider),
+                                                "Fees ${feeOf(o.fee, o.amount)}, pays ${sat(o.amount)}",
+                                                o.provider == s.quote.provider,
+                                            ) { step = Step.Payout(o, s.asked) }
+                                        }
                                     }
                                 }
                             }
                         }
+                        is Step.PayingOut -> Told("Sending ${sat(s.amount)}", "Arrives in ${arrives(s.depth, LocalBlockSeconds.current)}", back)
+                        is Step.Paid -> Done("Paid ${sat(s.amount)}", back, if (s.fee > 0uL) "Fee ${feeOf(s.fee, s.amount)}" else null)
+                        is Step.Sent -> {
+                            Sent(s, back)
+                            s.code?.let { SaveContact(engine, it) }
+                        }
+                        // Not to pay again: it finishes by itself.
+                        Step.Later -> Told("Under way", "It finishes by itself", back)
+                        is Step.Received -> Done("Received ${sat(s.amount)}", back)
+                        is Step.Trust -> Ask(
+                            "Take it?",
+                            "It is at ${name(s.hub)}, a hub you don't use yet. Taking it adds that hub.",
+                            "Take it",
+                            { take(s.payment, true) },
+                            back,
+                        )
+                        is Step.Approve -> Ask(
+                            "Approve higher fees?",
+                            "${name(s.raised.hub)} raised its fees since your protection there started.\n\n" +
+                                raises(s.raised).joinToString("\n") { "${it.what}: ${it.now}, was ${it.agreed}" },
+                            "Approve and pay",
+                            {
+                                step = Step.Busy
+                                scope.launch {
+                                    engine.approveFees(s.raised).fold({ s.again() }, { step = Step.Failed(explain(it)) })
+                                }
+                            },
+                            back,
+                        )
+                        is Step.FeeRose -> Ask("The fee went up", feeRose(s.agreed, s.asked), "See new price", s.requote, back)
+                        is Step.Failed -> Ask(s.title, s.why, "Try again", { step = Step.Looking }, back, failed = true)
+                        is Step.ProtectFirst -> Ask(
+                            "Protect your bitcoin first",
+                            "${s.why}\n\n$PROTECT_FIRST",
+                            "Protect",
+                            { protecting = true },
+                            back,
+                        )
+                        is Step.AddFirst -> Ask(
+                            "Your bitcoin isn't in your balance yet",
+                            "${s.why}\n\n$ADD_FIRST",
+                            "See your bitcoin",
+                            toBitcoin ?: back,
+                            back,
+                        )
+                        is Step.NothingYet -> Ask(
+                            "Nothing to pay with yet",
+                            "${s.why}\n\n$RECEIVE_FIRST",
+                            "Receive",
+                            toReceive ?: back,
+                            back,
+                        )
                     }
-                    is Step.PayingOut -> Told("Sending ${sat(s.amount)}", "Arrives in ${arrives(s.depth, LocalBlockSeconds.current)}", back)
-                    is Step.Paid -> Done("Paid ${sat(s.amount)}", back, if (s.fee > 0uL) "Fee ${feeOf(s.fee, s.amount)}" else null)
-                    is Step.Sent -> {
-                        Sent(s, back)
-                        s.code?.let { SaveContact(engine, it) }
-                    }
-                    // Not to pay again: it finishes by itself.
-                    Step.Later -> Told("Under way", "It finishes by itself", back)
-                    is Step.Received -> Done("Received ${sat(s.amount)}", back)
-                    is Step.Trust -> Ask(
-                        "Take it?",
-                        "It is at ${name(s.hub)}, a hub you don't use yet. Taking it adds that hub.",
-                        "Take it",
-                        { take(s.payment, true) },
-                        back,
-                    )
-                    is Step.Approve -> Ask(
-                        "Approve higher fees?",
-                        "${name(s.raised.hub)} raised its fees since your protection there started.\n\n" +
-                            raises(s.raised).joinToString("\n") { "${it.what}: ${it.now}, was ${it.agreed}" },
-                        "Approve and pay",
-                        {
-                            step = Step.Busy
-                            scope.launch {
-                                engine.approveFees(s.raised).fold({ s.again() }, { step = Step.Failed(explain(it)) })
-                            }
-                        },
-                        back,
-                    )
-                    is Step.FeeRose -> Ask("The fee went up", feeRose(s.agreed, s.asked), "See new price", s.requote, back)
-                    is Step.Failed -> Ask(s.title, s.why, "Try again", { step = Step.Looking }, back, failed = true)
-                    is Step.ProtectFirst -> Ask(
-                        "Protect your bitcoin first",
-                        "${s.why}\n\n$PROTECT_FIRST",
-                        "Protect",
-                        { protecting = true },
-                        back,
-                    )
-                    is Step.AddFirst -> Ask(
-                        "Your bitcoin isn't in your balance yet",
-                        "${s.why}\n\n$ADD_FIRST",
-                        "See your bitcoin",
-                        toBitcoin ?: back,
-                        back,
-                    )
-                    is Step.NothingYet -> Ask(
-                        "Nothing to pay with yet",
-                        "${s.why}\n\n$RECEIVE_FIRST",
-                        "Receive",
-                        toReceive ?: back,
-                        back,
-                    )
                 }
             }
         }
