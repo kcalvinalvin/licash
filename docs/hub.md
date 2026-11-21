@@ -759,7 +759,7 @@ docker run -d -p 8338:8338 -v licash-hub:/data licash-hub
 ## Upgrading
 
 Stop the hub, back up `<data>` (see the backups above), replace the binary and start it
-again, except from a ledger of schema 1, whose hub is not replaced (below).
+again, except from a ledger of schema 2 or 1, whose hub is not replaced (below).
 Before starting it:
 
 - Install every program of `r0/programs/` (see `docs/r0.md`): a contract
@@ -767,6 +767,28 @@ Before starting it:
   lacking one responds to none of its contested claims.
 - Expect no migration: a database or file of an earlier layout is refused
   by name, never read nor replaced.
+
+### From a ledger of schema 2
+
+A hub of note format v4 reads a `hub.sqlite` of ledger schema 3 only. Its
+grants are ones anyone verifies, and it cites a spend against a claim by
+the signatures of the owners the claim relies on, so that its proof costs
+what the claim names, not what the spend took and made; its contracts run
+a rebuilt program (graph id 14). A ledger of schema 2 is refused at start,
+saying so, and left as it is. Nothing of it carries over, as from schema 1
+(below): its contracts end under the hub that opened them, which keeps its
+binary, its programs and its URL. A Docker hub that follows `main` would
+take the new image and refuse its ledger: pin it to its own `sha-` tag
+first.
+
+The steps are those below: stop new openings with
+`--contracts-max-live 1`, run `licash-hub audit` (it reads ledgers of
+schema 1 to 3), let every contract close, then make a hub anew with `init`
+in a new `<data>` and a new seed. The provider's swaps wallet,
+`<data>/swaps/wallet.sqlite`, is a wallet of the same release (wallet
+schema 4): spend or pay out its notes at the other hubs with the old
+binary, then move it aside with the rest of `<data>`; the new hub's
+`--swaps` makes a new one.
 
 ### From a ledger of schema 1
 

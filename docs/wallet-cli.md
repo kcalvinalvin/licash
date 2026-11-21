@@ -67,7 +67,9 @@ as it is. A wallet of the release before note format v3 (wallet schema 3)
 holds notes whose issuance proofs this version does not verify: spend or pay
 out its notes, and let its contracts close, with that release's binary, then
 `init` a new wallet in another file. Hubs of v3 are new hubs, and refuse
-wallets of v2, which refuse them in turn.
+wallets of v2, which refuse them in turn. So, likewise, is a wallet of the
+release before note format v4 (wallet schema 4), whose notes and grants
+this version does not read, and hubs of v4 are new hubs.
 
 `code` prints a payment code (a BIP321 URI, `--qr` for a QR code) naming the
 wallet, the hubs it is paid at and its Nostr mailbox, if they name relays.
