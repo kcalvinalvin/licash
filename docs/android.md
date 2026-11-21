@@ -61,6 +61,19 @@ brings, and the part of a protection returned as notes, are not counted as
 received (the latter is found as the receipt of exactly that amount at that
 hub, after the contract was asked for).
 
+How much of the balance was protected on average (all protected over all
+held, so a dust balance does not weigh as a large one) cannot be known after
+the fact, since coverage is worked out live. The app writes its balance down
+as it changes (within a minute of the last, one row; an unchanged balance
+once a day), in a `stats` component of `wallet.sqlite` that the first sample
+makes: opening, reading or restoring a wallet makes none, so a wallet of an
+earlier version has nothing before the first run of this one, which Stats
+says, with how much of the period was written down. A sample holds until the
+next; across more than a day and a half with a changed balance at the end,
+nothing is claimed. The table is in backups and restored with them, but its
+rows alone are no reason to write one, and an unreadable `stats` component
+(another version, or half made) leaves everything else working.
+
 Settings is one page: the hubs (each tapped for its fees, more added by
 address or found on Nostr), Backup, Bitcoin (each step of catching up:
 Tor, the nodes, the block headers and filters against the best peer's
