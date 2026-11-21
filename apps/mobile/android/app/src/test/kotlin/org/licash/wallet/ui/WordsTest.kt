@@ -16,6 +16,34 @@ class WordsTest {
         )
 
     @Test
+    fun a_payment_with_too_little_is_sent_where_its_bitcoin_or_nothing_is() {
+        // A contract offered comes first, as before: too little, or nothing held, whatever else failed.
+        assertEquals(Lack.OFFER, lack(insufficient = true, noHub = false, notes = 5uL, bitcoin = 0uL, offered = true))
+        assertEquals(Lack.OFFER, lack(insufficient = false, noHub = false, notes = 0uL, bitcoin = 9uL, offered = true))
+        // No offer, nothing in notes, too little: bitcoin held or coming is where to look, else receive first.
+        assertEquals(Lack.BITCOIN, lack(insufficient = false, noHub = true, notes = 0uL, bitcoin = 100uL, offered = false))
+        assertEquals(Lack.NOTHING, lack(insufficient = false, noHub = true, notes = 0uL, bitcoin = 0uL, offered = false))
+        assertEquals(Lack.NOTHING, lack(insufficient = true, noHub = false, notes = 0uL, bitcoin = 0uL, offered = false))
+        // Notes held somewhere else, or a failure that is not about a balance: said as it is.
+        assertEquals(Lack.OTHER, lack(insufficient = false, noHub = true, notes = 40uL, bitcoin = 100uL, offered = false))
+        assertEquals(Lack.OTHER, lack(insufficient = true, noHub = false, notes = 40uL, bitcoin = 0uL, offered = false))
+        assertEquals(Lack.OTHER, lack(insufficient = false, noHub = false, notes = 0uL, bitcoin = 100uL, offered = false))
+    }
+
+    @Test
+    fun bitcoin_paid_to_the_wallet_with_nothing_done_about_it_is_said_waiting() {
+        // Paid on Bitcoin, no offer for it, nothing under way: waiting, less what the wallet keeps on purpose.
+        assertEquals(10_000uL, waiting(balance(onchain = 10_000uL).copy(kept = 0uL), offered = false, opening = false))
+        assertEquals(6_000uL, waiting(balance(onchain = 10_000uL).copy(kept = 4_000uL), offered = false, opening = false))
+        // Its own change and payouts only, an offer, a protection being set up or a move under way: nothing to say.
+        assertNull(waiting(balance(onchain = 10_000uL), offered = false, opening = false))
+        assertNull(waiting(balance(onchain = 10_000uL).copy(kept = 0uL), offered = true, opening = false))
+        assertNull(waiting(balance(onchain = 10_000uL).copy(kept = 0uL), offered = false, opening = true))
+        assertNull(waiting(balance(onchain = 10_000uL).copy(kept = 0uL, moving = 5_000uL), offered = false, opening = false))
+        assertNull(waiting(balance(), offered = false, opening = false))
+    }
+
+    @Test
     fun nothing_held_says_nothing_of_protection() {
         val none = protection(balance())
         assertNull(none.shield)

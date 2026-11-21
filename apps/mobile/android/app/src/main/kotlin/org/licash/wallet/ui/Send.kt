@@ -61,6 +61,7 @@ import org.licash.wallet.Ui
 import org.licash.wallet.explain
 import org.licash.wallet.feeOf
 import org.licash.wallet.host
+import org.licash.wallet.noHub
 import org.licash.wallet.sat
 import org.licash.wallet.share
 
@@ -102,6 +103,12 @@ private sealed interface Step {
 
     /** Too little in the balance to pay, and bitcoin to protect into it. */
     data class ProtectFirst(val why: String) : Step
+
+    /** Too little to pay with, nothing to offer, but bitcoin held or on its way: not in the balance yet. */
+    data class AddFirst(val why: String) : Step
+
+    /** Too little to pay with, and nothing held at all. */
+    data class NothingYet(val why: String) : Step
 }
 
 /**
@@ -118,6 +125,8 @@ fun Send(
     cashOut: String? = null,
     ownAddress: String? = null,
     cashOutAmount: ULong? = null,
+    toBitcoin: (() -> Unit)? = null,
+    toReceive: (() -> Unit)? = null,
     back: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
@@ -138,10 +147,18 @@ fun Send(
     var own by remember { mutableStateOf(ownAddress) }
 
     // Too little to pay with: protection offered first, if a coin pays for
-    // one, its rest joining the balance; else why.
+    // one, its rest joining the balance; else bitcoin held or coming, to
+    // open, or nothing held, to receive; else why.
     fun tooLittle(e: Throwable, title: String = "Couldn't pay"): Step {
-        val none = e is LicashException.Insufficient || ui.balance.notes == 0uL
-        return if (none && ui.offer != null) Step.ProtectFirst(explain(e)) else Step.Failed(explain(e), title)
+        val why = explain(e)
+        val b = ui.balance
+        val bitcoin = b.onchain + b.moving + b.opening + ui.incoming.sumOf { it.amount }
+        return when (lack(e is LicashException.Insufficient, noHub(e), b.notes, bitcoin, ui.offer != null)) {
+            Lack.OFFER -> Step.ProtectFirst(why)
+            Lack.BITCOIN -> Step.AddFirst(why)
+            Lack.NOTHING -> Step.NothingYet(why)
+            Lack.OTHER -> Step.Failed(why, title)
+        }
     }
 
     suspend fun taking(payment: String, trust: Boolean): Step =
@@ -452,6 +469,20 @@ fun Send(
                         { protecting = true },
                         back,
                     )
+                    is Step.AddFirst -> Ask(
+                        "Your bitcoin isn't in your balance yet",
+                        "${s.why}\n\n$ADD_FIRST",
+                        "See your bitcoin",
+                        toBitcoin ?: back,
+                        back,
+                    )
+                    is Step.NothingYet -> Ask(
+                        "Nothing to pay with yet",
+                        "${s.why}\n\n$RECEIVE_FIRST",
+                        "Receive",
+                        toReceive ?: back,
+                        back,
+                    )
                 }
             }
         }
@@ -461,6 +492,12 @@ fun Send(
 /** Why protecting comes before paying, with nothing in the balance yet. */
 internal const val PROTECT_FIRST = "You pay from your balance, and your bitcoin joins it once protected: " +
     "one of your coins pays for the protection, whole, and what is left of it joins your balance, covered."
+
+/** Why bitcoin held is not paid with yet, and what to do. */
+internal const val ADD_FIRST = "You pay from your balance. Open your bitcoin to protect it and add it to your balance."
+
+/** What to do when nothing is held at all. */
+internal const val RECEIVE_FIRST = "You pay from your balance, and it is empty. Receive some first."
 
 /** One fact of a payment to confirm: `tag` names its value, for the tests; a fee's `share` of the amount. */
 private class Fact(val label: String, val value: String, val tag: String, val share: String? = null, val fee: FeeBreakdown? = null)

@@ -120,6 +120,7 @@ fun Home(
                     Total(ui) { money(null) }
                     Going(engine, ui, money, history, open)
                     Offer(engine, ui)
+                    Waiting(ui, money)
                     Unprotected(engine, ui, money)
                     // A new wallet's first catching up: each step, as it goes.
                     if (ui.history.isEmpty() && catchingUp(ui)) {
@@ -251,6 +252,23 @@ private fun Offer(engine: Engine, ui: Ui) {
         onClick = { choosing = true },
     )
     if (choosing) OfferSheet(engine, q) { choosing = false }
+}
+
+/**
+ * Bitcoin paid to the wallet that no protection is offered for, nor any is
+ * being set up: said, so it is not left to be found, and opening where it
+ * is held and what to do with it.
+ */
+@Composable
+private fun Waiting(ui: Ui, money: (String?) -> Unit) {
+    val coin = waiting(ui.balance, offered = ui.offer != null, opening = ui.opening != null) ?: return
+    Spacer(Modifier.height(8.dp))
+    Pill(
+        icon = Glyphs.bitcoin,
+        text = "${sat(coin)} on Bitcoin, not in your balance",
+        tag = "waiting",
+        onClick = { money(ON_BITCOIN) },
+    )
 }
 
 /**

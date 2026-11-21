@@ -91,11 +91,15 @@ internal fun plain(reason: String): String {
     fun amount(m: MatchResult) = m.groupValues[1].toULongOrNull()?.let(::sat) ?: "${m.groupValues[1]} sat"
     NO_PAYOUT.matchEntire(reason)?.let { return "No one can send ${amount(it)} on Bitcoin right now. Try less, or later." }
     NO_MOVE.matchEntire(reason)?.let { return "No one can move ${amount(it)} between your hubs right now. Try less, or later." }
+    NO_HUB.matchEntire(reason)?.let { return "Your balance can't pay ${amount(it)} and its fee here." }
     return AMOUNT.replace(reason, ::amount).replaceFirstChar { it.uppercase() }
 }
 
 private val NO_PAYOUT = Regex("no swap provider found pays (\\d+) sat out on Bitcoin now")
 private val NO_MOVE = Regex("no swap provider found moves (\\d+) sat from \\S+ to \\S+ now")
+
+/** The core's reason when no hub a code names holds the amount and its fee, with where to pay on Bitcoin instead, if the code says. */
+private val NO_HUB = Regex("no hub it names is one trusted holding (\\d+) and the fee(?:: pay \\S+ on Bitcoin)?")
 private val AMOUNT = Regex("\\b(\\d{4,}) sat\\b")
 
 /**
@@ -122,3 +126,6 @@ fun duration(blocks: Long, blockSecs: Long = 600): String {
 /** When, from seconds since 1970. */
 fun at(seconds: Long): String =
     DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(seconds * 1000))
+
+/** Whether `e` says no hub the code names holds the amount and its fee: the payer holds too little there. */
+fun noHub(e: Throwable): Boolean = e is LicashException.Invalid && NO_HUB.matches(e.reason)

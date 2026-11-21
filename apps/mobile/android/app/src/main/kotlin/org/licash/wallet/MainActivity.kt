@@ -42,6 +42,7 @@ import org.licash.wallet.ui.Home
 import org.licash.wallet.ui.LocalBlockSeconds
 import org.licash.wallet.ui.LicashTheme
 import org.licash.wallet.ui.Money
+import org.licash.wallet.ui.ON_BITCOIN
 import org.licash.wallet.ui.Onboarding
 import org.licash.wallet.ui.Receive
 import org.licash.wallet.ui.Send
@@ -167,7 +168,16 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
                         )
                         Screen.History -> History(engine, ui, open = { screen = Screen.Details(it) }) { screen = Screen.Home }
                         Screen.Receive -> Receive(engine) { screen = Screen.Home }
-                        is Screen.Send -> Send(engine, ui, s.link, s.cashOut, s.own, s.amount) { screen = s.from }
+                        is Screen.Send -> Send(
+                            engine,
+                            ui,
+                            s.link,
+                            s.cashOut,
+                            s.own,
+                            s.amount,
+                            toBitcoin = { screen = Screen.Money(Screen.Home, ON_BITCOIN) },
+                            toReceive = { screen = Screen.Receive },
+                        ) { screen = s.from }
                         Screen.Settings -> Settings(engine, ui, balance = { screen = Screen.Money(Screen.Settings) }) {
                             screen = Screen.Home
                         }

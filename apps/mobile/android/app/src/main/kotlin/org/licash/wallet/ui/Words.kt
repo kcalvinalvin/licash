@@ -390,3 +390,46 @@ fun feeRose(agreed: ULong, asked: ULong): String =
 /** `amount` sat in bitcoin, as a payment link says it: `0.00033000`. */
 fun btc(amount: ULong): String =
     "%d.%08d".format(Locale.US, (amount / 100_000_000uL).toLong(), (amount % 100_000_000uL).toLong())
+
+/** What a payment that finds too little to pay with is told to do about it. */
+enum class Lack {
+    /** Protect what is on Bitcoin: a contract is offered for it. */
+    OFFER,
+
+    /** Open what is on Bitcoin, held or on its way: it is not in the balance yet. */
+    BITCOIN,
+
+    /** Nothing is held at all: receive first. */
+    NOTHING,
+
+    /** Not to be told apart: the reason says it. */
+    OTHER,
+}
+
+/**
+ * Where a payment that failed sends its payer. A contract offered comes
+ * first, as it always has, for `insufficient` or an empty balance, whatever
+ * else went wrong. Otherwise only a balance too small (`insufficient`, or
+ * `noHub`: no hub the code names holds the amount) with no notes at all is
+ * told to look at what is `bitcoin` held or coming, or to receive: any
+ * other failure is said as it is, and so is one with notes held, which
+ * more bitcoin does not mend.
+ */
+fun lack(insufficient: Boolean, noHub: Boolean, notes: ULong, bitcoin: ULong, offered: Boolean): Lack = when {
+    offered && (insufficient || notes == 0uL) -> Lack.OFFER
+    notes != 0uL || !(insufficient || noHub) -> Lack.OTHER
+    bitcoin > 0uL -> Lack.BITCOIN
+    else -> Lack.NOTHING
+}
+
+/**
+ * What is on Bitcoin, paid to the wallet and not its own to keep, that is
+ * not in the balance and that nothing is being done about: none offered
+ * to protect it, no protection being set up, none of it being added. The
+ * wallet's own change and payouts (`kept`) wait on purpose and are not
+ * counted. Null if there is none.
+ */
+fun waiting(balance: Balance, offered: Boolean, opening: Boolean): ULong? {
+    if (offered || opening || balance.moving > 0uL || balance.onchain <= balance.kept) return null
+    return balance.onchain - balance.kept
+}

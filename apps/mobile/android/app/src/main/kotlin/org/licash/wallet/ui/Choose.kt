@@ -160,7 +160,7 @@ internal fun ChooseSheet(
             }
         }
         if (coin == null) {
-            Say("Paid from Bitcoin you hold, and you hold none yet. Cash out to yourself first, then protect.")
+            Say("Paid from Bitcoin you hold, and you hold none yet. Receive some on Bitcoin, or cash out to yourself, then protect.")
         } else if (fit == null) {
             Text(
                 NO_FIT,

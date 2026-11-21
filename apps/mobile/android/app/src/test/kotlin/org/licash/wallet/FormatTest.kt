@@ -41,6 +41,23 @@ class FormatTest {
     }
 
     @Test
+    fun a_balance_too_small_for_a_code_is_said_in_plain_words() {
+        assertEquals(
+            "Your balance can't pay 5,000 sat and its fee here.",
+            plain("no hub it names is one trusted holding 5000 and the fee"),
+        )
+        assertEquals(
+            "Your balance can't pay 20 sat and its fee here.",
+            plain("no hub it names is one trusted holding 20 and the fee"),
+        )
+        // A code that once said where to pay on Bitcoin instead says no more of it.
+        assertEquals(
+            "Your balance can't pay 1,500 sat and its fee here.",
+            plain("no hub it names is one trusted holding 1500 and the fee: pay tb1qexample on Bitcoin"),
+        )
+    }
+
+    @Test
     fun no_provider_is_said_without_naming_providers() {
         assertEquals(
             "No one can send 20,000 sat on Bitcoin right now. Try less, or later.",

@@ -96,7 +96,7 @@ fun Money(
         val fail = { why: String -> error = why }
         when (at) {
             null -> Summary(engine, ui, held, notes, visited, go) { changed++ }
-            ON_BITCOIN -> OnBitcoin(engine, ui)
+            ON_BITCOIN -> OnBitcoin(engine, ui, go)
             else -> HubPage(
                 engine,
                 ui,
@@ -233,7 +233,7 @@ private fun Share(icon: ImageVector, tint: Color, label: String, amount: ULong, 
  * once warned.
  */
 @Composable
-private fun OnBitcoin(engine: Engine, ui: Ui) {
+private fun OnBitcoin(engine: Engine, ui: Ui, go: (String?) -> Unit) {
     val b = ui.balance
     val scope = rememberCoroutineScope()
     val coming = ui.incoming.sumOf { it.amount }
@@ -267,6 +267,18 @@ private fun OnBitcoin(engine: Engine, ui: Ui) {
     if (offer != null) {
         Spacer(Modifier.height(20.dp))
         BigButton("Protect and add to balance", Modifier.fillMaxWidth().testTag("offer-protect")) { choosing = true }
+    } else if (b.onchain > 0uL && ui.opening == null) {
+        // None offered, perhaps because it is too little for the price: the hub's own page
+        // says what protecting costs and what it takes, hub by hub.
+        val hubs = ui.hubs.filter { it.contracts != null }
+        if (hubs.isNotEmpty()) {
+            Group("Protect") {
+                hubs.forEachIndexed { i, hub ->
+                    if (i > 0) Divider()
+                    Entry("Protect at ${name(hub.url)}", tag = "protect-at", onClick = { go(hub.url) })
+                }
+            }
+        }
     }
     if (b.onchain > 0uL && b.moving == 0uL) {
         Spacer(Modifier.height(if (offer != null) 8.dp else 20.dp))
