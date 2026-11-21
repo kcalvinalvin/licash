@@ -402,6 +402,9 @@ async fn info(State((hub, services)): State<(Arc<Hub>, Services)>) -> Answer<Inf
     })
     .await?;
     info.lightning = services.gateway.and_then(|gateway| gateway.advertise());
+    if info.lightning.is_some() {
+        info.features.push(licash_api::FEATURE_MEMO.into());
+    }
     info.deposits = services.deposits.map(|deposits| deposits.advertise());
     info.contracts = services.contracts.map(|openings| openings.advertise());
     info.relays = services.relays;

@@ -69,6 +69,8 @@ pub struct Invoice {
     /// Its lock's preimage revealed only with [`crate::PROTECTED_MARGIN`]
     /// blocks left ([`Wallet::invoice_protected`]).
     pub protected: bool,
+    /// What it says to its payer, if asked ([`Wallet::invoice_saying`]).
+    pub memo: Option<String>,
 }
 
 /// Where an invoice the wallet is paid with stands.
@@ -117,20 +119,25 @@ impl Payable {
     }
 
     fn of(invoice: &Bolt11Invoice, msat: u64) -> Self {
-        let description = match invoice.description() {
-            lightning_invoice::Bolt11InvoiceDescriptionRef::Direct(d) => Some(d.to_string()),
-            lightning_invoice::Bolt11InvoiceDescriptionRef::Hash(_) => None,
-        };
         let expires_at = invoice.expires_at().map_or(i64::MAX, |at| {
             i64::try_from(at.as_secs()).unwrap_or(i64::MAX)
         });
         Self {
             request: invoice.to_string(),
             amount: msat.div_ceil(1000),
-            description: description.filter(|d| !d.is_empty()),
+            description: described(invoice),
             expires_at,
         }
     }
+}
+
+/// What `invoice` says it pays for, if it says it in words.
+fn described(invoice: &Bolt11Invoice) -> Option<String> {
+    match invoice.description() {
+        lightning_invoice::Bolt11InvoiceDescriptionRef::Direct(d) => Some(d.to_string()),
+        lightning_invoice::Bolt11InvoiceDescriptionRef::Hash(_) => None,
+    }
+    .filter(|d| !d.is_empty())
 }
 
 /// The invoice `text` carries, decoded.
@@ -656,7 +663,25 @@ impl<T: Transport> Wallet<T> {
     /// fee on top, to hand the payer. [`Wallet::follow_invoice`] claims the
     /// payment once made.
     pub async fn invoice(&self, url: &str, amount: u64) -> Result<Invoice, Error> {
-        self.invoice_with(url, amount, false).await
+        self.invoice_with(url, amount, false, None).await
+    }
+
+    /// [`Wallet::invoice`], or [`Wallet::invoice_protected`] if
+    /// `protected`, saying `memo` to its payer, if given: in its
+    /// description, which the hub and its Lightning node see too. Refused
+    /// at a hub not naming [`licash_api::FEATURE_MEMO`], which would leave
+    /// it out, and checked in the invoice it answers.
+    pub async fn invoice_saying(
+        &self,
+        url: &str,
+        amount: u64,
+        memo: Option<&str>,
+        protected: bool,
+    ) -> Result<Invoice, Error> {
+        if protected {
+            self.chain_known_to_protect()?;
+        }
+        self.invoice_with(url, amount, protected, memo).await
     }
 
     /// [`Wallet::invoice`], its lock's preimage revealed only with
@@ -671,14 +696,19 @@ impl<T: Transport> Wallet<T> {
     /// chain's height of itself, whose hub's word for it protects nothing:
     /// its payment waits, unclaimed, while it does not.
     pub async fn invoice_protected(&self, url: &str, amount: u64) -> Result<Invoice, Error> {
-        if self.tip()?.is_none() {
-            return Err(Error::Chain(
+        self.chain_known_to_protect()?;
+        self.invoice_with(url, amount, true, None).await
+    }
+
+    fn chain_known_to_protect(&self) -> Result<(), Error> {
+        match self.tip()? {
+            Some(_) => Ok(()),
+            None => Err(Error::Chain(
                 "the chain's height is not known to the wallet itself, to protect an \
                  invoice by: tell it, or scan"
                     .into(),
-            ));
+            )),
         }
-        self.invoice_with(url, amount, true).await
     }
 
     async fn invoice_with(
@@ -686,7 +716,12 @@ impl<T: Transport> Wallet<T> {
         url: &str,
         amount: u64,
         protected: bool,
+        memo: Option<&str>,
     ) -> Result<Invoice, Error> {
+        let memo = memo
+            .map(licash_api::memo)
+            .transpose()
+            .map_err(|p| Error::Invalid(p.message))?;
         let url = hub_url(url)?;
         self.not_visited(&url)?;
         let (hub, info) = self.refresh(&url).await?;
@@ -694,6 +729,11 @@ impl<T: Transport> Wallet<T> {
             .lightning
             .as_ref()
             .ok_or_else(|| Error::Invalid(format!("hub {url} takes no Lightning payments")))?;
+        if memo.is_some() && !info.features.iter().any(|f| f == licash_api::FEATURE_MEMO) {
+            return Err(Error::Invalid(format!(
+                "hub {url} puts no memo in its invoices"
+            )));
+        }
         if amount < lightning.min_receive || amount > lightning.max_receive {
             return Err(Error::Invalid(format!(
                 "hub {url} takes {} to {} over Lightning",
@@ -712,7 +752,7 @@ impl<T: Transport> Wallet<T> {
         let mut preimage = [0; 32];
         OsRng.fill_bytes(&mut preimage);
         let hash = lock_hash(&preimage);
-        let body = Receive::new(keyset.id(), &ephemeral.public(), &outputs, &hash);
+        let body = Receive::new(keyset.id(), &ephemeral.public(), &outputs, &hash).with_memo(memo);
         let body = serde_json::to_string(&body).map_err(invalid)?;
         self.store.write(|tx| {
             tx.execute(
@@ -796,6 +836,12 @@ impl<T: Transport> Wallet<T> {
                     &url,
                     "it answered an invoice of another payment",
                 ));
+            }
+            if let Some(memo) = &body.memo {
+                // Never handed out: the payer would not read what it was asked to.
+                if described(&invoice).as_ref() != Some(memo) {
+                    return self.cancel_invoice(hash, "its hub left the memo out of the invoice");
+                }
             }
             self.store.write(|tx| {
                 tx.execute(
@@ -891,7 +937,7 @@ impl<T: Transport> Wallet<T> {
 }
 
 const INVOICES: &str = "SELECT i.hash, r.url, i.amount, i.request, i.done_at IS NOT NULL,
-    i.canceled, i.created_at, i.lock, i.done_at, i.protected
+    i.canceled, i.created_at, i.lock, i.done_at, i.protected, i.body
     FROM invoices i JOIN reach r ON r.hub = i.hub";
 
 fn invoice_of(r: &Row<'_>) -> rusqlite::Result<Invoice> {
@@ -910,5 +956,9 @@ fn invoice_of(r: &Row<'_>) -> rusqlite::Result<Invoice> {
         lock: r.get::<_, Option<[u8; 32]>>(7)?.map(hex::encode),
         received_at: r.get(8)?,
         protected: r.get(9)?,
+        // As asked: an older wallet's asked none.
+        memo: serde_json::from_str::<Receive>(&r.get::<_, String>(10)?)
+            .ok()
+            .and_then(|asked| asked.memo),
     })
 }

@@ -892,6 +892,50 @@ fn a_provider_taking_donations_says_where_payers_reach_it() {
 }
 
 #[test]
+fn a_memo_is_its_words_one_space_apart_short_and_printable() {
+    use licash_api::{memo, MAX_MEMO};
+    assert_eq!(memo("  Lunch\n on\tFriday ").unwrap(), "Lunch on Friday");
+    assert_eq!(memo("café ☕").unwrap(), "café ☕");
+    let longest = "é".repeat(MAX_MEMO);
+    assert_eq!(memo(&longest).unwrap(), longest);
+    for refused in ["", " \n ", &"x".repeat(MAX_MEMO + 1), "a\u{7}b", "a\u{9f}b"] {
+        assert_eq!(
+            memo(refused).unwrap_err().code,
+            Code::Invalid,
+            "{refused:?}"
+        );
+    }
+}
+
+#[test]
+fn a_receipt_says_a_memo_only_if_asked_and_only_as_a_memo_is_made() {
+    use licash_api::Receive;
+    let f = fixture();
+    let outputs: Vec<Output> = f
+        .outputs
+        .iter()
+        .map(|d| Output::from_derivation(d).unwrap())
+        .collect();
+    let ephemeral = Ephemeral::random().public();
+    let receive = Receive::new(f.keyset.id(), &ephemeral, &outputs, &[5; 32]);
+    // Without, the same bytes as before memos: a hub's stored receipts stay its own.
+    let wire = serde_json::to_value(&receive).unwrap();
+    assert!(wire.get("memo").is_none());
+    let older: Receive = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        (older.memo.clone(), older.checked_memo().unwrap()),
+        (None, None)
+    );
+    let said = receive.clone().with_memo(Some("Rent".into()));
+    assert_eq!(json(&said).memo.as_deref(), Some("Rent"));
+    assert_eq!(said.checked_memo().unwrap().as_deref(), Some("Rent"));
+    for unmade in ["", " Rent", "Rent  due", "a\u{7}b"] {
+        let unmade = receive.clone().with_memo(Some(unmade.into()));
+        assert_eq!(unmade.checked_memo().unwrap_err().code, Code::Invalid);
+    }
+}
+
+#[test]
 fn deposit_bodies_are_receipts_with_a_refund_key_and_a_payment() {
     use licash_api::{
         Deposit, DepositStatus, Depositing, Deposits, Funding, Receive, ReceiveState, ReceiveStatus,

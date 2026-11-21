@@ -10,7 +10,7 @@ use std::{
 use licash::spend::{ProposalId, TimedTerms};
 use licash_api::{Code, Hex, Paying, Problem, Receive, ReceiveState, ReceiveStatus, Receiving};
 use licash_hub::{Error, Forward, Forwarded, Refusal, Settled, LOCAL};
-use licash_lightning::expires;
+use licash_lightning::{expires, Description};
 use licash_store::Kind;
 use lightning_invoice::Bolt11Invoice;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -287,7 +287,8 @@ impl Gateway {
             .checked_add(c.receive.due(amount))
             .and_then(|sat| sat.checked_mul(1000))
             .ok_or_else(|| Failure(Problem::invalid("the amount overflows")))?;
-        let canonical = Receive::new(&keyset, &ephemeral, &outputs, &hash);
+        let memo = body.checked_memo()?;
+        let canonical = Receive::new(&keyset, &ephemeral, &outputs, &hash).with_memo(memo.clone());
         let canonical = serde_json::to_string(&canonical).expect("a receipt serializes");
         let turn = self.peer.turn().await;
         if self.receipts.get(&hash)?.is_none() {
@@ -317,7 +318,13 @@ impl Gateway {
         let cltv = c.receive_cltv(self.hub.info().policy.timing.min_depth);
         let held = self
             .node
-            .hold(hash, receipt.msat, cltv, c.invoice_expiry, None)
+            .hold(
+                hash,
+                receipt.msat,
+                cltv,
+                c.invoice_expiry,
+                memo.map(Description::Text),
+            )
             .await;
         let request = match held {
             Ok(request) => request,

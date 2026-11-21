@@ -771,15 +771,42 @@ pub struct LockOutput {
     pub commitment: Hex,
 }
 
+/// The [`Info::features`] of a hub whose invoices say a [`Receive::memo`].
+/// Older hubs ignore one: a wallet asks for it only of a hub naming this.
+pub const FEATURE_MEMO: &str = "memo";
+
+/// The most characters of a [`Receive::memo`]: well within the 639 bytes
+/// of an invoice's description.
+pub const MAX_MEMO: usize = 100;
+
+/// `text` as a memo: its words, one space apart, of 1 to [`MAX_MEMO`]
+/// characters, none a control character.
+pub fn memo(text: &str) -> Result<String, Problem> {
+    let memo = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if memo.is_empty() || memo.chars().count() > MAX_MEMO {
+        return Err(Problem::invalid(format!(
+            "a memo of 1 to {MAX_MEMO} characters"
+        )));
+    }
+    if memo.chars().any(char::is_control) {
+        return Err(Problem::invalid("a memo of no control characters"));
+    }
+    Ok(memo)
+}
+
 /// Ask for an invoice whose payment locks the hub's own notes to
 /// `outputs`, under `keyset`, derived with `ephemeral`, on the preimage of
-/// `hash`. The invoice asks for their value and the hub's receive fee.
+/// `hash`. The invoice asks for their value and the hub's receive fee, and
+/// says `memo`, if given, to its payer: seen by the hub and its node too.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receive {
     pub keyset: Hex,
     pub ephemeral: Hex,
     pub outputs: Vec<LockOutput>,
     pub hash: Hex,
+    /// As [`memo`] makes it, at a hub naming [`FEATURE_MEMO`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
 }
 
 impl Receive {
@@ -797,6 +824,23 @@ impl Receive {
             ephemeral: Hex(ephemeral.0.to_vec()),
             outputs,
             hash: Hex(hash.to_vec()),
+            memo: None,
+        }
+    }
+
+    /// The same, saying `memo` to its payer.
+    pub fn with_memo(self, memo: Option<String>) -> Self {
+        Self { memo, ..self }
+    }
+
+    /// Its memo, if it says one, checked as [`memo`] makes it.
+    pub fn checked_memo(&self) -> Result<Option<String>, Problem> {
+        match &self.memo {
+            None => Ok(None),
+            Some(text) => match memo(text)? {
+                normal if normal == *text => Ok(Some(normal)),
+                _ => Err(Problem::invalid("a memo not as `memo` makes it")),
+            },
         }
     }
 

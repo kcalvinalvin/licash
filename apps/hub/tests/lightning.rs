@@ -206,6 +206,38 @@ impl Transport for Local {
     }
 }
 
+/// The service as a hub of before memos: naming no such feature, or
+/// naming it while leaving memos out of its invoices as that hub did.
+#[derive(Clone)]
+struct Memoless {
+    local: Local,
+    names: bool,
+}
+
+impl Transport for Memoless {
+    fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
+        let (this, url) = (self.clone(), url.to_owned());
+        async move {
+            let body = body.map(|body| {
+                let mut asked: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                asked.as_object_mut().map(|a| a.remove("memo"));
+                serde_json::to_vec(&asked).unwrap()
+            });
+            let mut response = this.local.request(&url, body).await?;
+            if url.ends_with(licash_api::INFO) && !this.names {
+                let mut info: Info = serde_json::from_slice(&response.body).unwrap();
+                info.features.retain(|f| f != licash_api::FEATURE_MEMO);
+                response.body = serde_json::to_vec(&info).unwrap();
+            }
+            Ok(response)
+        }
+    }
+}
+
 fn proposal_id(id: &str) -> ProposalId {
     ProposalId::from_bytes(bytes(id))
 }
@@ -336,6 +368,104 @@ async fn a_payment_received_is_claimed_and_settles_its_invoice() {
     let resumed = wallet.resume().await.unwrap();
     assert!(resumed.invoices.is_empty() && resumed.pending.is_empty());
     assert_eq!(wallet.invoices().unwrap(), vec![received]);
+}
+
+/// What `request` says it pays for, in words, if anything.
+fn description(request: &str) -> Option<String> {
+    let invoice: Bolt11Invoice = request.parse().unwrap();
+    match invoice.description() {
+        lightning_invoice::Bolt11InvoiceDescriptionRef::Direct(d) => Some(d.to_string()),
+        lightning_invoice::Bolt11InvoiceDescriptionRef::Hash(_) => None,
+    }
+    .filter(|d| !d.is_empty())
+}
+
+#[tokio::test]
+async fn an_invoice_says_the_memo_its_wallet_asked_for_and_no_other() {
+    let net = Net::new().await;
+    let features = net.info().await.features;
+    assert!(features.iter().any(|f| f == licash_api::FEATURE_MEMO));
+    let alice = net.wallet("alice");
+    let asked = alice.invoice_saying(HUB, 20, Some("  Lunch\n on\tFriday "), false);
+    let invoice = asked.await.unwrap();
+    assert_eq!(invoice.memo.as_deref(), Some("Lunch on Friday"));
+    let request = invoice.request.clone().unwrap();
+    assert_eq!(description(&request).as_deref(), Some("Lunch on Friday"));
+    assert_eq!(alice.invoices().unwrap()[0].memo, invoice.memo);
+    // None asked: none said.
+    let plain = alice.invoice(HUB, 20).await.unwrap();
+    assert_eq!(plain.memo, None);
+    assert_eq!(description(&plain.request.unwrap()), None);
+    // Refused by the wallet before the hub hears of it.
+    for memo in ["", " ", &"x".repeat(licash_api::MAX_MEMO + 1), "a\u{7}b"] {
+        let refused = alice.invoice_saying(HUB, 20, Some(memo), false).await;
+        assert!(
+            matches!(refused, Err(licash_wallet::Error::Invalid(_))),
+            "{memo:?}"
+        );
+    }
+    // Paid as any other: the memo stays with it.
+    net.pay_held(&invoice.hash);
+    net.gateway.round().await;
+    let received = alice.follow_invoice(&invoice.hash).await.unwrap();
+    assert_eq!(received.state, InvoiceState::Received);
+    assert_eq!(received.memo.as_deref(), Some("Lunch on Friday"));
+
+    // At the hub: the same receipt with another memo, or one not as a
+    // wallet makes it, is refused, and its invoice never says another.
+    let db = rusqlite::Connection::open(net.dir.path().join("hub.sqlite")).unwrap();
+    let body: String = db
+        .query_row(
+            "SELECT body FROM lightning_receipts WHERE hash = ?1",
+            [bytes(&plain.hash)],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let body: licash_api::Receive = serde_json::from_str(&body).unwrap();
+    assert_eq!(body.memo, None);
+    let other = body.clone().with_memo(Some("Rent".into()));
+    let problem = refused(&net, licash_api::LN_RECEIVE, &other).await;
+    assert!(problem.message.contains("another receipt"), "{problem:?}");
+    for memo in [" Rent", "a\u{7}b", ""] {
+        let bad = body.clone().with_memo(Some(memo.into()));
+        let problem = refused(&net, licash_api::LN_RECEIVE, &bad).await;
+        assert!(problem.message.contains("memo"), "{memo:?}: {problem:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_memo_is_never_asked_of_a_hub_that_would_leave_it_out() {
+    let net = Net::new().await;
+    for names in [false, true] {
+        let name = if names { "bob" } else { "carol" };
+        let path = net.dir.path().join(format!("{name}.sqlite"));
+        let local = Local(net.app.clone());
+        let regtest = ChainProfile::Core30DefaultRegtest;
+        let wallet = Wallet::create(
+            &path,
+            &[names as u8 + 1; 32],
+            regtest,
+            Memoless { local, names },
+        );
+        let wallet = wallet.unwrap();
+        let asked = wallet.invoice_saying(HUB, 20, Some("Rent"), false).await;
+        match names {
+            // Asked of it nonetheless, it answers an invoice without:
+            // never handed out.
+            true => {
+                let invoice = asked.unwrap();
+                assert!(invoice.request.is_none(), "{invoice:?}");
+                let reason = "its hub left the memo out of the invoice".to_owned();
+                assert_eq!(invoice.state, InvoiceState::Canceled(reason));
+            }
+            false => {
+                let refused = asked.unwrap_err().to_string();
+                assert!(refused.contains("puts no memo"), "{refused}");
+            }
+        }
+        // Without one, as before.
+        assert!(wallet.invoice(HUB, 20).await.unwrap().request.is_some());
+    }
 }
 
 #[tokio::test]

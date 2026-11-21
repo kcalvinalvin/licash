@@ -154,6 +154,11 @@ LND's channels can no longer pay or receive the most it takes.
 receipt's invoice may be paid for 15 minutes (`--ln-invoice-expiry`, 900
 seconds), after which an unpaid one frees its place.
 Lowering it blocks new receipts, not retries or following existing ones.
+A receipt may ask for a memo (at most 100 characters, its words one space
+apart, no control characters), which its invoice says to the payer as its
+description; the gateway names the `memo` feature in `/v1/info`, so wallets
+ask older hubs for none. The memo is part of the receipt: the same hash
+asked again with another is refused.
 
 `--ln-max-pay-day SAT` bounds what the gateway pays out over the node in
 any 24 hours: the sum of what the locks of the invoices paid, or under way,
