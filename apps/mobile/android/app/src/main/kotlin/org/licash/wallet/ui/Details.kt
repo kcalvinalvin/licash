@@ -51,6 +51,7 @@ import org.licash.wallet.at
 import org.licash.wallet.digits
 import org.licash.wallet.explain
 import org.licash.wallet.host
+import org.licash.wallet.key
 import org.licash.wallet.sat
 import org.licash.wallet.share
 
@@ -67,10 +68,13 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
     var error by remember { mutableStateOf<String?>(null) }
     var unopened by remember { mutableStateOf(false) }
     var notes by remember { mutableStateOf<NotesOf?>(null) }
+    // A contract's reserve: what of its price comes back.
+    var reserve by remember { mutableStateOf<ULong?>(null) }
     LaunchedEffect(activity, ui.scan?.next) {
         engine.details(activity)
             .onSuccess { details = it; error = null }
             .onFailure { error = explain(it) }
+        if (activity.kind == Kind.CONTRACT) reserve = engine.contractInspection(activity.id).getOrNull()?.holderReserve
         engine.notesOf(activity).onSuccess { notes = it }.onFailure { AppLog.warn("its notes", it) }
     }
     val copy: (String, String) -> Unit = { label, text ->
@@ -126,7 +130,7 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
             )
         }
         error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
-        Summary(activity, details, tx, ui.developer, txid?.let { engine.explorerLink(it) }?.let { { view(it) } })
+        Summary(activity, details, tx, ui.developer, txid?.let { engine.explorerLink(it) }?.let { { view(it) } }, ui.contacts[activity.key], reserve)
         // Who paid, as they proved to this wallet alone: a contact, or one to keep.
         activity.from?.takeIf { activity.kind == Kind.RECEIVED }?.let { SaveContact(engine, it, payer = true) }
         if (unopened) {
@@ -157,7 +161,7 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
 }
 
 internal fun title(activity: Activity, coming: Boolean): String = when {
-    coming -> "Arriving"
+    coming && activity.kind != Kind.CLOSED -> "Arriving"
     else -> when (activity.kind) {
         Kind.SENT -> "Sent"
         Kind.RECEIVED -> "Received"
@@ -169,8 +173,12 @@ internal fun title(activity: Activity, coming: Boolean): String = when {
         Kind.CONTRACT -> "Protection"
         Kind.SWAP -> "Moved"
         Kind.OPTIMIZED -> "Optimized notes"
+        Kind.CLOSED -> "Protection closed"
     }
 }
+
+/** Of a contract's `price`, what it cost: the rest, its `reserve`, comes back. */
+internal fun opened(price: ULong, reserve: ULong): ULong = price - minOf(price, reserve)
 
 /** Whether it paid out, rather than in. */
 internal fun paid(activity: Activity): Boolean =
@@ -369,7 +377,15 @@ private fun PayoutTimeline(
  * if it is there.
  */
 @Composable
-private fun Summary(activity: Activity, details: Details?, tx: Onchain?, developer: Boolean, view: (() -> Unit)?) {
+private fun Summary(
+    activity: Activity,
+    details: Details?,
+    tx: Onchain?,
+    developer: Boolean,
+    view: (() -> Unit)?,
+    contact: String? = null,
+    reserve: ULong? = null,
+) {
     val failed = activity.state == State.FAILED
     Group("") {
         // What it cost on top, and what it came to: nothing of one that failed.
@@ -379,7 +395,11 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?, develop
                 if (activity.fee > 0uL) Line("Total", sat(activity.amount + activity.fee), tag = "total")
             }
         }
-        when (details) {
+        // A contract's money back, a coin on Bitcoin: from where, not from whom.
+        if (activity.kind == Kind.CLOSED) {
+            Line("From", "Protection at ${name(activity.detail)}", tag = "closed-from")
+            Line("To", "Your Bitcoin", tag = "closed-to")
+        } else when (details) {
             is Details.Moved -> {
                 FeeLine("Hub fee", activity.fee, activity.amount, tag = "fee-hub", value = sat(activity.fee), breakdown = recordedFee(activity.amount, activity.fee, listOf("Hub" to activity.fee)))
                 details.payment?.fee?.let {
@@ -410,6 +430,10 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?, develop
                 Line("At", name(details.hub))
             }
             is Details.Contract -> {
+                reserve?.let {
+                    Line("Cost", sat(opened(activity.amount, it)), tag = "contract-cost")
+                    Line("Reserve, refundable", sat(it), tag = "contract-reserve")
+                }
                 Line("Paid from", "Your Bitcoin", tag = "paid-from")
                 Line("At", name(details.hub), tag = "at")
             }
@@ -427,6 +451,8 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?, develop
                 if (activity.kind == Kind.OPTIMIZED) Say("Smaller notes leave room for receiving and help recovery fit its note limit.")
             }
         }
+        // Whom it was paid to: a contact. Who paid is said below, as proved.
+        contact?.takeIf { activity.kind == Kind.SENT }?.let { Line("To", it, tag = "contact") }
         val noted = activity.kind == Kind.SENT || activity.kind == Kind.RECEIVED
         activity.memo?.let { Line(if (noted) "Note" else "Memo", it, tag = "memo") }
         activity.code?.let {

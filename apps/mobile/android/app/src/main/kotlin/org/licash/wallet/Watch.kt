@@ -201,7 +201,7 @@ internal fun news(activity: Activity): String? {
             Kind.MOVED -> "$amount added to your balance"
             Kind.INVOICE -> "Received $amount over Lightning"
             Kind.CONTRACT -> "Protection on"
-            Kind.RECEIVED, Kind.ONCHAIN, Kind.OPTIMIZED -> null
+            Kind.RECEIVED, Kind.ONCHAIN, Kind.OPTIMIZED, Kind.CLOSED -> null
         }
         State.FAILED -> when (activity.kind) {
             Kind.SENT -> "Sending $amount"
@@ -211,7 +211,7 @@ internal fun news(activity: Activity): String? {
             Kind.MOVED -> "Adding $amount to your balance"
             Kind.INVOICE -> "Receiving $amount over Lightning"
             Kind.CONTRACT -> "Setting up protection"
-            Kind.RECEIVED, Kind.ONCHAIN, Kind.OPTIMIZED -> null
+            Kind.RECEIVED, Kind.ONCHAIN, Kind.OPTIMIZED, Kind.CLOSED -> null
         }?.let { "$it failed: open Licash for why" }
     }
 }

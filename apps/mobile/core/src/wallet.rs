@@ -1307,18 +1307,24 @@ impl Wallet {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let aside = self.set_aside()?;
+        // A contract's money back: said as such, not as a payment.
+        let returning = self.returning()?;
         for coin in self.wallet.silent_coins()? {
             let state = match coin.spending {
                 Some(by) if !aside.contains(&by) => State::Pending,
                 _ => State::Done,
             };
+            let (kind, detail) = match returning.get(&coin.outpoint.txid) {
+                Some(hub) => (Kind::Closed, hub.clone()),
+                None => (Kind::Onchain, format!("block {}", coin.height)),
+            };
             history.push(Activity {
                 id: coin.outpoint.to_string(),
-                kind: Kind::Onchain,
+                kind,
                 state,
                 amount: coin.value,
                 fee: 0,
-                detail: format!("block {}", coin.height),
+                detail,
                 // Its block's: until learned, with those under way first.
                 at: times.get(&coin.height).copied(),
                 memo: None,
@@ -1360,7 +1366,7 @@ impl Wallet {
                 let swap = swap.ok_or_else(unknown)?;
                 swap.lock.into_iter().chain(swap.theirs).collect()
             }
-            Kind::Onchain | Kind::Contract => Vec::new(),
+            Kind::Onchain | Kind::Closed | Kind::Contract => Vec::new(),
         };
         let me = self.wallet.address();
         let mut notes = licash_wallet::OperationNotes::default();
@@ -1492,7 +1498,7 @@ impl Wallet {
             Kind::Payout => payouts::details(&self.wallet, &id, self.tip()),
             Kind::Swap => moves::details(&self.wallet, &id),
             Kind::Contract => self.contract_details(&id)?.ok_or_else(unknown),
-            Kind::Onchain => {
+            Kind::Onchain | Kind::Closed => {
                 let outpoint: OutPoint = id.parse().map_err(|_| unknown())?;
                 let mut coins = self.wallet.silent_coins()?.into_iter();
                 let mut coin = coins.find(|c| c.outpoint == outpoint);
@@ -1652,15 +1658,22 @@ impl Wallet {
             }
         }
         let paying = self.wallet.unconfirmed_payments(&txs)?;
+        let returning = self.returning()?;
         Ok(paying
             .into_iter()
             .map(|(outpoint, value)| Activity {
                 id: outpoint.to_string(),
-                kind: Kind::Onchain,
+                kind: match returning.contains_key(&outpoint.txid) {
+                    true => Kind::Closed,
+                    false => Kind::Onchain,
+                },
                 state: State::Pending,
                 amount: value,
                 fee: 0,
-                detail: "waiting for a block".into(),
+                detail: match returning.get(&outpoint.txid) {
+                    Some(hub) => hub.clone(),
+                    None => "waiting for a block".into(),
+                },
                 at: None,
                 memo: None,
                 from: None,

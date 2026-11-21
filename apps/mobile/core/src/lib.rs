@@ -1050,6 +1050,10 @@ pub enum Kind {
     Swap,
     /// Notes rearranged at a hub: no amount paid away, only a fee.
     Optimized,
+    /// What a recovery contract gave back on Bitcoin as it closed (its
+    /// reserve, and any notes it recovered): a coin of the wallet's, by
+    /// its outpoint as [`Kind::Onchain`], its `detail` the contract's hub.
+    Closed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]

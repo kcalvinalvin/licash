@@ -11,6 +11,7 @@ import org.licash.core.ContractState
 import org.licash.core.Fees
 import org.licash.core.FeesRaised
 import org.licash.core.Hub
+import org.licash.core.Kind
 import org.licash.core.OpeningStep
 import org.licash.core.Rate
 import org.licash.core.Recovery
@@ -72,6 +73,9 @@ data class Protection(val protected: ULong, val open: ULong) {
             Shield.SOME -> "$percent% protected"
         }
 }
+
+/** Whom a line of the history was paid to (one made) or by: its contact, if known. */
+fun counterpart(kind: Kind, contact: String?): String? = contact?.let { if (kind == Kind.SENT) "To $it" else "From $it" }
 
 /** How much of `balance` is protected. */
 fun protection(balance: Balance): Protection = Protection(balance.total - balance.credit, balance.credit)

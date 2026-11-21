@@ -8,7 +8,10 @@
 //! Kept in the wallet's file, `wallet.sqlite`, and in `contracts/` beside it,
 //! made only once a first contract is asked for.
 
-use std::sync::{atomic::Ordering, Arc, PoisonError};
+use std::{
+    collections::HashMap,
+    sync::{atomic::Ordering, Arc, PoisonError},
+};
 
 use bitcoin::{OutPoint, Txid};
 use licash_contracts::holder::{self, Ask, Fate, Phase};
@@ -421,6 +424,24 @@ impl Wallet {
         Ok(())
     }
 
+    /// The transactions contracts paid the wallet back by as they closed,
+    /// each with its contract's hub: closed early with the hub, or forced
+    /// closed. A coin of one is the wallet's own money back, not a payment.
+    pub(super) fn returning(&self) -> Result<HashMap<Txid, String>, LicashError> {
+        let all = holder::list(self.wallet.path()).map_err(failed)?;
+        let recovered: Vec<_> = holder::recovery::recoveries(self.wallet.path())
+            .map_err(failed)?
+            .into_iter()
+            .map(|r| {
+                (
+                    r.id,
+                    [r.fold, r.payout, r.sweep].into_iter().flatten().collect(),
+                )
+            })
+            .collect();
+        Ok(returned(&all, &recovered))
+    }
+
     /// The contracts signed, as lines of the history: what each cost,
     /// under way until its funding is in a block.
     pub(super) fn contract_activities(&self) -> Result<Vec<Activity>, LicashError> {
@@ -545,6 +566,26 @@ fn contracted(
             balance.opening += value.saturating_sub(c.price);
         }
     }
+}
+
+/// The transactions of `contracts` that paid the wallet back, each with
+/// its contract's hub: a fold, or those of a forced close, `recovered` by
+/// contract id.
+fn returned(
+    contracts: &[holder::Contract],
+    recovered: &[([u8; 32], Vec<Txid>)],
+) -> HashMap<Txid, String> {
+    let mut by: HashMap<Txid, String> = contracts
+        .iter()
+        .filter_map(|c| c.folded.map(|txid| (txid, c.hub.clone())))
+        .collect();
+    for (id, txids) in recovered {
+        let Some(c) = contracts.iter().find(|c| &c.id == id) else {
+            continue;
+        };
+        by.extend(txids.iter().map(|txid| (*txid, c.hub.clone())));
+    }
+    by
 }
 
 fn hex(id: &[u8; 32]) -> String {
@@ -697,6 +738,26 @@ mod tests {
         assert_eq!(confirmations(Some(300), 300), 1);
         assert_eq!(confirmations(Some(298), 300), 3);
         assert_eq!(confirmations(Some(301), 300), 1);
+    }
+
+    #[test]
+    fn what_a_contract_paid_back_is_known_by_its_fold_or_forced_close() {
+        let txid = |b: u8| Txid::from_byte_array([b; 32]);
+        let mut folded = contract(1, Phase::Funded, Some(Fate::Live));
+        folded.folded = Some(txid(10));
+        let mut forced = contract(2, Phase::Funded, Some(Fate::Live));
+        forced.hub = "https://other.example".into();
+        let live = contract(3, Phase::Funded, Some(Fate::Live));
+        let recovered = [
+            ([2; 32], vec![txid(20), txid(21)]),
+            // A recovery of no contract kept: nothing to say it was.
+            ([9; 32], vec![txid(90)]),
+        ];
+        let by = returned(&[folded, forced, live], &recovered);
+        assert_eq!(by.len(), 3, "{by:?}");
+        assert_eq!(by[&txid(10)], HUB);
+        assert_eq!(by[&txid(20)], "https://other.example");
+        assert_eq!(by[&txid(21)], "https://other.example");
     }
 
     #[test]

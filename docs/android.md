@@ -219,7 +219,15 @@ Paying a code, a note may be typed for the payee, and "Share my code"
 for the payee, the hub and relays reading neither. A hub that would not
 keep a note with a payment refuses it, nothing paid, and the app offers
 to send it without the note. The history shows a payment's note, and its
-details who paid: a contact, or a code to save as one.
+details who paid: a contact, or a code to save as one. A payment made to a
+contact's wallet, or by one whose shared code is a contact's, says "To" or
+"From" that contact on its line.
+
+A contract is two lines of the history: "Protection", its price paid on
+Bitcoin, its details splitting it into the cost and the reserve that comes
+back; and "Protection closed", what it paid back to the wallet's Bitcoin
+(closed early with the hub, or forced closed), from the contract at its
+hub, rather than a coin received.
 
 Receive, showing the Licash code, lets the user pick which code: the
 wallet's own, or a separate one made there under a name only the user

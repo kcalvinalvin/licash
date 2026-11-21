@@ -63,7 +63,7 @@ internal fun doing(activity: Activity, coming: Boolean): String = when {
     coming -> "Receiving ${sat(activity.amount)}"
     else -> when (activity.kind) {
         Kind.SENT, Kind.LIGHTNING, Kind.PAYOUT -> "Sending ${sat(activity.amount)}"
-        Kind.RECEIVED, Kind.INVOICE, Kind.MOVED, Kind.ONCHAIN -> "Receiving ${sat(activity.amount)}"
+        Kind.RECEIVED, Kind.INVOICE, Kind.MOVED, Kind.ONCHAIN, Kind.CLOSED -> "Receiving ${sat(activity.amount)}"
         Kind.SWAP -> "Moving ${sat(activity.amount)}"
         Kind.CONTRACT -> "Setting up protection"
         Kind.OPTIMIZED -> "Optimizing notes"

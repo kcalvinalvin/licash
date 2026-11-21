@@ -62,6 +62,7 @@ class GlanceTest {
             Kind.SWAP to "Moving 10,000 sat",
             Kind.CONTRACT to "Setting up protection",
             Kind.OPTIMIZED to "Optimizing notes",
+            Kind.CLOSED to "Receiving 10,000 sat",
         )
         assertEquals(Kind.entries.toSet(), texts.keys)
         for ((kind, text) in texts) {

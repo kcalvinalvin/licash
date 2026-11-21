@@ -1980,6 +1980,43 @@ fn a_phone_tells_whom_it_pays_a_note_and_learns_who_paid_it() {
 }
 
 #[test]
+fn a_phone_names_the_contacts_its_payments_went_to_and_came_from() {
+    let net = Net::keeping();
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let bob = net.wallet("bob", net.height());
+    let asked = bob.payment_code(Some(500)).unwrap();
+    let paid = alice.pay(asked.qr.clone(), None, None, Some(0)).unwrap();
+    let got = bob.collect().unwrap();
+    let sent = alice.history().unwrap();
+    let sent: Vec<Activity> = sent.into_iter().filter(|a| a.id == paid.id).collect();
+    let taken: Vec<Activity> = bob
+        .history()
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.id == got[0].id)
+        .collect();
+
+    // No contacts: no one named.
+    assert_eq!(alice.contacts_of(sent.clone()).unwrap(), vec![None]);
+    assert_eq!(bob.contacts_of(taken.clone()).unwrap(), vec![None]);
+
+    // Each kept as the other's contact: the payment says to whom, and from whom.
+    let bobs = bob.payment_code(None).unwrap();
+    alice.save_contact("Bob".into(), bobs.text).unwrap();
+    let from = got[0].from.clone().expect("who paid");
+    bob.save_contact("Alice".into(), from).unwrap();
+    assert_eq!(
+        alice.contacts_of(sent).unwrap(),
+        vec![Some("Bob".to_string())]
+    );
+    assert_eq!(
+        bob.contacts_of(taken).unwrap(),
+        vec![Some("Alice".to_string())]
+    );
+}
+
+#[test]
 fn a_phone_is_paid_at_an_extra_code_apart_from_its_own_and_shows_each_payment() {
     let net = Net::keeping();
     let light = Light::new(&net);

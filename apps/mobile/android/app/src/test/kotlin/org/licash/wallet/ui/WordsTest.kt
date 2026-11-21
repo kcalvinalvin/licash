@@ -6,6 +6,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.licash.core.Balance
+import org.licash.core.Kind
 import org.licash.core.OpeningStep
 import org.licash.core.Transfer
 
@@ -41,6 +42,13 @@ class WordsTest {
         assertTrue(addFirst(addable = false, offered = true).contains("on its way"))
         assertTrue(addFirst(addable = true, offered = true).contains("protect it first"))
         assertFalse(addFirst(addable = true, offered = false).contains("protect it first"))
+    }
+
+    @Test
+    fun a_payment_says_the_contact_it_went_to_or_came_from() {
+        assertEquals("To Bob", counterpart(Kind.SENT, "Bob"))
+        assertEquals("From Alice", counterpart(Kind.RECEIVED, "Alice"))
+        assertNull(counterpart(Kind.SENT, null))
     }
 
     @Test

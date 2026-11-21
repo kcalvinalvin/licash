@@ -5,18 +5,19 @@
 //! be read is never written over.
 
 use std::{
+    collections::HashMap,
     fs::File,
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
 };
 
-use licash::spend::ChainProfile;
+use licash::{address::Address, spend::ChainProfile};
 use licash_wallet::PaymentCode;
 use serde::{Deserialize, Serialize};
 
 use super::Wallet;
-use crate::LicashError;
+use crate::{Activity, Kind, LicashError};
 
 /// The most characters a name may have.
 const MAX_NAME: usize = 64;
@@ -92,6 +93,33 @@ fn pays_same(text: &str, code: &PaymentCode) -> bool {
         (Some(a), Some(b)) => a.network == b.network && a.address == b.address,
         _ => false,
     }
+}
+
+/// The contacts kept in `dir`, as the Licash wallet each code pays on
+/// `network` and its name: none if unreadable, a line of the history
+/// going without a name rather than failing.
+pub(super) fn names(dir: &Path, network: ChainProfile) -> Vec<(Address, String)> {
+    let all = load(dir).unwrap_or_default();
+    all.into_iter()
+        .filter_map(|c| {
+            let licash = c.code.parse::<PaymentCode>().ok()?.licash?;
+            (licash.network == network).then_some((licash.address, c.name))
+        })
+        .collect()
+}
+
+/// The name of the contact of `names` whose code pays `address`, if any.
+pub(super) fn name_of(names: &[(Address, String)], address: &Address) -> Option<String> {
+    names
+        .iter()
+        .find(|(a, _)| a == address)
+        .map(|(_, n)| n.clone())
+}
+
+/// The name of the contact of `names` paid by the code `code`, if any.
+pub(super) fn name_of_code(names: &[(Address, String)], code: &str) -> Option<String> {
+    let licash = code.trim().parse::<PaymentCode>().ok()?.licash?;
+    name_of(names, &licash.address)
 }
 
 /// `name`, trimmed: refused if empty or too long.
@@ -171,6 +199,30 @@ impl Wallet {
             save(&self.dir, &all)?;
         }
         Ok(())
+    }
+
+    /// The contact each of `lines` of the history was paid to (a payment
+    /// made to a contact's wallet) or by (its `from` a contact's code), in
+    /// their order: none where neither is known. Apart from the history,
+    /// which says who paid as proved, not as named.
+    pub fn contacts_of(&self, lines: Vec<Activity>) -> Result<Vec<Option<String>>, LicashError> {
+        let names = names(&self.dir, self.wallet.network());
+        if names.is_empty() {
+            return Ok(vec![None; lines.len()]);
+        }
+        let payees: HashMap<String, Address> = self
+            .wallet
+            .sends()?
+            .into_iter()
+            .map(|s| (s.id, s.payee))
+            .collect();
+        Ok(lines
+            .iter()
+            .map(|line| match line.kind {
+                Kind::Sent => payees.get(&line.id).and_then(|p| name_of(&names, p)),
+                _ => line.from.as_deref().and_then(|f| name_of_code(&names, f)),
+            })
+            .collect())
     }
 
     /// The contact the payment code `code` pays, if one does: whom a

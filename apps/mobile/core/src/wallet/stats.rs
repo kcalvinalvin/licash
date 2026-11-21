@@ -431,7 +431,7 @@ fn line_event(line: &Activity, records: &Records) -> Option<StatEvent> {
         }
     };
     match line.kind {
-        Kind::Onchain => return None,
+        Kind::Onchain | Kind::Closed => return None,
         Kind::Sent => {
             event.hub_fee = Some(settled);
             driven(&mut event);

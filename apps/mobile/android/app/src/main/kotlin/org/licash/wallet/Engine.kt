@@ -128,6 +128,8 @@ data class Ui(
     val offerDeclined: Boolean = false,
     /** Where each line of the history under way stands, by [key]. */
     val under: Map<String, Details> = emptyMap(),
+    /** The contact each line of the history was paid to or by, by [key]. */
+    val contacts: Map<String, String> = emptyMap(),
     /** How closely what is under way is watched, out of sight too. */
     val watch: Watch = Watch.NONE,
     /** When a Lightning invoice was last asked, in seconds since the epoch. */
@@ -1072,9 +1074,15 @@ class Engine(context: Context) {
                 val cold = runCatching { it.cold() }
                     .onFailure { e -> AppLog.warn("reading cold storage", e) }
                     .getOrDefault(state.value.cold)
+                // Only the lines a contact could be named on: payments made, and those whose payer shared a code.
+                val named = history.filter { a -> a.kind == Kind.SENT || a.from != null }
+                val contacts = runCatching { it.contactsOf(named) }
+                    .map { names -> named.zip(names).mapNotNull { (a, name) -> name?.let { a.key to it } }.toMap() }
+                    .onFailure { e -> AppLog.warn("reading the contacts", e) }
+                    .getOrDefault(state.value.contacts)
                 Shown(
                     it.network(), it.balance(), history, it.hubs(), raised, it.tor(), contracts, recoveries, under,
-                    noteMaintenance, onTheirWay, cold,
+                    noteMaintenance, onTheirWay, cold, contacts,
                 )
             }
         }.onFailure { AppLog.warn("reading the wallet", it) }.getOrNull()
@@ -1104,6 +1112,7 @@ class Engine(context: Context) {
                     asked = prefs.askedAt,
                     onTheirWay = shown.onTheirWay,
                     cold = shown.cold,
+                    contacts = shown.contacts,
                     backup = prefs.backupFolder?.let { _ -> it.backup ?: AutoBackup(prefs.backupAt) },
                 )
             }
@@ -1176,6 +1185,7 @@ class Engine(context: Context) {
         val noteMaintenance: Boolean,
         val onTheirWay: UInt,
         val cold: ColdStorage?,
+        val contacts: Map<String, String>,
     )
 
     /** A new wallet of the network chosen, born at the chain's height if known. */
@@ -1554,10 +1564,10 @@ class Engine(context: Context) {
     suspend fun contacts(): Result<List<Contact>> = io { local { it.contacts() } }
 
     /** Keep the payment code `code` as `name`'s: refused for a name another contact has. */
-    suspend fun saveContact(name: String, code: String): Result<Contact> = io { local { it.saveContact(name, code) } }
+    suspend fun saveContact(name: String, code: String): Result<Contact> = io { local { it.saveContact(name, code) }.also { refresh() } }
 
     /** Forget the contact named `name`. */
-    suspend fun removeContact(name: String): Result<Unit> = io { local { it.removeContact(name) } }
+    suspend fun removeContact(name: String): Result<Unit> = io { local { it.removeContact(name) }.also { refresh() } }
 
     /** The contact the payment code `code` pays, if one does. */
     suspend fun contactOf(code: String): Result<Contact?> = io { local { it.contactOf(code) } }

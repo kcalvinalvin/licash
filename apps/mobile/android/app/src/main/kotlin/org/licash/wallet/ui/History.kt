@@ -67,7 +67,7 @@ fun History(engine: Engine, ui: Ui, open: (Activity) -> Unit, stats: () -> Unit,
                 ActivityRow(activity, now, coming = true) { open(activity) }
             }
             items(ui.history, key = { it.key }) { activity ->
-                ActivityRow(activity, now) { open(activity) }
+                ActivityRow(activity, now, contact = ui.contacts[activity.key]) { open(activity) }
             }
         }
     }
@@ -79,7 +79,7 @@ fun History(engine: Engine, ui: Ui, open: (Activity) -> Unit, stats: () -> Unit,
  * its day.
  */
 @Composable
-private fun ActivityRow(activity: Activity, now: Long, coming: Boolean = false, open: () -> Unit) {
+private fun ActivityRow(activity: Activity, now: Long, coming: Boolean = false, contact: String? = null, open: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     val failed = !coming && activity.state == State.FAILED
     val under = coming || activity.state == State.PENDING
@@ -112,6 +112,17 @@ private fun ActivityRow(activity: Activity, now: Long, coming: Boolean = false, 
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            // Whom it was paid to, or by: a contact.
+            counterpart(activity.kind, contact)?.let {
+                Text(
+                    it,
+                    modifier = Modifier.testTag("row-contact"),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = colors.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
             // What it says it was for, as its payer or payee read it.
             activity.memo?.let {
                 Text(
@@ -169,7 +180,7 @@ private fun glyph(activity: Activity, coming: Boolean, failed: Boolean): ImageVe
     else -> when (activity.kind) {
         Kind.LIGHTNING, Kind.INVOICE -> Glyphs.bolt
         Kind.SWAP, Kind.OPTIMIZED -> Glyphs.swap
-        Kind.CONTRACT -> Glyphs.shield
+        Kind.CONTRACT, Kind.CLOSED -> Glyphs.shield
         Kind.SENT, Kind.PAYOUT -> Glyphs.up
         Kind.RECEIVED, Kind.MOVED, Kind.ONCHAIN -> Glyphs.down
     }

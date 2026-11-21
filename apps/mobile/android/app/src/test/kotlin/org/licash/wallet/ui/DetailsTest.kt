@@ -3,6 +3,7 @@ package org.licash.wallet.ui
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.licash.core.Activity
 import org.licash.core.Details
@@ -122,6 +123,17 @@ class DetailsTest {
         assertEquals("Protection", title(line(Kind.CONTRACT), coming = false))
         assertEquals("Sent on Bitcoin", title(line(Kind.PAYOUT), coming = false))
         assertEquals("From Bitcoin", title(line(Kind.MOVED), coming = false))
+    }
+
+    @Test
+    fun a_contract_says_what_it_cost_apart_from_the_reserve_it_gives_back_as_it_closes() {
+        // Its money back is said as such, on its way too, and paid in, not out.
+        assertEquals("Protection closed", title(line(Kind.CLOSED), coming = false))
+        assertEquals("Protection closed", title(line(Kind.CLOSED), coming = true))
+        assertFalse(paid(line(Kind.CLOSED)))
+        assertTrue(paid(line(Kind.CONTRACT)))
+        assertEquals(3_655uL, opened(23_655uL, 20_000uL))
+        assertEquals(0uL, opened(5_000uL, 20_000uL))
     }
 
     private fun lightning(provider: String?, failure: String?, refundBlocks: UInt? = null) = Details.Lightning(
