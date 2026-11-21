@@ -15,6 +15,11 @@ use licash_nostr::{wallet, Route};
 use licash_wallet::PaymentCode;
 use serde_json::json;
 
+/// The most keeping its notes few costs at a time, in sat: the wallet
+/// remints notes by itself once they have rested a while of its choosing,
+/// so between reading a balance and looking again, a few sat may go.
+const NOTES_UPKEEP: u64 = 50;
+
 #[tokio::test]
 #[ignore = "needs the stack of apps/e2e/run.sh and an Android device"]
 async fn the_app_is_paid_and_pays_on_bitcoin_and_in_licash() -> anyhow::Result<()> {
@@ -535,11 +540,14 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     visited(eco, phone).await?;
     contracted(eco, phone).await?;
 
-    // Started again: at once, holding the same.
+    // Started again: at once, holding the same, less what keeping its
+    // notes few may cost meanwhile.
     let held = phone.balance().await?;
     let again = phone.launch().await?;
     ensure!(again < Duration::from_secs(10), "{again:?} to start again");
-    phone.wait_balance(held, 30).await?;
+    phone
+        .wait_balance(held.saturating_sub(NOTES_UPKEEP)..=held, 30)
+        .await?;
     logs(phone).await?;
     restored(phone, hub, &silent.to_string()).await
 }
@@ -574,7 +582,10 @@ async fn restored(phone: &Phone, hub: &str, silent: &str) -> anyhow::Result<()> 
     phone.tap_id("restore-file").await?;
     picked(phone, |text| text.starts_with("licash-regtest-backup-")).await?;
     phone.home(120).await?;
-    phone.wait_balance(held, 60).await?;
+    // All it held, less what keeping its notes few may cost meanwhile.
+    phone
+        .wait_balance(held.saturating_sub(NOTES_UPKEEP)..=held, 60)
+        .await?;
     deleted(phone).await?;
 
     phone.tap_id("restore-wallet").await?;
@@ -844,8 +855,6 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
 /// protecting the notes there, on credit no longer, nothing left on
 /// Bitcoin. Ending it, it is told to cash out instead.
 async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
-    /// The most keeping its notes few costs while it is set up, in sat.
-    const NOTES_UPKEEP: u64 = 50;
     // hub1's reserve and opening fee, and over them 1% a year of the part
     // of the cover it funds (licash-hub's --contracts-rate by default),
     // none of hers.
@@ -1172,7 +1181,6 @@ async fn hub_down(
         "Bob got other than 1000"
     );
     // Resuming can also charge a note optimization fee, a few sat.
-    const NOTES_UPKEEP: u64 = 50;
     let spent = until("the payment done", 60, || async {
         let spent = held - phone.balance().await?;
         Ok((1_000..=1_000 + fee + NOTES_UPKEEP)

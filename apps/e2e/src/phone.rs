@@ -3,7 +3,7 @@
 //! links opened in it. The device is the one adb picks (`ANDROID_SERIAL`);
 //! the app the APK at `$LICASH_E2E_APP`, installed afresh for each test.
 
-use std::{cell::Cell, path::PathBuf, time::Duration};
+use std::{cell::Cell, ops::RangeInclusive, path::PathBuf, time::Duration};
 
 use anyhow::{ensure, Context};
 use tokio::process::Command;
@@ -437,13 +437,13 @@ impl Phone {
         Ok(amount(&self.by_id("balance", 30).await?.text))
     }
 
-    /// Wait up to `secs` for Home to show a balance of `sat`.
-    pub async fn wait_balance(&self, sat: u64, secs: u64) -> anyhow::Result<()> {
+    /// Wait up to `secs` for Home to show a balance within `sat`.
+    pub async fn wait_balance(&self, sat: RangeInclusive<u64>, secs: u64) -> anyhow::Result<()> {
         let shown = Cell::new(0);
-        let what = format!("a balance of {sat}");
+        let what = format!("a balance of {sat:?}");
         until(&what, secs, || async {
             shown.set(self.balance().await?);
-            Ok((shown.get() == sat).then_some(()))
+            Ok(sat.contains(&shown.get()).then_some(()))
         })
         .await
         .with_context(|| format!("{} shown", shown.get()))
