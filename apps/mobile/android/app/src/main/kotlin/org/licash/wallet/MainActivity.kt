@@ -56,6 +56,7 @@ import org.licash.wallet.ui.Onboarding
 import org.licash.wallet.ui.Receive
 import org.licash.wallet.ui.Send
 import org.licash.wallet.ui.Settings
+import org.licash.wallet.ui.StatsScreen
 import org.licash.wallet.ui.Wordmark
 
 private sealed interface Screen {
@@ -85,6 +86,9 @@ private sealed interface Screen {
     /** The history: what came in and went out. */
     data object History : Screen
 
+    /** What the history came to: counts, fees and times, by period. */
+    data object Stats : Screen
+
     /** One line of the history, opened from `from`. */
     data class Details(val activity: Activity, val from: Screen = History) : Screen
 }
@@ -94,13 +98,14 @@ private fun parent(screen: Screen): Screen = when (screen) {
     is Screen.Send -> screen.from
     is Screen.Money -> if (screen.at != null) screen.copy(at = null) else screen.from
     is Screen.Details -> screen.from
+    Screen.Stats -> Screen.History
     else -> Screen.Home
 }
 
 /** How deep in the app `screen` is: Home, a page of it, what a page opens. */
 private fun depth(screen: Screen): Int = when (screen) {
     Screen.Home -> 0
-    is Screen.Details -> 2
+    is Screen.Details, Screen.Stats -> 2
     is Screen.Send -> if (screen.from is Screen.Money) 2 else 1
     else -> 1
 }
@@ -202,7 +207,13 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
                                 history = { screen = Screen.History },
                                 open = { screen = Screen.Details(it, Screen.Home) },
                             )
-                            Screen.History -> History(engine, ui, open = { screen = Screen.Details(it) }) { screen = Screen.Home }
+                            Screen.History -> History(
+                                engine,
+                                ui,
+                                open = { screen = Screen.Details(it) },
+                                stats = { screen = Screen.Stats },
+                            ) { screen = Screen.Home }
+                            Screen.Stats -> StatsScreen(engine, ui) { screen = Screen.History }
                             Screen.Receive -> Receive(engine) { screen = Screen.Home }
                             is Screen.Send -> Send(
                                 engine,

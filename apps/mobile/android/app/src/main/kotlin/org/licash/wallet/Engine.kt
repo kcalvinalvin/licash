@@ -37,6 +37,8 @@ import org.licash.core.Activity
 import org.licash.core.BackupFound
 import org.licash.core.BackupStep
 import org.licash.core.Balance
+import org.licash.core.BalancePoint
+import org.licash.core.ChainSource
 import org.licash.core.Code
 import org.licash.core.Contact
 import org.licash.core.Contract
@@ -69,6 +71,7 @@ import org.licash.core.ColdStorage
 import org.licash.core.Scan
 import org.licash.core.Scanned
 import org.licash.core.State
+import org.licash.core.Stats
 import org.licash.core.TorClient
 import org.licash.core.TorStatus
 import org.licash.core.Wallet
@@ -1418,6 +1421,16 @@ class Engine(context: Context) {
     /** The notes a line of the history spent, and those it made the wallet's. */
     suspend fun notesOf(activity: Activity): Result<NotesOf> =
         io { local { it.notesOf(activity.kind, activity.id) } }
+
+    /** What the wallet did and what it cost, for Stats: read from its records, nothing asked of the network. */
+    suspend fun stats(): Result<Stats> = io { local { it.stats(chainSource()) } }
+
+    /** What the wallet held at each of `instants`, seconds since 1970, replayed from its records. */
+    suspend fun balanceOver(instants: List<Long>): Result<List<BalancePoint>> =
+        io { local { it.balanceOver(instants, chainSource()) } }
+
+    /** Bitcoin as the light client tells it, or, with none running, as nothing. */
+    private fun chainSource(): ChainSource = light?.let { GoChain(it) } ?: NoChain
 
     /** Where to see the transaction `txid`, if anywhere. */
     fun explorerLink(txid: String): String? {

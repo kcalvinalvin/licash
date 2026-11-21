@@ -17,6 +17,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -41,11 +42,17 @@ import org.licash.wallet.sat
  * Pulled down, it looks for payments now.
  */
 @Composable
-fun History(engine: Engine, ui: Ui, open: (Activity) -> Unit, back: () -> Unit) {
+fun History(engine: Engine, ui: Ui, open: (Activity) -> Unit, stats: () -> Unit, back: () -> Unit) {
     val now = System.currentTimeMillis() / 1000
     PullToLook(engine, Modifier.fillMaxSize()) {
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 20.dp).testTag("history")) {
-            item(key = "top") { TopBar("Activity", back) }
+            item(key = "top") {
+                TopBar("Activity", back) {
+                    IconButton(onClick = stats, modifier = Modifier.testTag("stats-open")) {
+                        Icon(StatsGlyph, contentDescription = "Stats")
+                    }
+                }
+            }
             if (ui.history.isEmpty() && ui.incoming.isEmpty()) {
                 item(key = "none") {
                     Text(
