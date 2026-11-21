@@ -759,7 +759,8 @@ docker run -d -p 8338:8338 -v licash-hub:/data licash-hub
 ## Upgrading
 
 Stop the hub, back up `<data>` (see the backups above), replace the binary and start it
-again. Before starting it:
+again, except from a ledger of schema 1, whose hub is not replaced (below).
+Before starting it:
 
 - Install every program of `r0/programs/` (see `docs/r0.md`): a contract
   keeps the program it opened under for as long as it lives, and a prover
@@ -772,7 +773,11 @@ again. Before starting it:
 A hub of note format v3 reads a `hub.sqlite` of ledger schema 2 only, and
 its contracts run a rebuilt program, whose statement reads no proposal of
 more than 64 inputs or 128 outputs a branch. Nothing of a schema 1 ledger
-carries over: its contracts end under the hub that opened them.
+carries over: its contracts end under the hub that opened them, which
+keeps its binary, its programs (none of them is in `r0/programs/` any
+more) and its URL, where its holders' wallets reach it. A Docker hub that
+follows `main` would take the new image and refuse its ledger: pin it to
+its own `sha-` tag first.
 
 1. On the old binary, stop new openings: restart it with
    `--contracts-max-live 1`, which refuses an opening while any contract is
@@ -789,7 +794,9 @@ carries over: its contracts end under the hub that opened them.
    each close and each claim under way is buried.
 4. Once holders have spent their notes of it down, stop it, move `<data>`
    aside (keep it: its seed and ledger), and make a hub anew with `init` in
-   a new `<data>`, its programs installed.
+   a new `<data>`, its programs installed. Never copy the old `seed` into
+   it: v3 derives the same note keys from a seed, and the new ledger's
+   empty spend log would accept the old notes' identifiers again.
 
 Contracts opened before keep their graph, program and reserve; only new openings take the new
 graph, and apps older than it open none until they are updated. Read the
