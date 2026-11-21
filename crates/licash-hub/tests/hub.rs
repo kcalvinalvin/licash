@@ -257,13 +257,26 @@ fn init_never_replaces_a_seed_or_ledger_and_open_needs_both_matching() {
     drop(hub);
     sql(&a.db)
         .execute(
-            "UPDATE schema_versions SET version = 3 WHERE component = 'ledger'",
+            "UPDATE schema_versions SET version = 4 WHERE component = 'ledger'",
             [],
         )
         .unwrap();
     let why = setup_error(Hub::open(&a.seed, &a.db, Policy::default()));
-    assert!(why.contains("schema 3"), "{why}");
-    // A ledger of the release before holds notes of the note format v2:
+    assert!(why.contains("schema 4"), "{why}");
+    // A ledger of the release before holds notes and grants of the note
+    // format v3: refused by its schema, and told what to do with it.
+    sql(&a.db)
+        .execute(
+            "UPDATE schema_versions SET version = 2 WHERE component = 'ledger'",
+            [],
+        )
+        .unwrap();
+    let why = setup_error(Hub::open(&a.seed, &a.db, Policy::default()));
+    assert!(
+        why.contains("schema 2") && why.contains("earlier release") && why.contains("init"),
+        "{why}"
+    );
+    // One of the release before that holds notes of the note format v2:
     // refused by its schema, not taken for another hub's seed.
     sql(&a.db)
         .execute(
@@ -1604,7 +1617,7 @@ fn the_ledger_is_a_component_of_a_hub_file_and_its_rows_hold_to_their_states() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     // Rows by themselves: what each refers to is not under test.
     db.pragma_update(None, "foreign_keys", false).unwrap();
 

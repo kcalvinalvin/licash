@@ -1,21 +1,32 @@
 //! Owner authorization and coin-producing grants.
 //!
-//! A grant is the proposal's ordinary blind issuance, sealed. Each packet is
-//! `(k_d B, DLEQ)` XORed with a pad hashed from one 32-byte unlock `t`, and
-//! the grant commits to `H(t)`. Before `t` is released the packets are
-//! independent of the issuer's keys; releasing `t` is exactly one blind
-//! issuance per packet. The payer cannot check a sealed packet, so whoever
-//! relies on a released unlock (a recipient, or the counter that retires the
-//! payer's inputs) checks the opening: `Grant::verify_unlock` opens every
+//! A grant is the proposal's ordinary blind issuance, sealed under one
+//! secret scalar `t`, the unlock, whose key `T = tG` the grant names. Each
+//! packet is `E = k_d B + t U` with a proof of it ([`crypto::Seal`]), `U` a
+//! point hashed from the proposal and the packet's position, of which
+//! nobody knows a discrete logarithm. Before `t` is released a packet says
+//! nothing of `k_d B`; releasing `t` is exactly one blind issuance per
 //! packet.
+//!
+//! The payer verifies every packet before she signs ([`Grant::verify`],
+//! which [`SignedProposal::sign`] does): what she authorizes is a grant
+//! that opens, whole, under the secret of `T`. So whoever relies on a
+//! released unlock (the counter that retires her inputs, a statement that
+//! cites her spend) checks one equation, `tG = T` ([`Grant::verify_unlock`],
+//! [`GrantHead::verify_unlock`]), whatever the number of packets, and a
+//! recipient checks the packets it opens.
 //!
 //! This module is stateless: no source is admitted or recorded spent here.
 
-use k256::{ProjectivePoint, Scalar};
+use k256::{
+    elliptic_curve::hash2curve::{ExpandMsgXmd, GroupDigest},
+    ProjectivePoint, Scalar, Secp256k1,
+};
+use sha2::Sha256;
 
 use crate::{
     codec::{put_blob, put_u32, Reader},
-    crypto::{self, Dleq, DleqCommit, Point, ScalarBytes, Signature},
+    crypto::{self, DleqCommit, Point, ScalarBytes, Seal, Signature, SEAL_BYTES},
     ec::Pt,
     note::Evidence,
     note::{non_identity, Derivation, IssuerKeys, Keyset, Note},
@@ -27,53 +38,49 @@ fn bad(reason: &str) -> Error {
     Error::Protocol(reason.into())
 }
 
-/// A grant's unlock `t`: 32 random bytes, a hash preimage like a swap secret.
+/// A grant's unlock `t`: a nonzero scalar, the secret of the key the grant
+/// names ([`Grant::unlock_key`]).
 pub type Unlock = [u8; 32];
 
-/// Sealed bytes of one packet: the blind signature (33) and its DLEQ (64).
-pub const SEALED_BYTES: usize = 33 + 64;
-
-const GRANT_TAG: &[u8] = b"LICASH-GR\x02";
+const GRANT_TAG: &[u8] = b"LICASH-GR\x03";
 const SIGNED_TAG: &[u8] = b"LICASH-SS\x02";
-/// A packet's denomination, target, seal and unlink commitment.
-const PACKET_BYTES: usize = 8 + 33 + SEALED_BYTES + 33 + 33;
+const MASK_DST: &[u8] = b"LICASH-GRANT-MASK-V1-secp256k1_XMD:SHA-256_SSWU_RO_";
+/// A packet's denomination, target, seal, its proof and unlink commitment.
+const PACKET_BYTES: usize = 8 + 33 + 33 + SEAL_BYTES + 33 + 33;
 
-/// `H(t)`, bound to the proposal so one unlock answers one grant.
-pub fn unlock_hash(proposal: &ProposalId, unlock: &Unlock) -> [u8; 32] {
-    crypto::tagged_hash("licash/grant-lock/v2", &[proposal.as_bytes(), unlock])
-}
-
-/// The pad of packet `index`. It commits the position and denomination, so no
-/// two packets of any grant share pad bytes.
-fn pad(proposal: &ProposalId, unlock: &Unlock, index: usize, denom: u64) -> [u8; SEALED_BYTES] {
-    let mut out = [0; SEALED_BYTES];
+/// The mask base `U` of packet `index` of the grant of `proposal`: hashed
+/// to the curve, so that nobody knows how it relates to the generator, to
+/// a blinded point or to another packet's.
+fn mask(proposal: &ProposalId, index: usize) -> Result<ProjectivePoint, Error> {
     let index = u32::try_from(index)
-        .expect("bounded packet index")
+        .map_err(|_| bad("grant packet index"))?
         .to_be_bytes();
-    for (block, chunk) in out.chunks_mut(32).enumerate() {
-        let block = crypto::tagged_hash(
-            "licash/grant-pad/v2",
-            &[
-                proposal.as_bytes(),
-                unlock,
-                &index,
-                &denom.to_be_bytes(),
-                &[block as u8],
-            ],
-        );
-        chunk.copy_from_slice(&block[..chunk.len()]);
+    let point = Secp256k1::hash_from_bytes::<ExpandMsgXmd<Sha256>>(
+        &[proposal.as_bytes(), &index],
+        &[MASK_DST],
+    )
+    .map_err(|_| bad("grant mask hash-to-curve"))?;
+    if point == ProjectivePoint::IDENTITY {
+        return Err(Error::InvalidPoint);
     }
-    out
+    Ok(point)
 }
 
-/// Untrusted public packet. Every field is committed by issuer and owners;
+/// The key of an unlock, `tG`, if it is a nonzero scalar.
+fn unlock_key(unlock: &Unlock) -> Result<Point, Error> {
+    let t = ScalarBytes(*unlock).to_nonzero()?;
+    Ok(Point::from_projective(&crypto::generator_mul(&t)))
+}
+
+/// Untrusted public packet. Every field is committed by the owners;
 /// verification is mandatory after any mutation or external reconstruction.
-/// `sealed` is opaque until the unlock is known.
+/// `sealed` is `k_d B + t U`, which `seal` proves.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Packet {
     pub denom: u64,
     pub blinded: Point,
-    pub sealed: Vec<u8>,
+    pub sealed: Point,
+    pub seal: Seal,
     pub commit: DleqCommit,
 }
 
@@ -83,16 +90,16 @@ impl std::fmt::Debug for Packet {
     }
 }
 
-/// Public offer, not an admitted source or owner authorization. The issuer
-/// signature covers the complete offer.
+/// Public offer, not an admitted source or owner authorization. Nothing
+/// signs it: each packet's proof is of knowledge of its denomination's key,
+/// which only the issuer has.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Grant {
     pub keyset: [u8; 32],
     pub proposal: ProposalId,
-    /// `unlock_hash(proposal, t)`.
-    pub lock: [u8; 32],
+    /// `T = tG`, the key of the unlock.
+    pub unlock_key: Point,
     pub packets: Vec<Packet>,
-    pub sig: Signature,
 }
 
 impl std::fmt::Debug for Grant {
@@ -101,8 +108,75 @@ impl std::fmt::Debug for Grant {
     }
 }
 
+/// What the owners' signatures say of the grant they authorize, in the
+/// fewest bytes: the key of its unlock, and a hash of all of it. Whoever
+/// holds a signature over it and the secret of `unlock_key` knows that the
+/// grant its signer verified is open, without reading a packet
+/// ([`crate::recovery::Evidence::Signed`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GrantHead {
+    pub unlock_key: Point,
+    /// The hash of the grant's bytes.
+    pub rest: [u8; 32],
+}
+
+impl std::fmt::Debug for GrantHead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GrantHead(..)")
+    }
+}
+
+/// A [`GrantHead`]'s bytes: its key and its hash.
+pub const GRANT_HEAD_BYTES: usize = 33 + 32;
+
+impl GrantHead {
+    pub fn to_bytes(&self) -> [u8; GRANT_HEAD_BYTES] {
+        let mut bytes = [0; GRANT_HEAD_BYTES];
+        bytes[..33].copy_from_slice(&self.unlock_key.0);
+        bytes[33..].copy_from_slice(&self.rest);
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8; GRANT_HEAD_BYTES]) -> Self {
+        Self {
+            unlock_key: Point(bytes[..33].try_into().expect("33 bytes")),
+            rest: bytes[33..].try_into().expect("32 bytes"),
+        }
+    }
+
+    /// What the owners sign with the proposal's id ([`granted_digest`]).
+    pub fn commitment(&self) -> [u8; 32] {
+        crypto::tagged_hash("licash/grant-commitment/v3", &[&self.to_bytes()])
+    }
+
+    /// `unlock` is the grant's: a nonzero scalar, the secret of its key.
+    pub fn verify_unlock(&self, unlock: &Unlock) -> Result<(), Error> {
+        if unlock_key(unlock)? != self.unlock_key {
+            return Err(bad("grant unlock mismatch"));
+        }
+        Ok(())
+    }
+}
+
+/// What the owners of the inputs of the proposal `id` sign to authorize it
+/// plainly, with no grant.
+pub fn plain_digest(id: &ProposalId) -> [u8; 32] {
+    crypto::tagged_hash("licash/authorize-plain/v2", &[id.as_bytes()])
+}
+
+/// What the owners of the inputs of the proposal `id` sign to authorize it
+/// with the grant of head `head`.
+pub fn granted_digest(id: &ProposalId, head: &GrantHead) -> [u8; 32] {
+    crypto::tagged_hash(
+        "licash/authorize-grant/v3",
+        &[id.as_bytes(), &head.commitment()],
+    )
+}
+
 impl Grant {
-    fn body(&self) -> Result<Vec<u8>, Error> {
+    /// The bytes the owners commit to ([`Grant::head`]): the keyset, the
+    /// proposal, the unlock's key and every packet.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let count =
             u32::try_from(self.packets.len()).map_err(|_| bad("grant packet count overflow"))?;
         if count == 0 {
@@ -111,34 +185,29 @@ impl Grant {
         let mut bytes = GRANT_TAG.to_vec();
         bytes.extend(self.keyset);
         bytes.extend(self.proposal.as_bytes());
-        bytes.extend(self.lock);
+        bytes.extend(self.unlock_key.0);
         bytes.extend(count.to_be_bytes());
         for packet in &self.packets {
-            if packet.sealed.len() != SEALED_BYTES {
-                return Err(bad("grant packet seal length"));
-            }
             bytes.extend(packet.denom.to_be_bytes());
             bytes.extend(packet.blinded.0);
-            bytes.extend(&packet.sealed);
+            bytes.extend(packet.sealed.0);
+            bytes.extend(packet.seal.to_bytes());
             bytes.extend(packet.commit.r1.0);
             bytes.extend(packet.commit.r2.0);
         }
         Ok(bytes)
     }
 
-    pub fn commitment(&self) -> Result<[u8; 32], Error> {
-        Ok(crypto::tagged_hash(
-            "licash/grant-commitment/v2",
-            &[&self.to_bytes()?],
-        ))
+    /// What the owners sign of it ([`GrantHead`]).
+    pub fn head(&self) -> Result<GrantHead, Error> {
+        Ok(GrantHead {
+            unlock_key: self.unlock_key,
+            rest: crypto::tagged_hash("licash/grant/v3", &[&self.to_bytes()?]),
+        })
     }
 
-    /// The signed body followed by the issuer's signature: the bytes the
-    /// owners commit to.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let mut bytes = self.body()?;
-        bytes.extend(self.sig.0);
-        Ok(bytes)
+    pub fn commitment(&self) -> Result<[u8; 32], Error> {
+        Ok(self.head()?.commitment())
     }
 
     /// Structural decoding of `to_bytes`. Nothing is verified: call
@@ -147,7 +216,7 @@ impl Grant {
         let mut r = Reader::new(bytes, "grant", GRANT_TAG)?;
         let keyset = r.array()?;
         let proposal = ProposalId::from_bytes(r.array()?);
-        let lock = r.array()?;
+        let unlock_key = Point(r.array()?);
         let count = r.count(PACKET_BYTES)?;
         if count == 0 {
             return Err(bad("empty grant"));
@@ -157,28 +226,27 @@ impl Grant {
             packets.push(Packet {
                 denom: r.u64()?,
                 blinded: Point(r.array()?),
-                sealed: r.take(SEALED_BYTES)?.to_vec(),
+                sealed: Point(r.array()?),
+                seal: Seal::from_bytes(&r.array()?),
                 commit: DleqCommit {
                     r1: Point(r.array()?),
                     r2: Point(r.array()?),
                 },
             });
         }
-        let sig = Signature(r.array()?);
         r.finish()?;
         Ok(Self {
             keyset,
             proposal,
-            lock,
+            unlock_key,
             packets,
-            sig,
         })
     }
 
-    /// Keyset must be authenticated by the caller. This verifies the public
-    /// offer, not input issuance/ownership, spentness, or any funding policy.
-    /// Sealed packets are not opened here: see `verify_unlock`.
-    pub fn verify(&self, keyset: &Keyset, proposal: &Proposal) -> Result<(), Error> {
+    /// The grant is of `proposal` under `keyset`, a packet for each of its
+    /// outputs in order: what is read of it without a curve operation.
+    /// Nothing of a packet is verified ([`Grant::verify`]).
+    fn names(&self, keyset: &Keyset, proposal: &Proposal) -> Result<(), Error> {
         if &self.keyset != keyset.id()
             || proposal.keyset_id() != keyset.id()
             || self.proposal != proposal.id()
@@ -187,66 +255,54 @@ impl Grant {
         {
             return Err(bad("grant proposal context"));
         }
-        let digest = crypto::tagged_hash("licash/grant-offer/v2", &[&self.body()?]);
-        crypto::schnorr_verify(keyset.issuer(), &digest, &self.sig)?;
         for (packet, output) in self.packets.iter().zip(proposal.outputs()) {
             if packet.denom != output.denomination() || packet.blinded != output.blinded() {
                 return Err(bad("grant packet order or target"));
             }
-            keyset.key(packet.denom)?;
-            non_identity(&packet.blinded)?;
-            non_identity(&packet.commit.r1)?;
-            non_identity(&packet.commit.r2)?;
         }
         Ok(())
     }
 
-    /// Open one packet: the blind signature `k_d B` and its DLEQ, checked
-    /// under the plain denomination key.
-    fn unseal(
-        &self,
-        keyset: &Keyset,
-        index: usize,
-        unlock: &Unlock,
-    ) -> Result<(ProjectivePoint, Dleq), Error> {
-        if unlock_hash(&self.proposal, unlock) != self.lock {
-            return Err(bad("grant unlock mismatch"));
+    /// What a payer checks before she signs, and all she need check: the
+    /// grant is of `proposal`, and every packet is the issuance its output
+    /// asks for, sealed under the secret of [`Grant::unlock_key`]. Whoever
+    /// releases that secret then releases every output, and no other
+    /// secret is the grant's. Keyset must be authenticated by the caller.
+    /// This verifies the public offer, not input issuance/ownership,
+    /// spentness, or any funding policy.
+    pub fn verify(&self, keyset: &Keyset, proposal: &Proposal) -> Result<(), Error> {
+        self.names(keyset, proposal)?;
+        non_identity(&self.unlock_key)?;
+        let unlock_key = Pt::from_point(&self.unlock_key)?;
+        for (index, packet) in self.packets.iter().enumerate() {
+            non_identity(&packet.blinded)?;
+            non_identity(&packet.sealed)?;
+            non_identity(&packet.commit.r1)?;
+            non_identity(&packet.commit.r2)?;
+            crypto::seal_verify(
+                &packet.seal,
+                &crypto::Sealing {
+                    issuer_pub: &Pt::from_point(&keyset.key(packet.denom)?)?,
+                    unlock_key: &unlock_key,
+                    blinded: &Pt::from_point(&packet.blinded)?,
+                    mask: &Pt::from_projective(&mask(&self.proposal, index)?),
+                    sealed: &Pt::from_point(&packet.sealed)?,
+                    bound: &packet.commit.to_bytes(),
+                },
+            )?;
         }
-        let packet = self
-            .packets
-            .get(index)
-            .ok_or_else(|| bad("grant output index"))?;
-        if packet.sealed.len() != SEALED_BYTES {
-            return Err(bad("grant packet seal length"));
-        }
-        let mut open = pad(&self.proposal, unlock, index, packet.denom);
-        for (byte, sealed) in open.iter_mut().zip(&packet.sealed) {
-            *byte ^= sealed;
-        }
-        let blind_sig = Point(open[..33].try_into().expect("33 bytes"));
-        let dleq = Dleq {
-            e: ScalarBytes(open[33..65].try_into().expect("32 bytes")),
-            s: ScalarBytes(open[65..].try_into().expect("32 bytes")),
-        };
-        let point = non_identity(&blind_sig)?;
-        crypto::dleq_verify_blinded(
-            &dleq,
-            &Pt::from_point(&keyset.key(packet.denom)?)?,
-            &Pt::from_point(&packet.blinded)?,
-            &Pt::from_point(&blind_sig)?,
-        )?;
-        Ok((point, dleq))
+        Ok(())
     }
 
-    /// The unlock opens every packet to a valid issuance. A counter citing a
-    /// granted spend must pass this, so a grant that does not open can never
-    /// retire its payer's inputs.
+    /// `unlock` is this grant's: the secret of its key. Every packet a
+    /// payer verified opens under it ([`Grant::verify`]), so a counter
+    /// citing a granted spend checks this and no packet.
     pub fn verify_unlock(&self, keyset: &Keyset, unlock: &Unlock) -> Result<(), Error> {
         if &self.keyset != keyset.id() {
             return Err(bad("grant keyset"));
         }
-        for index in 0..self.packets.len() {
-            self.unseal(keyset, index, unlock)?;
+        if unlock_key(unlock)? != self.unlock_key {
+            return Err(bad("grant unlock mismatch"));
         }
         Ok(())
     }
@@ -268,14 +324,17 @@ impl Grant {
         self.verify_unlock(keyset, unlock)
     }
 
-    /// This grant's unlock among published disclosure slots, by its hash.
+    /// This grant's unlock among published disclosure slots: the one that
+    /// is the secret of its key. A slot that is no scalar is another's.
     pub fn unlock_in(&self, slots: &[[u8; 32]]) -> Option<Unlock> {
         slots
             .iter()
             .copied()
-            .find(|slot| unlock_hash(&self.proposal, slot) == self.lock)
+            .find(|slot| unlock_key(slot).is_ok_and(|key| key == self.unlock_key))
     }
 
+    /// Open one packet into its note, verified: the packet's proof, under
+    /// the key of `unlock`, is the note's evidence.
     fn open(
         &self,
         keyset: &Keyset,
@@ -283,29 +342,37 @@ impl Grant {
         output: &Derivation,
         unlock: &Unlock,
     ) -> Result<Note, Error> {
-        let (blind_sig, dleq) = self.unseal(keyset, index, unlock)?;
-        let packet = &self.packets[index];
+        self.verify_unlock(keyset, unlock)?;
+        let packet = self
+            .packets
+            .get(index)
+            .ok_or_else(|| bad("grant output index"))?;
         if packet.denom != output.message().denomination() || packet.blinded != output.blinded()? {
             return Err(bad("grant output derivation"));
         }
+        let t = ScalarBytes(*unlock).to_scalar()?;
+        let mask = mask(&self.proposal, index)?;
         let signature = crypto::unblind(
-            &blind_sig,
+            &(non_identity(&packet.sealed)? - mask * t),
             &output.blinding().to_scalar()?,
             &keyset.key(packet.denom)?.to_projective()?,
         );
         if signature == ProjectivePoint::IDENTITY {
             return Err(Error::InvalidPoint);
         }
-        // An opened packet is an ordinary issuance: linked until unlinked.
+        // An opened packet is an issuance its holder can show anyone:
+        // linked to the grant until unlinked.
         Note::from_parts(
             keyset,
             self.keyset,
             output.message().clone(),
             Point::from_projective(&signature),
-            Evidence::Linked {
-                dleq,
+            Evidence::Granted {
+                seal: packet.seal,
                 blinding: *output.blinding(),
                 commit: packet.commit,
+                unlock: ScalarBytes(*unlock),
+                mask: Point::from_projective(&mask),
             },
         )
     }
@@ -313,7 +380,8 @@ impl Grant {
 
 #[derive(Clone)]
 struct PacketRecord {
-    sealed: Vec<u8>,
+    sealed: Point,
+    seal: Seal,
     nonce: unlink::Nonce,
 }
 
@@ -322,7 +390,8 @@ impl PacketRecord {
         Packet {
             denom: self.nonce.denomination(),
             blinded: self.nonce.blinded(),
-            sealed: self.sealed.clone(),
+            sealed: self.sealed,
+            seal: self.seal,
             commit: self.nonce.commit().expect("validated grant target"),
         }
     }
@@ -336,7 +405,6 @@ pub struct PreparedGrant {
     proposal: ProposalId,
     unlock: Unlock,
     records: Vec<PacketRecord>,
-    sig: Signature,
 }
 
 impl std::fmt::Debug for PreparedGrant {
@@ -346,7 +414,7 @@ impl std::fmt::Debug for PreparedGrant {
 }
 
 impl PreparedGrant {
-    /// Curve/signing primitive only. A service must separately authenticate
+    /// Curve primitive only. A service must separately authenticate
     /// inputs, authorize admission and retain durable intent before replying.
     pub fn new(keys: &IssuerKeys, proposal: &Proposal) -> Result<Self, Error> {
         let unlock: Unlock = ScalarBytes::from_scalar(&crypto::random_scalar()).0;
@@ -356,8 +424,10 @@ impl PreparedGrant {
 
     /// The grant for `proposal` under issuer-chosen secrets, so an issuer
     /// that keeps the offer it sent can derive its unlock and unlink nonces
-    /// again instead of storing them. `unlock` must be unpredictable to
-    /// everyone else; the nonces follow [`unlink::Nonce::derive`].
+    /// again instead of storing them. `unlock` must be a nonzero scalar,
+    /// unpredictable to everyone else and of this grant alone; the nonces
+    /// follow [`unlink::Nonce::derive`]. Each packet's proof is drawn
+    /// afresh: two derivations seal alike and prove differently.
     pub fn derive(
         keys: &IssuerKeys,
         proposal: &Proposal,
@@ -368,45 +438,30 @@ impl PreparedGrant {
         if proposal.keyset_id() != keyset.id() || proposal.lock().is_some() {
             return Err(bad("unsupported grant proposal"));
         }
+        let t: Scalar = *ScalarBytes(unlock).to_nonzero()?;
         let id = proposal.id();
         let mut records = Vec::new();
         for (index, output) in proposal.outputs().iter().enumerate() {
             let secret = keys.denomination_secret(output.denomination())?;
             let blinded = non_identity(&output.blinded())?;
-            let blind_sig = crypto::blind_sign(secret, &blinded);
-            let dleq = crypto::dleq_prove(secret, &blinded, &blind_sig);
-            let mut sealed = Point::from_projective(&blind_sig).0.to_vec();
-            sealed.extend(dleq.e.0);
-            sealed.extend(dleq.s.0);
-            for (byte, pad) in
-                sealed
-                    .iter_mut()
-                    .zip(pad(&id, &unlock, index, output.denomination()))
-            {
-                *byte ^= pad;
+            let nonce = unlink::Nonce::derive(nonce_secret, &keyset, output)?;
+            let commit = nonce.commit()?;
+            let (sealed, seal) =
+                crypto::seal_prove(secret, &t, &blinded, &mask(&id, index)?, &commit.to_bytes());
+            if sealed == ProjectivePoint::IDENTITY {
+                return Err(Error::InvalidPoint);
             }
             records.push(PacketRecord {
-                sealed,
-                nonce: unlink::Nonce::derive(nonce_secret, &keyset, output)?,
+                sealed: Point::from_projective(&sealed),
+                seal,
+                nonce,
             });
         }
-        let mut offer = Grant {
+        Ok(Self {
             keyset: *keyset.id(),
             proposal: id,
-            lock: unlock_hash(&id, &unlock),
-            packets: records.iter().map(PacketRecord::packet).collect(),
-            sig: Signature([0; 64]),
-        };
-        offer.sig = crypto::schnorr_sign(
-            keys.issuer_secret(),
-            &crypto::tagged_hash("licash/grant-offer/v2", &[&offer.body()?]),
-        )?;
-        Ok(Self {
-            keyset: offer.keyset,
-            proposal: offer.proposal,
             unlock,
             records,
-            sig: offer.sig,
         })
     }
 
@@ -421,9 +476,8 @@ impl PreparedGrant {
         Grant {
             keyset: self.keyset,
             proposal: self.proposal,
-            lock: unlock_hash(&self.proposal, &self.unlock),
+            unlock_key: unlock_key(&self.unlock).expect("a nonzero scalar"),
             packets: self.records.iter().map(PacketRecord::packet).collect(),
-            sig: self.sig,
         }
     }
 
@@ -455,19 +509,17 @@ impl std::fmt::Debug for Authorization {
 }
 
 impl Authorization {
+    /// What the owners of `proposal`'s inputs sign. A grant is of the
+    /// proposal, a packet for each output in order ([`Grant::names`]);
+    /// whether its packets are what they say is for whoever signs to have
+    /// verified ([`SignedProposal::sign`]) and for whoever opens one.
     fn digest(&self, keyset: &Keyset, proposal: &Proposal) -> Result<[u8; 32], Error> {
         let id = proposal.id();
         match self {
-            Self::Plain => Ok(crypto::tagged_hash(
-                "licash/authorize-plain/v2",
-                &[id.as_bytes()],
-            )),
+            Self::Plain => Ok(plain_digest(&id)),
             Self::Granted(grant) => {
-                grant.verify(keyset, proposal)?;
-                Ok(crypto::tagged_hash(
-                    "licash/authorize-grant/v2",
-                    &[id.as_bytes(), &grant.commitment()?],
-                ))
+                grant.names(keyset, proposal)?;
+                Ok(granted_digest(&id, &grant.head()?))
             }
         }
     }
@@ -493,6 +545,9 @@ pub(crate) fn verify_owner_signatures(
 
 /// Owner-authorized intent, not admitted/spent state or recovery allocation.
 /// Every verification path checks both issuance and owner signatures anew.
+/// Of a grant it checks what the owners signed, not its packets: they
+/// verified every one before signing ([`SignedProposal::sign`]), and their
+/// word is what a third party takes.
 #[derive(Clone)]
 pub struct SignedProposal {
     proposal: Proposal,
@@ -517,6 +572,11 @@ impl SignedProposal {
         proposal.verify(keyset, notes)?;
         if owners.len() != proposal.inputs().len() {
             return Err(bad("owner key count"));
+        }
+        // Her signature is her word that the grant opens, whole, under the
+        // secret of its key: nobody checks it for her afterwards.
+        if let Authorization::Granted(grant) = &authorization {
+            grant.verify(keyset, &proposal)?;
         }
         let digest = authorization.digest(keyset, &proposal)?;
         let mut signatures = Vec::new();
@@ -661,7 +721,7 @@ mod tests {
     use crate::spend::Output;
 
     #[test]
-    fn an_issuer_signature_does_not_replace_packet_equation_and_point_checks() {
+    fn a_payer_refuses_a_packet_that_does_not_open_before_she_signs() {
         let keys = IssuerKeys::random(2).unwrap();
         let keyset = keys.keyset().unwrap();
         let spend = Point::from_projective(&crypto::generator_mul(&Scalar::from(17u64)));
@@ -686,7 +746,7 @@ mod tests {
         let output = Derivation::derive(4, spend, hold.public(), &[23; 32], 1).unwrap();
         let proposal = Proposal::new(
             &keyset,
-            &[note],
+            std::slice::from_ref(&note),
             spend,
             vec![Output::from_derivation(&output).unwrap()],
             None,
@@ -694,48 +754,66 @@ mod tests {
         .unwrap();
         let prepared = PreparedGrant::new(&keys, &proposal).unwrap();
         let original = prepared.offer();
+        original.verify(&keyset, &proposal).unwrap();
         original.verify_unlock(&keyset, &prepared.unlock).unwrap();
-        // The payer cannot tell a sealed packet from garbage, but garbage
-        // never opens, so it can never be cited against her.
+        original
+            .open(&keyset, 0, &output, &prepared.unlock)
+            .unwrap()
+            .verify(&keyset)
+            .unwrap();
+        let owner = hold_owner(&input);
+        let sign = |grant: &Grant| {
+            SignedProposal::sign(
+                &keyset,
+                proposal.clone(),
+                std::slice::from_ref(&note),
+                Authorization::Granted(Box::new(grant.clone())),
+                &[owner],
+            )
+        };
+        sign(&original).unwrap();
+        // The payer tells a sealed packet from garbage before she signs: no
+        // packet she authorizes fails to open under the unlock released.
         let mut garbage = original.clone();
-        garbage.packets[0].sealed[40] ^= 1;
-        garbage.sig = crypto::schnorr_sign(
-            keys.issuer_secret(),
-            &crypto::tagged_hash("licash/grant-offer/v2", &[&garbage.body().unwrap()]),
-        )
-        .unwrap();
-        garbage.verify(&keyset, &proposal).unwrap();
-        assert!(garbage.verify_unlock(&keyset, &prepared.unlock).is_err());
-        let mut partial_attestation = original.clone();
-        partial_attestation.sig = crypto::schnorr_sign(
-            keys.issuer_secret(),
-            &crypto::tagged_hash(
-                "licash/grant",
-                &[proposal.id().as_bytes(), &partial_attestation.lock],
-            ),
-        )
-        .unwrap();
-        assert!(partial_attestation.verify(&keyset, &proposal).is_err());
-        // A valid issuer signature over a malformed or retargeted offer.
-        for field in 0..5 {
+        garbage.packets[0].sealed = Point::from_projective(
+            &(garbage.packets[0].sealed.to_projective().unwrap() + ProjectivePoint::GENERATOR),
+        );
+        assert!(garbage.verify(&keyset, &proposal).is_err());
+        assert!(sign(&garbage).is_err());
+        // It still never opens, whoever is asked to.
+        assert!(garbage.open(&keyset, 0, &output, &prepared.unlock).is_err());
+        // A packet proven under another unlock is not this grant's.
+        let other = PreparedGrant::new(&keys, &proposal).unwrap().offer();
+        let mut mixed = original.clone();
+        mixed.packets[0] = other.packets[0].clone();
+        assert!(mixed.verify(&keyset, &proposal).is_err());
+        let mut rekeyed = original.clone();
+        rekeyed.unlock_key = other.unlock_key;
+        assert!(rekeyed.verify(&keyset, &proposal).is_err());
+        rekeyed.unlock_key = Point([0; 33]);
+        assert!(rekeyed.verify(&keyset, &proposal).is_err());
+        // Malformed or retargeted packets.
+        for field in 0..6 {
             let mut grant = original.clone();
             match field {
                 0 => grant.packets[0].commit.r1 = Point([0; 33]),
                 1 => grant.packets[0].commit.r2 = Point([0xff; 33]),
                 2 => grant.packets[0].denom = 2,
-                3 => {
-                    grant.packets[0].sealed.pop();
-                    assert!(grant.body().is_err());
-                    continue;
-                }
+                3 => grant.packets[0].seal.s_k.0[31] ^= 1,
+                4 => grant.packets[0].seal.e.0[31] ^= 1,
                 _ => grant.packets[0].blinded = spend,
             }
-            grant.sig = crypto::schnorr_sign(
-                keys.issuer_secret(),
-                &crypto::tagged_hash("licash/grant-offer/v2", &[&grant.body().unwrap()]),
-            )
-            .unwrap();
             assert!(grant.verify(&keyset, &proposal).is_err(), "field {field}");
+            assert!(sign(&grant).is_err(), "field {field}");
         }
+    }
+
+    /// The owner secret of a note derived from `derivation` under the
+    /// spend key 17 G, as the fixture derives it.
+    fn hold_owner(derivation: &Derivation) -> Scalar {
+        derivation
+            .ownership()
+            .owner_secret(&Scalar::from(17u64))
+            .unwrap()
     }
 }

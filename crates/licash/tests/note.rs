@@ -174,13 +174,15 @@ fn issuer_and_grant_evidence_verify_the_note_point() {
         .verify(&convert(key), &convert(y), &convert(c))
         .unwrap();
     let unlock = Scalar::from(41u64);
-    let encrypted = crypto::blind_sign(&(issuer + unlock), &blinded);
-    assert_eq!(encrypted - blinded * unlock, blind_sig);
+    let mask = crypto::generator_mul(&Scalar::from(43u64));
+    let (sealed, seal) = crypto::seal_prove(&issuer, &unlock, &blinded, &mask, &commit.to_bytes());
+    assert_eq!(sealed - mask * unlock, blind_sig);
     Evidence::Granted {
-        dleq: crypto::dleq_prove(&(issuer + unlock), &blinded, &encrypted),
+        seal,
         blinding: *output.blinding(),
         commit,
         unlock: ScalarBytes::from_scalar(&unlock),
+        mask: Point::from_projective(&mask),
     }
     .verify(&convert(key), &convert(y), &convert(c))
     .unwrap();

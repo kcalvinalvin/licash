@@ -166,10 +166,7 @@ fn a_complete_grant_opens_each_coin_with_one_shared_unlock_after_owner_authoriza
         prepared.clone().release(&keyset, &notes, &signed).unwrap(),
         unlock
     );
-    let digest = crypto::tagged_hash(
-        "licash/authorize-grant/v2",
-        &[proposal.id().as_bytes(), &grant.commitment().unwrap()],
-    );
+    let digest = licash::authorization::granted_digest(&proposal.id(), &grant.head().unwrap());
     for (message, sig) in proposal.inputs().iter().zip(signed.signatures()) {
         crypto::schnorr_verify(message.owner(), &digest, sig).unwrap();
     }
@@ -179,13 +176,17 @@ fn a_complete_grant_opens_each_coin_with_one_shared_unlock_after_owner_authoriza
             .unwrap();
         note.verify(&keyset).unwrap();
         assert_eq!(note.message(), derived.message());
-        // An opened packet is an ordinary issuance under the plain key.
-        assert!(matches!(note.evidence(), Evidence::Linked { .. }));
+        // An opened packet shows its own proof under the plain key: anyone
+        // verifies it with the unlock.
+        assert!(matches!(note.evidence(), Evidence::Granted { .. }));
     }
     grant.verify_unlock(&keyset, &unlock).unwrap();
+    // The unlock is the secret of the key the grant names.
     assert_eq!(
-        grant.lock,
-        licash::authorization::unlock_hash(&proposal.id(), &unlock)
+        grant.unlock_key,
+        Point::from_projective(&crypto::generator_mul(
+            &licash::crypto::ScalarBytes(unlock).to_scalar().unwrap()
+        ))
     );
     for wrong in [[0; 32], [0xff; 32], [83; 32]] {
         assert!(grant.verify_unlock(&keyset, &wrong).is_err());
@@ -211,12 +212,12 @@ fn a_derived_grant_rebuilds_from_its_secrets_and_releases_against_the_stored_off
     let prepared = PreparedGrant::derive(&keys, &proposal, unlock, &nonce_secret).unwrap();
     let grant = prepared.offer();
     grant.verify(&keyset, &proposal).unwrap();
-    // The secrets fix the lock and the unlink commitments; proofs and the
-    // issuer signature are fresh, so an issuer keeps the offer it sent.
+    // The secrets fix the unlock key, the sealed points and the unlink
+    // commitments; proofs are fresh, so an issuer keeps the offer it sent.
     let again = PreparedGrant::derive(&keys, &proposal, unlock, &nonce_secret)
         .unwrap()
         .offer();
-    assert_eq!(again.lock, grant.lock);
+    assert_eq!(again.unlock_key, grant.unlock_key);
     for (a, b) in again.packets.iter().zip(&grant.packets) {
         assert_eq!(
             (a.denom, a.blinded, a.commit),
@@ -227,7 +228,7 @@ fn a_derived_grant_rebuilds_from_its_secrets_and_releases_against_the_stored_off
     let other = PreparedGrant::derive(&keys, &proposal, unlock, &[44; 32])
         .unwrap()
         .offer();
-    assert_eq!(other.lock, grant.lock);
+    assert_eq!(other.unlock_key, grant.unlock_key);
     assert_ne!(other.packets[0].commit, grant.packets[0].commit);
     for (nonce, output) in prepared.unlink_nonces().iter().zip(proposal.outputs()) {
         let derived = unlink::Nonce::derive(&nonce_secret, &keyset, output).unwrap();
@@ -376,7 +377,7 @@ fn grant_stripping_replacement_and_cross_mode_signatures_are_rejected() {
 }
 
 #[test]
-fn the_issuer_and_owner_commitments_bind_every_packet_field_order_count_and_signature() {
+fn the_issuer_proofs_and_owner_commitments_bind_every_packet_field_order_and_count() {
     let (keys, keyset, notes, proposal) = fixture();
     let original = PreparedGrant::new(&keys, &proposal).unwrap().offer();
     let signed = SignedProposal::sign(
@@ -391,19 +392,19 @@ fn the_issuer_and_owner_commitments_bind_every_packet_field_order_count_and_sign
         let mut grant = original.clone();
         match field {
             0 => grant.keyset[0] ^= 1,
-            1 => grant.lock[0] ^= 1,
+            1 => grant.unlock_key = point(79),
             2 => {
                 grant.packets.pop();
             }
             3 => grant.packets.swap(0, 1),
             4 => grant.packets[0].denom = 2,
             5 => grant.packets[0].blinded = point(79),
-            6 => grant.packets[0].sealed[0] ^= 1,
-            7 => grant.packets[0].sealed[40] ^= 1,
-            8 => grant.packets[0].sealed[96] ^= 1,
+            6 => grant.packets[0].sealed = point(79),
+            7 => grant.packets[0].seal.s_t.0[31] ^= 1,
+            8 => grant.packets[0].seal.s_k.0[31] ^= 1,
             9 => grant.packets[0].commit.r1 = point(79),
             10 => grant.packets[0].commit.r2 = point(79),
-            11 => grant.sig.0[0] ^= 1,
+            11 => grant.packets[0].seal.e.0[31] ^= 1,
             _ => {
                 grant.proposal = Proposal::new(
                     &keyset,
@@ -564,7 +565,7 @@ fn thirty_two_separate_grants_keep_independent_unlocks_and_valid_coins() {
         )
         .unwrap();
         let prepared = PreparedGrant::new(&keys, &proposal).unwrap();
-        assert!(unlocks.insert(prepared.offer().lock));
+        assert!(unlocks.insert(prepared.offer().unlock_key));
         let signed = SignedProposal::sign(
             &keyset,
             proposal,
@@ -601,11 +602,11 @@ fn malformed_public_artifacts_are_not_owner_authorization() {
     for field in 0..5 {
         let mut grant: Grant = original.clone();
         match field {
-            0 => grant.lock = [0; 32],
-            1 => grant.packets[0].sealed.clear(),
+            0 => grant.unlock_key = Point([0; 33]),
+            1 => grant.packets[0].sealed = Point([0; 33]),
             2 => grant.packets[0].commit.r1 = Point([0; 33]),
             3 => grant.packets[0].commit.r2 = Point([0; 33]),
-            _ => grant.packets[0].sealed.push(0),
+            _ => grant.packets[0].sealed = Point([0xff; 33]),
         }
         assert!(SignedProposal::sign(
             &keyset,

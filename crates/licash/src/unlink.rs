@@ -441,15 +441,24 @@ mod tests {
             .unwrap()
             .open(&keyset, &d)
             .unwrap();
-        // The packet's evidence: the issuer's key masked by an unlock.
+        // The packet's evidence: the issuance sealed under an unlock.
         let unlock = Scalar::from(41u64);
-        let masked = keys.denomination_secret(4).unwrap() + unlock;
+        let mask = crypto::generator_mul(&Scalar::from(43u64));
         let blinded = d.blinded().unwrap().to_projective().unwrap();
+        let commit = nonce.commit().unwrap();
+        let (_, seal) = crypto::seal_prove(
+            keys.denomination_secret(4).unwrap(),
+            &unlock,
+            &blinded,
+            &mask,
+            &commit.to_bytes(),
+        );
         let granted = Evidence::Granted {
-            dleq: crypto::dleq_prove(&masked, &blinded, &crypto::blind_sign(&masked, &blinded)),
+            seal,
             blinding: *d.blinding(),
-            commit: nonce.commit().unwrap(),
+            commit,
             unlock: ScalarBytes::from_scalar(&unlock),
+            mask: crypto::Point::from_projective(&mask),
         };
         let note = Note::from_parts(
             &keyset,

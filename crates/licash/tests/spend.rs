@@ -440,7 +440,7 @@ fn all_valid_issuance_evidence_variants_share_the_same_proposal_identity() {
     let mut records = 4u64.to_be_bytes().to_vec();
     records.extend(public.0);
     let format = crypto::tagged_hash(
-        "licash/note-format/v3",
+        "licash/note-format/v4",
         &[
             b"licash/note/v2",
             b"LICASH-V2-secp256k1_XMD:SHA-256_SSWU_RO_",
@@ -450,7 +450,7 @@ fn all_valid_issuance_evidence_variants_share_the_same_proposal_identity() {
         "licash/keyset/v2",
         &[&format, &credential, &1u32.to_be_bytes(), &records],
     );
-    let mut encoded = b"LICASH-KS\x03".to_vec();
+    let mut encoded = b"LICASH-KS\x04".to_vec();
     encoded.extend(id);
     encoded.extend(credential);
     encoded.extend(1u32.to_be_bytes());
@@ -475,11 +475,16 @@ fn all_valid_issuance_evidence_variants_share_the_same_proposal_identity() {
             blinding: *derivation.blinding(),
             commit,
         },
-        Evidence::Granted {
-            dleq: crypto::dleq_prove(&(scalar + unlock), &b, &(b * (scalar + unlock))),
-            blinding: *derivation.blinding(),
-            commit,
-            unlock: ScalarBytes::from_scalar(&unlock),
+        {
+            let mask = crypto::generator_mul(&Scalar::from(59u64));
+            let (_, seal) = crypto::seal_prove(&scalar, &unlock, &b, &mask, &commit.to_bytes());
+            Evidence::Granted {
+                seal,
+                blinding: *derivation.blinding(),
+                commit,
+                unlock: ScalarBytes::from_scalar(&unlock),
+                mask: Point::from_projective(&mask),
+            }
         },
     ];
     let mut expected = None;

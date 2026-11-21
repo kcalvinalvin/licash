@@ -257,6 +257,16 @@ pub struct DleqCommit {
     pub r2: Point,
 }
 
+impl DleqCommit {
+    /// `R1 ‖ R2`.
+    pub fn to_bytes(&self) -> [u8; 66] {
+        let mut bytes = [0; 66];
+        bytes[..33].copy_from_slice(&self.r1.0);
+        bytes[33..].copy_from_slice(&self.r2.0);
+        bytes
+    }
+}
+
 pub fn dleq_commit(w: &Scalar, blinded: &ProjectivePoint) -> DleqCommit {
     DleqCommit {
         r1: Point::from_projective(&(ProjectivePoint::GENERATOR * w)),
@@ -340,6 +350,154 @@ pub fn dleq_verify_unblinded(
     } else {
         Err(Error::BadDleq)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sealed issuance: a blind signature masked under a key, provably
+// ---------------------------------------------------------------------------
+
+/// A proof that `E = k B_ + t U` for the `k` behind the issuer's key
+/// `K = kG` and the `t` behind `T = tG`: the blind signature `k B_` sealed
+/// under `T` with the mask base `U`, so that whoever learns `t` opens it
+/// (`E - tU`) and nobody else does. Whoever verifies it knows before `t` is
+/// released that it opens to the issuance on `B_`, and to nothing else:
+/// `K` and `T` fix `k` and `t`, whatever `U` is.
+///
+/// A Schnorr proof of the two secrets: `A1 = aG`, `A2 = bG`,
+/// `A3 = a B_ + b U`, `e = H(K, T, B_, U, E, A1, A2, A3, bound)`,
+/// `s_k = a + e k`, `s_t = b + e t`. Its nonces are drawn fresh for each
+/// proof: one answered under two challenges reveals `k`. `bound` is what
+/// else only the issuer may vouch for with it: a packet's unlink
+/// commitment, which nobody else can then change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Seal {
+    pub e: ScalarBytes,
+    pub s_k: ScalarBytes,
+    pub s_t: ScalarBytes,
+}
+
+/// A [`Seal`]'s bytes: `e`, `s_k`, `s_t`.
+pub const SEAL_BYTES: usize = 96;
+
+impl Seal {
+    pub fn to_bytes(&self) -> [u8; SEAL_BYTES] {
+        let mut bytes = [0; SEAL_BYTES];
+        bytes[..32].copy_from_slice(&self.e.0);
+        bytes[32..64].copy_from_slice(&self.s_k.0);
+        bytes[64..].copy_from_slice(&self.s_t.0);
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8; SEAL_BYTES]) -> Self {
+        let part = |at: usize| ScalarBytes(bytes[at..at + 32].try_into().expect("32 bytes"));
+        Self {
+            e: part(0),
+            s_k: part(32),
+            s_t: part(64),
+        }
+    }
+}
+
+/// What a [`Seal`] is of: the issuer's key `K`, the unlock key `T`, the
+/// blinded point `B_`, the mask base `U`, the sealed point `E`, and what
+/// else it vouches for.
+pub struct Sealing<'a> {
+    pub issuer_pub: &'a Pt,
+    pub unlock_key: &'a Pt,
+    pub blinded: &'a Pt,
+    pub mask: &'a Pt,
+    pub sealed: &'a Pt,
+    pub bound: &'a [u8],
+}
+
+fn seal_challenge(of: &Sealing, commits: [&Pt; 3]) -> Scalar {
+    let parts = [of.issuer_pub, of.unlock_key, of.blinded, of.mask, of.sealed]
+        .map(|p| p.to_point().0);
+    let commits = commits.map(|p| p.to_point().0);
+    let mut all: Vec<&[u8]> = parts.iter().map(|p| &p[..]).collect();
+    all.extend(commits.iter().map(|p| &p[..]));
+    all.push(of.bound);
+    scalar_from_hash(&tagged_hash("licash/seal/v1", &all))
+}
+
+/// Seal the blind signature `k B_` under `t` with the mask base `mask`:
+/// `E = k B_ + t U` and the proof of it ([`Seal`]), vouching for `bound`.
+pub fn seal_prove(
+    k: &Scalar,
+    t: &Scalar,
+    blinded: &ProjectivePoint,
+    mask: &ProjectivePoint,
+    bound: &[u8],
+) -> (ProjectivePoint, Seal) {
+    let sealed = *blinded * k + *mask * t;
+    let (a, b) = (random_scalar(), random_scalar());
+    let e = seal_challenge(
+        &Sealing {
+            issuer_pub: &Pt::from_projective(&(ProjectivePoint::GENERATOR * k)),
+            unlock_key: &Pt::from_projective(&(ProjectivePoint::GENERATOR * t)),
+            blinded: &Pt::from_projective(blinded),
+            mask: &Pt::from_projective(mask),
+            sealed: &Pt::from_projective(&sealed),
+            bound,
+        },
+        [
+            &Pt::from_projective(&(ProjectivePoint::GENERATOR * a)),
+            &Pt::from_projective(&(ProjectivePoint::GENERATOR * b)),
+            &Pt::from_projective(&(*blinded * a + *mask * b)),
+        ],
+    );
+    let seal = Seal {
+        e: ScalarBytes::from_scalar(&e),
+        s_k: ScalarBytes::from_scalar(&(a + e * k)),
+        s_t: ScalarBytes::from_scalar(&(b + e * t)),
+    };
+    (sealed, seal)
+}
+
+/// Verify a [`Seal`]: `s_k G - e K`, `s_t G - e T` and
+/// `s_k B_ + s_t U - e E` are the commitments its challenge hashes.
+pub fn seal_verify(proof: &Seal, of: &Sealing) -> Result<(), Error> {
+    let e = proof.e.to_scalar()?;
+    let s_k = proof.s_k.to_scalar()?;
+    let s_t = proof.s_t.to_scalar()?;
+    let neg_e = -e;
+    let a1 = msm(&[(Pt::generator(), s_k), (*of.issuer_pub, neg_e)]);
+    let a2 = msm(&[(Pt::generator(), s_t), (*of.unlock_key, neg_e)]);
+    let a3 = msm(&[(*of.blinded, s_k), (*of.mask, s_t), (*of.sealed, neg_e)]);
+    if seal_challenge(of, [&a1, &a2, &a3]) == e {
+        Ok(())
+    } else {
+        Err(Error::BadDleq)
+    }
+}
+
+/// Verify a [`Seal`] on unblinded values, as a third party with
+/// `(Y, C, r)`, the unlock `t`, the mask base and what it vouches for does:
+/// `B_ = Y + rG`, `E = C + rK + tU`, `T = tG`. It holds only if `C = kY`.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_verify_opened(
+    proof: &Seal,
+    issuer_pub: &Pt,
+    y: &Pt,
+    c: &Pt,
+    r: &Scalar,
+    t: &Scalar,
+    mask: &Pt,
+    bound: &[u8],
+) -> Result<(), Error> {
+    let blinded = y.add(&gen_mul(r));
+    let sealed = c.add(&msm(&[(*issuer_pub, *r), (*mask, *t)]));
+    seal_verify(
+        proof,
+        &Sealing {
+            issuer_pub,
+            unlock_key: &gen_mul(t),
+            blinded: &blinded,
+            mask,
+            sealed: &sealed,
+            bound,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

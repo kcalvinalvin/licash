@@ -46,7 +46,7 @@ use licash::{
     address::{Address, OwnerKeys},
     authorization::{Grant, PreparedGrant, SignedProposal, Unlock},
     chain::Checkpoint,
-    crypto::{schnorr_sign, tagged_hash, Point, Signature},
+    crypto::{scalar_from_hash, schnorr_sign, tagged_hash, Point, ScalarBytes, Signature},
     note::{IssuerKeys, Keyset, Note},
     spend::{Output, Proposal, ProposalId},
     unlink::{self, Answer, Answered, Request},
@@ -662,11 +662,16 @@ impl Hub {
         Ok((keys, keyset))
     }
 
+    /// The unlock of the grant of `proposal`: a scalar of the hub's secret,
+    /// derived again rather than stored, its key in the grant
+    /// ([`licash::authorization::Grant::unlock_key`]). Zero with negligible
+    /// odds, which [`PreparedGrant::derive`] refuses.
     fn unlock(&self, keyset: &[u8; 32], proposal: &ProposalId, salt: &[u8; 32]) -> Unlock {
-        tagged_hash(
-            "licash-hub/unlock",
+        let hash = tagged_hash(
+            "licash-hub/grant-unlock",
             &[&self.unlock_secret, keyset, proposal.as_bytes(), salt],
-        )
+        );
+        ScalarBytes::from_scalar(&scalar_from_hash(&hash)).0
     }
 
     /// The secret of the unlink nonces of `proposal`'s outputs, for this

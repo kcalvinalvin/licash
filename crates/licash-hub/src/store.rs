@@ -23,11 +23,12 @@ use crate::Error;
 
 pub(crate) use licash_store::now;
 
-/// The component the ledger's tables are, and its version. 2 issues notes
-/// of the note format v3; a ledger of 1 holds v2 notes, keysets and
-/// proofs, and is refused rather than read under the other rule.
+/// The component the ledger's tables are, and its version. 3 issues notes
+/// of the note format v4, and offers grants anyone verifies; a ledger of 2
+/// holds v3 notes and grants, one of 1 v2 notes, keysets and proofs: each
+/// is refused rather than read under the other rule.
 pub(crate) const COMPONENT: &str = "ledger";
-pub(crate) const VERSION: i64 = 2;
+pub(crate) const VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE meta (
@@ -374,6 +375,11 @@ pub(crate) fn inspect(path: &Path) -> Result<Connection, Error> {
 fn check_version(conn: &Connection) -> Result<(), Error> {
     match licash_store::component_version(conn, COMPONENT).map_err(setup)? {
         Some(VERSION) => Ok(()),
+        Some(v) if v < VERSION => Err(Error::Setup(format!(
+            "database schema {v}, this hub reads {VERSION}: a ledger of an earlier release, \
+             left as it is. Run the release that wrote it until its contracts close, then \
+             make a hub anew with init in a new data directory (docs/hub.md, Upgrading)"
+        ))),
         Some(v) => Err(Error::Setup(format!(
             "database schema {v}, this hub reads {VERSION}"
         ))),

@@ -13,18 +13,18 @@ use serde::{Deserialize, Serialize};
 use crate::{
     codec::Reader,
     crypto::{
-        dleq_verify_blinded, dleq_verify_unblinded, generator_mul, scalar_from_hash, tagged_hash,
-        Dleq, DleqCommit, Point, ScalarBytes,
+        dleq_verify_blinded, dleq_verify_unblinded, generator_mul, scalar_from_hash,
+        seal_verify_opened, tagged_hash, Dleq, DleqCommit, Point, ScalarBytes, Seal,
     },
     ec::Pt,
     Error,
 };
 
 const TAG: &[u8] = b"licash/note/v2";
-const NOTE_TAG: &[u8] = b"LICASH-NT\x03";
+const NOTE_TAG: &[u8] = b"LICASH-NT\x04";
 const DST: &[u8] = b"LICASH-V2-secp256k1_XMD:SHA-256_SSWU_RO_";
-const KEYSET_TAG: &[u8] = b"LICASH-KS\x03";
-const ISSUED_TAG: &[u8] = b"LICASH-IS\x03";
+const KEYSET_TAG: &[u8] = b"LICASH-KS\x04";
+const ISSUED_TAG: &[u8] = b"LICASH-IS\x04";
 const MAX_KEYS: usize = 64;
 pub const PUBLIC_FIELDS_BYTES: usize = 8 + 32 + 32 + 32;
 pub const MESSAGE_BYTES: usize = TAG.len() + PUBLIC_FIELDS_BYTES;
@@ -43,10 +43,13 @@ pub(crate) fn non_identity(point: &Point) -> Result<ProjectivePoint, Error> {
 
 /// The note format, which every keyset id commits to. v3 is v2 with an
 /// issuance proof whose challenge hashes its base
-/// ([`crate::crypto::dleq_prove`]): a note, keyset or Base of v2 is refused
-/// by its framing and id, never verified under the other rule.
+/// ([`crate::crypto::dleq_prove`]). v4 is v3 with grants anyone verifies
+/// ([`crate::authorization::Grant`]): a note opened from one carries its
+/// packet's proof ([`Evidence::Granted`]), and its owners sign the grant's
+/// head. A note, keyset or Base of an earlier format is refused by its
+/// framing and id, never verified under the other rule.
 fn format_commitment() -> [u8; 32] {
-    tagged_hash("licash/note-format/v3", &[TAG, DST])
+    tagged_hash("licash/note-format/v4", &[TAG, DST])
 }
 
 /// Separately typed public issuer metadata. Its ID commits the exact note
@@ -393,7 +396,7 @@ impl Note {
         )
     }
 
-    /// `LICASH-NT\x03 ‖ keyset ‖ public fields ‖ C ‖ evidence`, the evidence
+    /// `LICASH-NT\x04 ‖ keyset ‖ public fields ‖ C ‖ evidence`, the evidence
     /// a tag (0 Unlinked, 1 Linked, 2 Granted) and its fields in order.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = NOTE_TAG.to_vec();
@@ -433,17 +436,19 @@ impl Note {
                 bytes.extend(commit.r2.0);
             }
             Evidence::Granted {
-                dleq,
+                seal,
                 blinding,
                 commit,
                 unlock,
+                mask,
             } => {
                 bytes.push(2);
-                put_dleq(&mut bytes, dleq);
+                bytes.extend(seal.to_bytes());
                 bytes.extend(blinding.0);
                 bytes.extend(commit.r1.0);
                 bytes.extend(commit.r2.0);
                 bytes.extend(unlock.0);
+                bytes.extend(mask.0);
             }
         }
         bytes
@@ -513,28 +518,24 @@ impl Note {
         };
         let evidence = match r.byte()? {
             0 => Evidence::Unlinked(dleq(&mut r)?),
-            tag @ (1 | 2) => {
-                let dleq = dleq(&mut r)?;
-                let blinding = ScalarBytes(r.array()?);
-                let commit = DleqCommit {
+            1 => Evidence::Linked {
+                dleq: dleq(&mut r)?,
+                blinding: ScalarBytes(r.array()?),
+                commit: DleqCommit {
                     r1: Point(r.array()?),
                     r2: Point(r.array()?),
-                };
-                if tag == 1 {
-                    Evidence::Linked {
-                        dleq,
-                        blinding,
-                        commit,
-                    }
-                } else {
-                    Evidence::Granted {
-                        dleq,
-                        blinding,
-                        commit,
-                        unlock: ScalarBytes(r.array()?),
-                    }
-                }
-            }
+                },
+            },
+            2 => Evidence::Granted {
+                seal: Seal::from_bytes(&r.array()?),
+                blinding: ScalarBytes(r.array()?),
+                commit: DleqCommit {
+                    r1: Point(r.array()?),
+                    r2: Point(r.array()?),
+                },
+                unlock: ScalarBytes(r.array()?),
+                mask: Point(r.array()?),
+            },
             _ => return Err(bad("unknown note evidence")),
         };
         r.finish()?;
@@ -582,7 +583,7 @@ impl MintResponse {
         &self.proof
     }
 
-    /// `LICASH-IS\x03 ‖ keyset ‖ denomination ‖ B ‖ C' ‖ DLEQ ‖ R1 ‖ R2`.
+    /// `LICASH-IS\x04 ‖ keyset ‖ denomination ‖ B ‖ C' ‖ DLEQ ‖ R1 ‖ R2`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let p = &self.proof;
         let mut bytes = ISSUED_TAG.to_vec();
@@ -1085,15 +1086,18 @@ pub enum Evidence {
         blinding: ScalarBytes,
         commit: DleqCommit,
     },
-    /// Opened from a grant's packet (`crate::authorization::Grant`): the packet's
-    /// DLEQ, under the masked key `K + unlock G`, on `(B_, C_ + unlock B_)`,
-    /// with `B_`'s blinding and the hub's unlink commitment. Linked to the
-    /// grant as `Linked` is to its issuance; `Note::unlink` replaces it.
+    /// Opened from a grant's packet (`crate::authorization::Grant`): the
+    /// packet's proof that it sealed the issuance on `B_` under the grant's
+    /// unlock `t` with the mask base `U` ([`Seal`]), with `B_`'s blinding,
+    /// `t`, `U` and the hub's unlink commitment. It shows `C = kY` to
+    /// anyone, whatever `U` is. Linked to the grant as `Linked` is to its
+    /// issuance; `Note::unlink` replaces it.
     Granted {
-        dleq: Dleq,
+        seal: Seal,
         blinding: ScalarBytes,
         commit: DleqCommit,
         unlock: ScalarBytes,
+        mask: Point,
     },
 }
 
@@ -1105,22 +1109,21 @@ impl Evidence {
                 dleq_verify_unblinded(dleq, key, y, c, &blinding.to_scalar()?)
             }
             Evidence::Granted {
-                dleq,
+                seal,
                 blinding,
+                commit,
                 unlock,
-                ..
-            } => {
-                // `C_enc = (k + t) B_ = (C + tY) + r (K + tG)`: the packet's
-                // DLEQ is an ordinary unblinded DLEQ under the masked key on
-                // the shifted signature, so `C = kY` iff it verifies.
-                let t = unlock.to_scalar()?;
-                let masked = key.add(&crate::ec::gen_mul(&t));
-                let shifted = c.add(&crate::ec::msm(&[(*y, t)]));
-                if masked.is_identity() {
-                    return Err(Error::BadDleq);
-                }
-                dleq_verify_unblinded(dleq, &masked, y, &shifted, &blinding.to_scalar()?)
-            }
+                mask,
+            } => seal_verify_opened(
+                seal,
+                key,
+                y,
+                c,
+                &blinding.to_scalar()?,
+                &*unlock.to_nonzero()?,
+                &Pt::from_point(mask)?,
+                &commit.to_bytes(),
+            ),
         }
     }
 

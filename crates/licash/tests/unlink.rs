@@ -65,12 +65,16 @@ fn received(to: &OwnerKeys, denom: u64) -> Derivation {
 fn assert_unlinked(issuer: &Issuer, linked: &Note, unlinked: &Note) {
     assert_eq!(unlinked.message(), linked.message());
     assert_eq!(unlinked.signature(), linked.signature());
-    let (Evidence::Unlinked(proof), Evidence::Linked { dleq, .. }) =
-        (unlinked.evidence(), linked.evidence())
-    else {
-        panic!("expected unlinked evidence from linked evidence");
+    let Evidence::Unlinked(proof) = unlinked.evidence() else {
+        panic!("expected unlinked evidence");
     };
-    assert_ne!(proof, dleq);
+    // From an issuance's evidence, or a grant's packet's when opened from
+    // one, which has no DLEQ to reuse.
+    match linked.evidence() {
+        Evidence::Linked { dleq, .. } => assert_ne!(proof, dleq),
+        Evidence::Granted { .. } => {}
+        Evidence::Unlinked(_) => panic!("expected linked evidence"),
+    }
     unlinked.verify(&issuer.keyset).unwrap();
     let bytes = unlinked.to_bytes();
     assert_eq!(bytes.len(), UNLINKED_NOTE_BYTES);

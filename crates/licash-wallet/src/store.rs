@@ -18,11 +18,11 @@ use crate::Error;
 
 pub(crate) use licash_store::now;
 
-/// The component the wallet's tables are, and its version. 4 holds notes
-/// of the note format v3 (issuance proofs whose challenge hashes their
-/// base); a file of 3 holds v2 notes, which this version cannot spend.
+/// The component the wallet's tables are, and its version. 5 holds notes
+/// of the note format v4 (grants anyone verifies); a file of 4 holds v3
+/// notes and grants, one of 3 v2 notes, which this version cannot spend.
 const COMPONENT: &str = "wallet";
-const VERSION: i64 = 4;
+const VERSION: i64 = 5;
 
 /// A stage of an operation is a table of its own where its columns are
 /// known together (the terms of a deposit, the claim of a payout, a lock's
