@@ -160,13 +160,23 @@ func peerDirectory(base string) (string, error) {
 	return dir, nil
 }
 
+// openChainDB opens, or creates, the node's database at path, its freelist
+// kept on disk. Without it bbolt rebuilds the freelist on every open by
+// reading the whole file: hundreds of MB once the header index is in, most
+// of a minute on a phone. A file written without one, by an older release,
+// is read whole once more, and bbolt writes it one as it opens it; an
+// older release still opens a file that has one. Each commit writes the
+// freelist whole, a few ms on a store with many free pages.
+func openChainDB(path string) (walletdb.DB, error) {
+	return walletdb.Create("bdb", path, false, time.Minute, false)
+}
+
 // start runs the node, its headers imported from imp first if set, from
 // the peers on.
 func start(cfg Config, imp *neutrino.HeadersImportConfig, log *slog.Logger, began time.Time) (*Node, error) {
-	db, err := walletdb.Create(
-		"bdb", filepath.Join(cfg.DataDir, "neutrino.db"), true,
-		time.Minute, false,
-	)
+	opening := time.Now()
+	db, err := openChainDB(filepath.Join(cfg.DataDir, "neutrino.db"))
+	log.Info("chain database opened", "took", time.Since(opening).Round(time.Millisecond))
 	if err != nil {
 		return nil, fmt.Errorf("opening the chain database: %w", err)
 	}
