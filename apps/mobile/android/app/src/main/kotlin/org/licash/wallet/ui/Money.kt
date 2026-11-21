@@ -37,6 +37,7 @@ import kotlinx.coroutines.launch
 import org.licash.core.Holding
 import org.licash.core.Notes
 import org.licash.wallet.Engine
+import org.licash.wallet.behind
 import org.licash.wallet.Ui
 import org.licash.wallet.explain
 import org.licash.wallet.digits
@@ -284,7 +285,7 @@ private fun OnBitcoin(engine: Engine, ui: Ui, go: (String?) -> Unit) {
         Spacer(Modifier.height(if (offer != null) 8.dp else 20.dp))
         BigButton("Add without protection", Modifier.fillMaxWidth().testTag("move-in"), quiet = true) { warned = true }
     }
-    if (choosing && offer != null) OfferSheet(engine, offer) { choosing = false }
+    if (choosing && offer != null) OfferSheet(engine, offer, !behind(ui)) { choosing = false }
     if (warned) {
         Sheet("Not protected", dismiss = { warned = false; addError = null }, dismissable = !adding) {
             Say(UNPROTECTED_MOVE)

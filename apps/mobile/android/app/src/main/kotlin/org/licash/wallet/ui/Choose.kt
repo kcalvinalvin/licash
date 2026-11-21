@@ -17,6 +17,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -41,7 +42,7 @@ import kotlin.math.roundToLong
  * hub's range.
  */
 @Composable
-internal fun OfferSheet(engine: Engine, q: ContractQuote, dismiss: () -> Unit) {
+internal fun OfferSheet(engine: Engine, q: ContractQuote, ready: Boolean, dismiss: () -> Unit) {
     val range = q.range ?: return
     val fitting = q.coins.filter { fitOf(q, range, q.suggestedBlocks, it) != null }
     if (fitting.isEmpty()) return
@@ -49,6 +50,7 @@ internal fun OfferSheet(engine: Engine, q: ContractQuote, dismiss: () -> Unit) {
         q,
         range,
         fitting,
+        ready,
         open = { chosen, price ->
             dismiss()
             engine.openContract(q.hub, price, chosen)
@@ -72,14 +74,15 @@ internal fun fitOf(q: ContractQuote, range: ContractRange, blocks: UInt, coin: D
         ?: contractFit(range, blocks, coin.value, range.minCap, q.dust, q.denominations, q.fundedNotes)
 
 /**
- * Protection of terms chosen within what its hub allows: for how long, at
- * first as `q` suggests, and paid from which of `coins`, the smallest that a
- * contract takes whole at first. A coin is spent whole: it pays the price,
- * and all the rest of it is her part of the contract, which the hub charges
- * its interest on none of and which joins her balance once its funding
- * confirms. What it covers is the smallest the hub allows that takes the
- * coin, shown beside what she funds and what it costs, itemized, as the hub
- * prices them. Offered unasked, it can be declined.
+ * Protection of terms chosen within what its hub allows: what it covers,
+ * for how long, what it costs (its opening fee and interest) and the
+ * reserve, hers and refundable, apart. How long, which of `coins` pays and
+ * the itemized cost are under More: at first as `q` suggests, paid from the
+ * smallest coin a contract takes whole. A coin is spent whole: it pays the
+ * price, and all the rest of it is her part of the contract, which joins
+ * her balance once its funding confirms. Offered unasked, it can be
+ * declined. Not paid for until the app is caught up with Bitcoin (`ready`),
+ * as opening it needs.
  *
  * With no coin to pay it, she is told to cash out to herself first.
  */
@@ -88,6 +91,7 @@ internal fun ChooseSheet(
     q: ContractQuote,
     range: ContractRange,
     coins: List<DepositCoin>,
+    ready: Boolean,
     open: (Chosen, price: ULong) -> Unit,
     dismiss: () -> Unit,
     decline: (() -> Unit)? = null,
@@ -104,48 +108,13 @@ internal fun ChooseSheet(
     val fit = coin?.let { fitOf(q, range, blocks, it) }
     val capped = fit?.cap ?: range.minCap
     val funded = fit?.funded ?: 0uL
+    // What the hub is paid: its fee and interest, then the reserve, hers.
     val price = contractPrice(range, capped, blocks, funded)
     val fee = contractFee(range, capped, blocks, funded)
+    val cost = fee.cost()
     // It stops protecting a little before it ends.
     val protectsFor = if (blocks > q.afterAssert) blocks - q.afterAssert else 0u
-    Sheet("Protect at ${name(q.hub)}", dismiss) {
-        Line("Covers up to", sat(capped), tag = "quote-cap")
-        Line("For", span(protectsFor.toLong(), LocalBlockSeconds.current), tag = "quote-for")
-        if (range.maxBlocks > range.minBlocks) {
-            Slider(
-                value = blocks.toFloat(),
-                onValueChange = { blocks = blocksAt(it, range.minBlocks, range.maxBlocks) },
-                valueRange = range.minBlocks.toFloat()..range.maxBlocks.toFloat(),
-                modifier = Modifier.testTag("contract-blocks"),
-            )
-        }
-        if (fit != null) {
-            Line("You fund", sat(funded), tag = "contract-funded")
-            Text(
-                "Your coin is spent whole: what it pays beyond the price is yours, and joins your balance once confirmed. The hub charges interest on its own part only.",
-                modifier = Modifier.padding(bottom = 8.dp),
-                style = MaterialTheme.typography.bodySmall,
-                color = colors.onSurfaceVariant,
-            )
-            Line("Hub's opening fee", sat(fee.opening), tag = "contract-opening-fee")
-            Line(
-                "Interest",
-                "${sat(fee.interest)} · ${percent(range.ppmYear.toULong())} a year of ${digits(capped - funded)}",
-                tag = "contract-interest",
-            )
-            if (funded > 0uL && (range.ppmYearFunded > 0u || fee.interestFunded > 0uL)) {
-                Line(
-                    "Interest on yours",
-                    "${sat(fee.interestFunded)} · ${percent(range.ppmYearFunded.toULong())} a year",
-                    tag = "contract-interest-funded",
-                )
-            }
-            Line("Reserve, returned", sat(range.reserve), tag = "contract-reserve")
-            FeeLine(
-                "Cost", price, capped, tag = "quote-price", value = sat(price),
-                breakdown = contractCost(range, capped, price, fee, funded),
-            )
-        }
+    val chips: @Composable () -> Unit = {
         if (coins.size > 1) {
             Text("Paid from", modifier = Modifier.padding(top = 12.dp), style = MaterialTheme.typography.bodyLarge)
             Row(Modifier.horizontalScroll(rememberScrollState())) {
@@ -159,6 +128,23 @@ internal fun ChooseSheet(
                 }
             }
         }
+    }
+    Sheet("Protect at ${name(q.hub)}", dismiss) {
+        Line("Covers up to", sat(capped), tag = "quote-cap")
+        Line("For", span(protectsFor.toLong(), LocalBlockSeconds.current), tag = "quote-for")
+        if (fit != null) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                FeeLine(
+                    "Cost", cost, capped, tag = "quote-price", value = sat(cost),
+                    breakdown = contractCost(range, capped, fee, funded), modifier = Modifier.weight(1f),
+                )
+                Info("Interest", INTEREST_MEANS)
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Line("Reserve, refundable", sat(range.reserve), Modifier.weight(1f), tag = "contract-reserve")
+                Info("Reserve", RESERVE_MEANS)
+            }
+        }
         if (coin == null) {
             Say("Paid from Bitcoin you hold, and you hold none yet. Receive some on Bitcoin, or cash out to yourself, then protect.")
         } else if (fit == null) {
@@ -168,6 +154,42 @@ internal fun ChooseSheet(
                 style = MaterialTheme.typography.bodyMedium,
                 color = colors.error,
             )
+            // To pay with another coin: in sight.
+            chips()
+        }
+        More(modifier = Modifier.testTag("contract-more")) {
+            if (range.maxBlocks > range.minBlocks) {
+                Text("How long", modifier = Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodyLarge)
+                Slider(
+                    value = blocks.toFloat(),
+                    onValueChange = { blocks = blocksAt(it, range.minBlocks, range.maxBlocks) },
+                    valueRange = range.minBlocks.toFloat()..range.maxBlocks.toFloat(),
+                    modifier = Modifier.testTag("contract-blocks"),
+                )
+            }
+            if (fit != null) {
+                chips()
+                Line("Your part", sat(funded), tag = "contract-funded")
+                Text(
+                    YOUR_PART,
+                    modifier = Modifier.padding(bottom = 8.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = colors.onSurfaceVariant,
+                )
+                Line("Opening fee", sat(fee.opening), tag = "contract-opening-fee")
+                Line(
+                    "Interest",
+                    "${sat(fee.interest)} · ${percent(range.ppmYear.toULong())} a year of ${digits(capped - funded)}",
+                    tag = "contract-interest",
+                )
+                if (funded > 0uL && (range.ppmYearFunded > 0u || fee.interestFunded > 0uL)) {
+                    Line(
+                        "Interest on yours",
+                        "${sat(fee.interestFunded)} · ${percent(range.ppmYearFunded.toULong())} a year",
+                        tag = "contract-interest-funded",
+                    )
+                }
+            }
         }
         Line("Takes", "Up to an hour, $download")
         Text(
@@ -181,9 +203,9 @@ internal fun ChooseSheet(
         val c = coin
         if (c != null) {
             BigButton(
-                "Protect for ${sat(price)}",
+                if (ready) "Protect for ${sat(cost)}" else "Waiting for Bitcoin",
                 Modifier.fillMaxWidth().testTag("protect"),
-                enabled = fit != null,
+                enabled = fit != null && ready,
             ) {
                 open(Chosen(capped, blocks, c.outpoint), price)
             }
@@ -198,6 +220,10 @@ internal fun ChooseSheet(
 /** Why a coin pays for no contract: it is spent whole, so it is short of the price or beyond what the largest takes. */
 internal const val NO_FIT = "No contract of this hub takes this coin whole: it is short of the price, " +
     "or beyond what the largest contract takes. Pay with another coin."
+
+/** Her part of the cover, said under it. */
+internal const val YOUR_PART = "Your coin is spent whole: what is left of it after the cost and the reserve " +
+    "is your part of the cover, and joins your balance once confirmed. The hub charges less interest on it, or none."
 
 /** What protection asks of its owner, said before it is paid for. */
 internal const val DUTY = "Open Licash now and then, and before it ends: what it protects " +

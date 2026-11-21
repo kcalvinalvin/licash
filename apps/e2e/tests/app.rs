@@ -950,10 +950,11 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
 /// protecting the notes there, on credit no longer, nothing left on
 /// Bitcoin. Ending it, it is told to cash out instead.
 async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
-    // hub1's reserve and opening fee, and over them 1% a year of the part
-    // of the cover it funds (licash-hub's --contracts-rate by default),
-    // none of hers.
-    const FIXED: u64 = 23_000;
+    // hub1's opening fee, and over it 1% a year of the part of the cover
+    // it funds (licash-hub's --contracts-rate by default), none of hers:
+    // the cost shown. Its reserve, hers, is paid beside it, apart.
+    const OPENING: u64 = 3_000;
+    const RESERVE: u64 = 20_000;
     // Its sizes, 2^n - 1 sat: the least.
     const LEAST: u64 = 131_071;
     // The coin cashed out for it: the price, and a few hundred sat of its
@@ -964,8 +965,8 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     const DUST: u64 = 330;
     /// What a mock contract is worth, said wherever one shows.
     const MOCK: &str = "Test only: protects nothing";
-    let price = |cap: u64, funded: u64, blocks: u32| {
-        FIXED
+    let cost = |cap: u64, funded: u64, blocks: u32| {
+        OPENING
             + licash_api::rate(
                 10_000,
                 u32::try_from(cap - funded).unwrap_or(u32::MAX),
@@ -1053,7 +1054,12 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     for gone in ["contract-cap", "contract-funding", "cash-out-first"] {
         ensure!(!phone.has(gone).await?, "{gone:?} on {coin}");
     }
-    // Its fit over `blocks`, as shown: her part and its price.
+    // Its reserve apart from its cost, hers; how long and her part folded.
+    phone.tagged("contract-reserve", "20,000 sat", 10).await?;
+    ensure!(!phone.has("contract-funded").await?, "her part unfolded");
+    phone.tap_id("contract-more").await?;
+    // Its fit over `blocks`, as shown: her part and its cost, the reserve
+    // paid beside them.
     let fit = |blocks: u32| async move {
         until(
             &format!("the fit of {coin} over {blocks} blocks"),
@@ -1064,9 +1070,10 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
                 let (Some(funded), Some(paid)) = (of("contract-funded"), of("quote-price")) else {
                     return Ok(None);
                 };
+                let spent = funded + paid + RESERVE;
                 let whole = funded > 0
-                    && paid == price(cap, funded, blocks)
-                    && (funded + paid..funded + paid + DUST).contains(&coin);
+                    && paid == cost(cap, funded, blocks)
+                    && (spent..spent + DUST).contains(&coin);
                 Ok(whole.then_some((funded, paid)))
             },
         )
@@ -1074,21 +1081,19 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     };
     let (funded, paid) = fit(1_000).await?;
     eprintln!("{coin} pays {paid} and funds {funded} of {cap}");
-    // Itemized: the hub's fee, its interest by the year on its own part,
-    // her reserve.
+    // Itemized: the hub's fee, its interest by the year on its own part.
     phone
         .tagged("contract-opening-fee", "3,000 sat", 10)
         .await?;
     let interest = phone.by_id("contract-interest", 10).await?.text;
     let of = interest.rsplit("a year of").next().map(amount);
     ensure!(
-        interest.starts_with(&format!("{} sat", paid - FIXED))
+        interest.starts_with(&format!("{} sat", paid - OPENING))
             && interest.contains("1% a year of")
             && of == Some(cap - funded),
         "{interest:?} for its interest on {} of {cap}",
         cap - funded
     );
-    phone.tagged("contract-reserve", "20,000 sat", 10).await?;
     // None on her part, its only coin, nothing to say against it.
     for gone in [
         "contract-interest-funded",
@@ -1110,8 +1115,15 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         fit(1_000).await? == (funded, paid),
         "another fit over 1000 blocks"
     );
+    // Below what was unfolded: scrolled to.
+    let protect = phone.scroll_to_id("protect").await?;
     phone.tagged("worth", MOCK, 10).await?;
-    phone.tap_id("protect").await?;
+    ensure!(
+        amount(&protect.text) == paid,
+        "{:?} for a cost of {paid}",
+        protect.text
+    );
+    phone.tap_view(&protect).await?;
     // Being set up: said at once, then the step it is at.
     until("protection being set up", 30, || async {
         let views = phone.views().await?;

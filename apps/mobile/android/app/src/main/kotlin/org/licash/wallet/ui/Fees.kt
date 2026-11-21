@@ -5,6 +5,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import org.licash.core.ContractFee
 import org.licash.core.ContractRange
 import org.licash.core.InvoiceQuote
@@ -38,30 +39,43 @@ internal fun setupCost(amount: ULong, cost: ULong) = FeeBreakdown(
     title = "Setup cost", totalLabel = "Total cost", amountLabel = "Maximum payout",
 )
 
+/** What protection costs, `fee`: its opening fee and interest, the reserve apart, as it is not spent. */
+internal fun ContractFee.cost(): ULong = opening + interest + interestFunded
+
 /**
- * What protection of `cap` sat chosen within `range` costs, `price`,
- * itemized as its hub prices it: its opening fee, its interest by the year
- * on the part it funds and on the `funded` part hers, and her reserve,
- * returned as it closes. Her part is paid beside it and comes back to her.
+ * What protection of `cap` sat chosen within `range` costs, itemized as its
+ * hub prices it: its opening fee, and its interest by the year on the part
+ * it funds and on the `funded` part hers. Not the reserve, which is hers
+ * and comes back ([RESERVE_MEANS]), nor her part, which joins her balance.
  */
-internal fun contractCost(range: ContractRange, cap: ULong, price: ULong, fee: ContractFee, funded: ULong): FeeBreakdown {
+internal fun contractCost(range: ContractRange, cap: ULong, fee: ContractFee, funded: ULong): FeeBreakdown {
     val hubs = cap - funded.coerceAtMost(cap)
     val parts = listOf(
         "Hub's opening fee" to fee.opening,
         "Interest on the hub's part" to fee.interest,
         "Interest on your part" to fee.interestFunded,
-        "Your reserve" to range.reserve,
     )
     val yours = if (funded == 0uL) "" else
         " and ${percent(range.ppmYearFunded.toULong())} a year on the ${digits(funded)} sat you fund yourself, " +
-            "paid from your coin beside this cost and joining your balance once its funding confirms"
+            "paid from your coin and joining your balance once its funding confirms"
     return FeeBreakdown(
-        cap, price, feeParts(price, parts),
+        cap, fee.cost(), feeParts(fee.cost(), parts),
         explanation = "Interest: ${percent(range.ppmYear.toULong())} a year on the ${digits(hubs)} sat the hub " +
-            "funds$yours. Your reserve returns to you as it closes; a recovery may use it.",
-        title = "Setup cost", totalLabel = "Total cost", amountLabel = "Maximum payout",
+            "funds$yours. Not in this cost: your reserve, which comes back to you.",
+        title = "Cost", totalLabel = "Total cost", amountLabel = "Covers up to",
     )
 }
+
+/** What the hub's interest is for, said behind the (i) of the cost. */
+internal const val INTEREST_MEANS = "To protect your balance at a hub, the hub locks its own bitcoin on " +
+    "Bitcoin beside yours, for as long as the protection lasts: if the hub ever stops, the app claims " +
+    "what you hold there from it. Interest pays the hub for locking it. Part of the cover can be your own " +
+    "coin instead, which costs less and joins your balance once confirmed."
+
+/** What the reserve is, said behind its (i). */
+internal const val RESERVE_MEANS = "The reserve is yours, not a fee. It stays in the contract and pays the " +
+    "Bitcoin fees if you ever recover your money without the hub. Otherwise it comes back to you when " +
+    "the protection ends."
 
 /**
  * A fee's parts by who gets them, as quoted or recorded: those of 0 left
@@ -125,9 +139,10 @@ internal fun FeeLine(
     tag: String = "fee",
     value: String = if (fee == 0uL) "None" else sat(fee),
     breakdown: FeeBreakdown = FeeBreakdown(amount, fee),
+    modifier: Modifier = Modifier,
 ) {
     var showing by remember { mutableStateOf(false) }
-    Line(label, value, tag = tag, share = share(fee, amount), onClick = { showing = true })
+    Line(label, value, modifier, tag = tag, share = share(fee, amount), onClick = { showing = true })
     if (showing) FeeSheet(breakdown) { showing = false }
 }
 

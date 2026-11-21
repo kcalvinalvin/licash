@@ -3,6 +3,7 @@ package org.licash.wallet.ui
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
+import org.licash.core.ContractRange
 import org.licash.core.ContractTerms
 import org.licash.core.Fees
 import org.licash.core.FeesRaised
@@ -20,6 +21,13 @@ class HubsTest {
         assertEquals("Fee 1 sat", optimizationCost(1uL, State.PENDING))
         assertEquals("Free", optimizationCost(0uL, State.DONE))
         assertEquals("Not charged", optimizationCost(1uL, State.FAILED))
+    }
+
+    @Test
+    fun protection_interest_is_said_short_and_on_hers_only_if_charged() {
+        val range = ContractRange(131_071uL, 16_777_215uL, 432u, 52_560u, 2u, 20_000uL, 3_000uL, 10_000u, 0u, 52_560u)
+        assertEquals("1% a year", interestOf(range))
+        assertEquals("1% a year, 0.5% on yours", interestOf(range.copy(ppmYearFunded = 5_000u)))
     }
 
     private fun found(silent: UInt, onion: UInt) = HubsFound(hubs = emptyList(), silent = silent, silentOnion = onion)

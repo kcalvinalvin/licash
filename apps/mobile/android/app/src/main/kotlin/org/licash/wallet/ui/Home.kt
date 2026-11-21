@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.sp
 import org.licash.core.Activity
 import org.licash.core.Holding
 import org.licash.wallet.Engine
+import org.licash.wallet.behind
 import org.licash.wallet.Ui
 import org.licash.wallet.digits
 import org.licash.wallet.sat
@@ -249,7 +250,7 @@ private fun Offer(engine: Engine, ui: Ui) {
         tag = "offer",
         onClick = { choosing = true },
     )
-    if (choosing) OfferSheet(engine, q) { choosing = false }
+    if (choosing) OfferSheet(engine, q, !behind(ui)) { choosing = false }
 }
 
 /**

@@ -28,6 +28,7 @@ import org.licash.core.ContractState
 import org.licash.core.Holding
 import org.licash.core.Notes
 import org.licash.wallet.Engine
+import org.licash.wallet.behind
 import org.licash.wallet.Ui
 import org.licash.wallet.carriedOn
 import org.licash.wallet.digits
@@ -205,6 +206,7 @@ internal fun HubPage(
                 q,
                 range,
                 q.coins,
+                !behind(ui),
                 open = { chosen, price ->
                     quote = null
                     engine.openContract(q.hub, price, chosen)

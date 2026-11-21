@@ -321,8 +321,12 @@ the hub's `--contracts-per-coin` times the coin paying), her part, and why none
 does, a coin short of the price or beyond what the hub's largest contract
 takes; a slider chooses how long it lasts (at first half a year). With no coin
 on Bitcoin, the sheet says to cash out to the wallet first. Priced live as the
-hub prices it, itemized (the hub's opening fee, its yearly interest on each
-part, her reserve). Opening downloads about 100 MB and takes minutes to an hour,
+hub prices it: its cost (the hub's opening fee and its yearly interest on each
+part, itemized on a tap) apart from her reserve, "refundable", each with an
+(i) saying what it is; how long, the coin and her part are under More. Its
+button says "Waiting for Bitcoin" until the app is caught up, as opening
+needs. A hub's "Fees and limits" lists its opening fee, interest, reserve,
+covers and length a short row each. Opening downloads about 100 MB and takes minutes to an hour,
 in the background, one at a time, the step it is at shown; several
 contracts at a hub, and at several hubs, add up. Each says what it covers
 now of the hub's notes once unfolded: what its recovery would claim of them

@@ -63,6 +63,7 @@ import org.licash.core.PayoutQuote
 import org.licash.core.Scanned
 import org.licash.core.State
 import org.licash.wallet.Engine
+import org.licash.wallet.behind
 import org.licash.wallet.Ui
 import org.licash.wallet.explain
 import org.licash.wallet.feeOf
@@ -146,7 +147,7 @@ fun Send(
     var protecting by remember { mutableStateOf(false) }
     val offer = ui.offer?.takeIf { ui.opening == null }
     if (protecting && offer != null) {
-        OfferSheet(engine, offer) {
+        OfferSheet(engine, offer, !behind(ui)) {
             protecting = false
             back()
         }

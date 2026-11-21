@@ -53,25 +53,27 @@ class FeesTest {
     }
 
     @Test
-    fun a_contract_costs_its_opening_fee_the_interest_on_each_part_and_a_reserve() {
+    fun a_contract_costs_its_opening_fee_and_the_interest_on_each_part_and_not_its_reserve() {
         val range = ContractRange(131_071uL, 16_777_215uL, 432u, 52_560u, 2u, 20_000uL, 3_000uL, 10_000u, 5_000u, 52_560u)
         val fee = ContractFee(opening = 3_000uL, interest = 41_943uL, interestFunded = 20_971uL)
-        val cost = contractCost(range, 16_777_215uL, 85_914uL, fee, 8_388_607uL)
+        val cost = contractCost(range, 16_777_215uL, fee, 8_388_607uL)
+        assertEquals(65_914uL, cost.fee)
         assertEquals(
             listOf(
                 "Hub's opening fee" to 3_000uL,
                 "Interest on the hub's part" to 41_943uL,
                 "Interest on your part" to 20_971uL,
-                "Your reserve" to 20_000uL,
             ),
             cost.components,
         )
         assertTrue(cost.explanation, cost.explanation.contains("1% a year on the 8,388,608 sat the hub funds"))
         assertTrue(cost.explanation, cost.explanation.contains("0.5% a year on the 8,388,607 sat you fund yourself"))
+        assertTrue(cost.explanation, cost.explanation.contains("your reserve, which comes back to you"))
         assertEquals("Total cost", cost.totalLabel)
         // None of hers: no interest on her part, and her rate unsaid.
-        val alone = contractCost(range, 131_071uL, 23_655uL, ContractFee(3_000uL, 655uL, 0uL), 0uL)
-        assertEquals(listOf("Hub's opening fee", "Interest on the hub's part", "Your reserve"), alone.components.map { it.first })
+        val alone = contractCost(range, 131_071uL, ContractFee(3_000uL, 655uL, 0uL), 0uL)
+        assertEquals(3_655uL, alone.fee)
+        assertEquals(listOf("Hub's opening fee", "Interest on the hub's part"), alone.components.map { it.first })
         assertTrue(!alone.explanation.contains("you fund"))
     }
 

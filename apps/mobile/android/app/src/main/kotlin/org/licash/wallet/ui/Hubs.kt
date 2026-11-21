@@ -27,6 +27,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import org.licash.core.ContractRange
 import org.licash.core.FeesRaised
 import org.licash.core.FoundHub
 import org.licash.core.Hub
@@ -144,22 +145,15 @@ internal fun HubFees(
                 // else its one fixed contract.
                 val range = it.range
                 if (range != null) {
-                    Entry(
-                        "Price",
-                        value = "${sat(range.reserve + range.fee)} + ${percent(range.ppmYear.toULong())} a year",
-                        sub = "${sat(range.fee)} opening fee and ${sat(range.reserve)} reserve, returned; " +
-                            "interest on the part the hub funds" +
-                            if (range.ppmYearFunded == 0u) ", none on yours" else
-                                ", ${percent(range.ppmYearFunded.toULong())} a year on yours",
-                        tag = "protection-price",
-                    )
+                    // A row each, short enough not to be cut: the (i) on the
+                    // protect sheet says what interest and the reserve are.
+                    Entry("Opening fee", value = sat(range.fee), tag = "protection-price")
                     Divider()
-                    Entry(
-                        "Covers",
-                        value = between(range.minCap, range.maxCap),
-                        sub = "In sizes doubling from the least, up to ${range.perCoin} times the coin paying for it",
-                        tag = "protection-cap",
-                    )
+                    Entry("Interest", value = interestOf(range), tag = "protection-interest")
+                    Divider()
+                    Entry("Reserve, refundable", value = sat(range.reserve), tag = "protection-reserve")
+                    Divider()
+                    Entry("Covers", value = between(range.minCap, range.maxCap), tag = "protection-cap")
                     Divider()
                     Entry(
                         "For",
@@ -230,6 +224,11 @@ internal fun OptimizeNotes(engine: Engine, hub: Hub, dismiss: () -> Unit) {
         TextButton(onClick = dismiss, enabled = !busy) { Text("Done") }
     }
 }
+
+/** A hub's interest by the year, on its own part of the cover, then on hers if it charges any. */
+internal fun interestOf(range: ContractRange): String =
+    "${percent(range.ppmYear.toULong())} a year" +
+        if (range.ppmYearFunded == 0u) "" else ", ${percent(range.ppmYearFunded.toULong())} on yours"
 
 /** From `min` to `max`, in sat: a range a hub takes. */
 private fun between(min: ULong, max: ULong): String = "${digits(min)} to ${sat(max)}"
