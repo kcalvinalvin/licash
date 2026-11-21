@@ -165,7 +165,7 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
                             history = { screen = Screen.History },
                             open = { screen = Screen.Details(it, Screen.Home) },
                         )
-                        Screen.History -> History(ui, open = { screen = Screen.Details(it) }) { screen = Screen.Home }
+                        Screen.History -> History(engine, ui, open = { screen = Screen.Details(it) }) { screen = Screen.Home }
                         Screen.Receive -> Receive(engine) { screen = Screen.Home }
                         is Screen.Send -> Send(engine, ui, s.link, s.cashOut, s.own, s.amount) { screen = s.from }
                         Screen.Settings -> Settings(engine, ui, balance = { screen = Screen.Money(Screen.Settings) }) {

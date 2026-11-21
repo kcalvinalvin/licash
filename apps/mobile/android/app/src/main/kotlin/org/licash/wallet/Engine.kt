@@ -389,6 +389,22 @@ class Engine(context: Context) {
         wake.trySend(Unit)
     }
 
+    /**
+     * Look for payments now, as the owner asks by pulling down: those the
+     * hubs keep and the mailbox's at once, as a round does; the chain and
+     * the rest on a round started now.
+     */
+    suspend fun lookNow() = withContext(Dispatchers.IO) {
+        poke()
+        val hubs = wallet?.let { runCatching { local { w -> w.hubs() } }.getOrNull() } ?: return@withContext
+        if (hubs.none { it.mailbox }) return@withContext
+        try {
+            if (collect()) refresh()
+        } catch (e: LicashException) {
+            AppLog.warn("the mailbox, looked in as asked", e)
+        }
+    }
+
     /** Open the wallet and show it, then start the light client. */
     private suspend fun load() {
         mutex.withLock {

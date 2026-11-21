@@ -105,34 +105,37 @@ fun Home(
             Spacer(Modifier.weight(1f))
             IconButton(onClick = settings) { Icon(Icons.Default.Settings, contentDescription = "Settings") }
         }
-        // In the middle of what is left, scrolling on short screens and with large fonts.
-        Column(
-            Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
-        ) {
-            // Nothing works without a hub: choosing one comes first.
-            if (ui.hubs.isEmpty()) {
-                ChooseHub(engine, ui)
-            } else {
-                Total(ui) { money(null) }
-                Going(engine, ui, money, history, open)
-                Offer(engine, ui)
-                Unprotected(engine, ui, money)
-                // A new wallet's first catching up: each step, as it goes.
-                if (ui.history.isEmpty() && catchingUp(ui)) {
-                    Spacer(Modifier.height(16.dp))
-                    Column(
-                        Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
-                            .background(MaterialTheme.colorScheme.surfaceContainer).padding(horizontal = 16.dp, vertical = 8.dp),
-                    ) {
-                        SyncStages(engine, ui)
-                        Text(
-                            "You can leave the app: it keeps catching up, its progress in a notification.",
-                            modifier = Modifier.padding(bottom = 8.dp),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+        // In the middle of what is left, scrolling on short screens and with
+        // large fonts; pulled down, it looks for payments now.
+        PullToLook(engine, Modifier.fillMaxWidth().weight(1f)) {
+            Column(
+                Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                // Nothing works without a hub: choosing one comes first.
+                if (ui.hubs.isEmpty()) {
+                    ChooseHub(engine, ui)
+                } else {
+                    Total(ui) { money(null) }
+                    Going(engine, ui, money, history, open)
+                    Offer(engine, ui)
+                    Unprotected(engine, ui, money)
+                    // A new wallet's first catching up: each step, as it goes.
+                    if (ui.history.isEmpty() && catchingUp(ui)) {
+                        Spacer(Modifier.height(16.dp))
+                        Column(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
+                                .background(MaterialTheme.colorScheme.surfaceContainer).padding(horizontal = 16.dp, vertical = 8.dp),
+                        ) {
+                            SyncStages(engine, ui)
+                            Text(
+                                "You can leave the app: it keeps catching up, its progress in a notification.",
+                                modifier = Modifier.padding(bottom = 8.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
                 }
             }

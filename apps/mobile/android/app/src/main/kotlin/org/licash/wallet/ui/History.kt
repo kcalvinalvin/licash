@@ -28,6 +28,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import org.licash.core.Activity
+import org.licash.wallet.Engine
 import org.licash.core.Kind
 import org.licash.core.State
 import org.licash.wallet.Ui
@@ -37,27 +38,30 @@ import org.licash.wallet.sat
 /**
  * Activity: what came in and went out, the newest first, what is on its
  * way before it. A line says what, when and how much; a tap, the rest.
+ * Pulled down, it looks for payments now.
  */
 @Composable
-fun History(ui: Ui, open: (Activity) -> Unit, back: () -> Unit) {
+fun History(engine: Engine, ui: Ui, open: (Activity) -> Unit, back: () -> Unit) {
     val now = System.currentTimeMillis() / 1000
-    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 20.dp).testTag("history")) {
-        item(key = "top") { TopBar("Activity", back) }
-        if (ui.history.isEmpty() && ui.incoming.isEmpty()) {
-            item(key = "none") {
-                Text(
-                    "Nothing yet",
-                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 24.dp),
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+    PullToLook(engine, Modifier.fillMaxSize()) {
+        LazyColumn(Modifier.fillMaxSize().padding(horizontal = 20.dp).testTag("history")) {
+            item(key = "top") { TopBar("Activity", back) }
+            if (ui.history.isEmpty() && ui.incoming.isEmpty()) {
+                item(key = "none") {
+                    Text(
+                        "Nothing yet",
+                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 24.dp),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
-        }
-        items(ui.incoming, key = { "coming " + it.id }) { activity ->
-            ActivityRow(activity, now, coming = true) { open(activity) }
-        }
-        items(ui.history, key = { it.key }) { activity ->
-            ActivityRow(activity, now) { open(activity) }
+            items(ui.incoming, key = { "coming " + it.id }) { activity ->
+                ActivityRow(activity, now, coming = true) { open(activity) }
+            }
+            items(ui.history, key = { it.key }) { activity ->
+                ActivityRow(activity, now) { open(activity) }
+            }
         }
     }
 }
