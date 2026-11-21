@@ -40,6 +40,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -784,6 +787,9 @@ private fun Sent(s: Step.Sent, back: () -> Unit) {
         Done("Sent ${sat(s.amount)}", back)
         return
     }
+    // Its own layout, not an outcome's: felt the same, once.
+    val feel = rememberFeel()
+    LaunchedEffect(Unit) { feel.confirm() }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(32.dp))
         Text("Sent ${sat(s.amount)}", style = MaterialTheme.typography.headlineSmall)
@@ -829,6 +835,15 @@ private fun Outcome(
         Tone.ASK -> colors.onSurfaceVariant
         else -> colors.primary
     }
+    // Felt once, as it shows: done, or failed. A wait or a question is not.
+    val feel = rememberFeel()
+    LaunchedEffect(tone) {
+        when (tone) {
+            Tone.DONE -> feel.confirm()
+            Tone.FAILED -> feel.reject()
+            else -> {}
+        }
+    }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(72.dp))
         Box(
@@ -845,7 +860,9 @@ private fun Outcome(
         Spacer(Modifier.height(24.dp))
         Text(
             title,
-            modifier = titleTag?.let { Modifier.testTag(it) } ?: Modifier,
+            // Said by a screen reader as it shows.
+            modifier = (titleTag?.let { Modifier.testTag(it) } ?: Modifier)
+                .semantics { liveRegion = LiveRegionMode.Polite },
             style = MaterialTheme.typography.headlineSmall,
             textAlign = TextAlign.Center,
         )
