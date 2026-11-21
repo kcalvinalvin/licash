@@ -85,11 +85,14 @@ const (
 	importFailures = 8
 )
 
-// importEntries is how many headers each of block-dn's files holds, of
-// block or of filter headers, and importQuiet as above: variables for
+// ImportEntries is how many headers each of block-dn's files holds, of
+// block or of filter headers, the first at a multiple of it.
+const ImportEntries = 100_000
+
+// importEntries is ImportEntries and importQuiet as above: variables for
 // tests.
 var (
-	importEntries uint32 = 100_000
+	importEntries uint32 = ImportEntries
 	importQuiet          = 2 * time.Minute
 )
 
