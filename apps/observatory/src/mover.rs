@@ -11,7 +11,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -44,6 +44,53 @@ fn patience(kind: Kind) -> Duration {
         Kind::Swap => Duration::from_secs(15 * 60),
         Kind::Lightning => Duration::from_secs(5 * 60),
         Kind::Chain => Duration::from_secs(6 * 3600),
+    }
+}
+
+/// How far a move has come, as `carry` tells `make`.
+#[derive(Default)]
+struct Progress {
+    /// A payout was made: its value may be on its way out of the wallet.
+    paid: AtomicBool,
+    /// How long the swap took, in ms plus one, once it was done: 0 until.
+    swapped: AtomicU64,
+    /// The provider's coin was seen, timed or not.
+    coin_seen: AtomicBool,
+}
+
+impl Progress {
+    fn paid(&self) -> bool {
+        self.paid.load(Ordering::Relaxed)
+    }
+
+    fn set_paid(&self) {
+        self.paid.store(true, Ordering::Relaxed);
+    }
+
+    fn swapped(&self) -> Option<u64> {
+        self.swapped.load(Ordering::Relaxed).checked_sub(1)
+    }
+
+    fn coin_seen(&self) -> bool {
+        self.coin_seen.load(Ordering::Relaxed)
+    }
+
+    /// The provider's coin was seen: its swap took `took` if the coin was
+    /// still unconfirmed. One first seen in a block (the polls failed until
+    /// then) says nothing of the swap, only of the wait for the block, so
+    /// it is not timed.
+    fn see_coin(&self, took: Duration, confirmed: bool) {
+        if self.coin_seen.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        if !confirmed {
+            self.swap_done(took);
+        }
+    }
+
+    fn swap_done(&self, took: Duration) {
+        let ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX - 1);
+        self.swapped.store(ms + 1, Ordering::Relaxed);
     }
 }
 
@@ -598,13 +645,14 @@ impl<T: Transport + 'static> Mover<T> {
             cost: None,
             outcome: Outcome::Running,
             detail: None,
+            swapped: None,
         };
         let id = match self.moving.store.action_started(&action) {
             Ok(id) => id,
             Err(e) => return tracing::warn!("recording a move: {e:#}"),
         };
-        let paid = AtomicBool::new(false);
-        let made = within(patience(plan.kind), self.carry(&plan, &paid)).await;
+        let progress = Progress::default();
+        let made = within(patience(plan.kind), self.carry(&plan, &progress)).await;
         let ended = store::now();
         // Its change unlinked, as any wallet does after a payment: part of
         // what it costs.
@@ -624,7 +672,7 @@ impl<T: Transport + 'static> Mover<T> {
         let cost = match (settled, &made) {
             // Its value may be on its way on Bitcoin still, out of the
             // wallet's sight: the quote, for want of better.
-            (_, Err(_)) if paid.load(Ordering::Relaxed) => Some(plan.quoted),
+            (_, Err(_)) if progress.paid() => Some(plan.quoted),
             (true, _) => measured,
             (false, _) => Some(measured.unwrap_or(0).max(plan.quoted)),
         };
@@ -640,16 +688,16 @@ impl<T: Transport + 'static> Mover<T> {
             "moved: {}",
             detail.unwrap_or("done")
         );
-        if let Err(e) = self
-            .moving
-            .store
-            .action_ended(id, ended, outcome, cost, detail)
+        if let Err(e) =
+            self.moving
+                .store
+                .action_ended(id, ended, outcome, cost, detail, progress.swapped())
         {
             tracing::warn!("recording a move: {e:#}");
         }
     }
 
-    async fn carry(&self, plan: &Plan, paid: &AtomicBool) -> Result<(), String> {
+    async fn carry(&self, plan: &Plan, progress: &Progress) -> Result<(), String> {
         let wallet = &self.wallet;
         let (from, to) = (self.url(&plan.source), self.url(&plan.target));
         match plan.kind {
@@ -687,7 +735,7 @@ impl<T: Transport + 'static> Mover<T> {
                 }
             }
             Kind::Lightning => self.carry_lightning(plan, from, to).await,
-            Kind::Chain => self.carry_chain(plan, (from, to), paid).await,
+            Kind::Chain => self.carry_chain(plan, (from, to), progress).await,
         }
     }
 
@@ -824,13 +872,16 @@ impl<T: Transport + 'static> Mover<T> {
         })
     }
 
-    /// The payout, then the deposit it pays: `paid` set once the payout is
-    /// made, its value then on its way out of the wallet's sight.
+    /// The payout, then the deposit it pays: `progress` told once the payout
+    /// is made, its value then on its way out of the wallet's sight, and how
+    /// long the swap took, from asking the provider to its coin being on
+    /// the network: what follows, blocks and the hub's claim, is waiting for
+    /// the chain.
     async fn carry_chain(
         &self,
         plan: &Plan,
         (from, to): (&str, &str),
-        paid: &AtomicBool,
+        progress: &Progress,
     ) -> Result<(), String> {
         let wallet = &self.wallet;
         let chain = self.moving.chain.as_ref().ok_or("no chain")?;
@@ -853,11 +904,12 @@ impl<T: Transport + 'static> Mover<T> {
         };
         // Within what was planned, but for the deposit's fee.
         let max_fee = plan.quoted - (terms.pays - plan.amount);
+        let swap_began = tokio::time::Instant::now();
         let quote = wallet
             .payout_quote(&provider, from, &terms.address, terms.pays, max_fee, rate)
             .await
             .map_err(said)?;
-        paid.store(true, Ordering::Relaxed);
+        progress.set_paid();
         let mut payout = wallet.payout(&quote).await.map_err(said)?;
         loop {
             if let PayoutState::Failed(why) = &payout.state {
@@ -869,7 +921,13 @@ impl<T: Transport + 'static> Mover<T> {
                 DepositState::Refunded(_) => return Err("the deposit was refunded".into()),
                 _ => {}
             }
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            // Closely until the provider's coin is out, so that the swap is
+            // timed to the second; then as the chain moves.
+            let wait = match progress.coin_seen() {
+                false => Duration::from_secs(2),
+                true => Duration::from_secs(10),
+            };
+            tokio::time::sleep(wait).await;
             if !matches!(payout.state, PayoutState::Done) {
                 match wallet.follow_payout(&payout.hash, &Blocks(chain)).await {
                     Ok(followed) => payout = followed,
@@ -877,6 +935,12 @@ impl<T: Transport + 'static> Mover<T> {
                     Err(e) => tracing::debug!("following a payout: {e}"),
                 }
                 broadcast_claims(wallet, chain).await;
+                if let Ok(seen) = wallet.payout_progress(&payout.hash) {
+                    if seen.coin.is_some() {
+                        let confirmed = seen.coin_height.is_some();
+                        progress.see_coin(swap_began.elapsed(), confirmed);
+                    }
+                }
             }
             if let Ok(followed) = wallet.follow_deposit(&deposit.hash).await {
                 deposit = followed;
@@ -988,5 +1052,30 @@ mod tests {
         let budget = Skipped::Unaffordable(100).retry();
         assert!(route < budget);
         assert!(route >= Duration::from_secs(60), "not a busy loop");
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn a_swap_is_timed_by_its_coin_seen_unconfirmed_and_only_once() {
+        let progress = Progress::default();
+        assert_eq!(progress.swapped(), None);
+        progress.see_coin(Duration::from_millis(38_000), false);
+        progress.see_coin(Duration::from_millis(90_000), false);
+        assert_eq!(progress.swapped(), Some(38_000), "the first sight");
+        assert!(progress.coin_seen());
+    }
+
+    #[test]
+    fn a_coin_first_seen_in_a_block_leaves_the_swap_untimed() {
+        let progress = Progress::default();
+        progress.see_coin(Duration::from_millis(95_000), true);
+        assert!(progress.coin_seen(), "the polls relax");
+        assert_eq!(progress.swapped(), None, "a block wait is not the swap");
+        progress.see_coin(Duration::from_millis(100_000), false);
+        assert_eq!(progress.swapped(), None, "nor is a later sight");
     }
 }

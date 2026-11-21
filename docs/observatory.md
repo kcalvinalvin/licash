@@ -50,11 +50,14 @@ services see the observatory's address.
 
 ## What the page shows
 
-- **Overview**: services up, median latencies, leaderboards (uptime, round
-  trip, success of measured moves) and the fees of each kind of payment on
-  10,000 sat, at their cheapest and median.
-- **Hubs** and **Swap providers**: each service's state, uptime, round
-  trip and terms. *Into it* is what providers can move into a hub now, in
+- **Overview**: a banner saying how many services answer, services up,
+  median latencies, where the time goes (Tor's setup, the round trip, the
+  service's work, in one bar), leaderboards (uptime, round trip, success of
+  measured moves) with a bar for each, and the fees of each kind of
+  payment on 10,000 sat, at their cheapest and median.
+- **Hubs** and **Swap providers**: each service's state, a strip of its
+  probes over the range (green all answered, amber some, red none), uptime,
+  round trip and terms. *Into it* is what providers can move into a hub now, in
   all, which is the liquidity they offer it.
 - **A service's page**: its URLs, a latency chart, its terms in full
   (Licash, Lightning, Bitcoin, protection and its interest), how far its
@@ -84,6 +87,13 @@ take, and what they cost.
 | Between hubs | swaps through a provider from one hub to another | 30% | 30 minutes |
 | Over Lightning | pays another hub's invoice, from a hub's gateway or through a provider | 30% | 30 minutes |
 | On Bitcoin | pays out of a hub through a provider to a hub's deposit address, then claims the deposit | 30% | 24 hours |
+
+A move on Bitcoin is timed by its swap: from asking the provider to the
+moment its coin is on the network. The blocks waited for after that, and the
+hub's claim of the deposit, are not counted in its time, only in what it
+costs; the page shows the swap's time and the whole apart. A move made
+before this was timed, or that failed before the provider's coin, shows no
+time.
 
 Each move moves `--amount` sat (2,000 by default), and a move on Bitcoin
 at least the smallest deposit its hub takes (often 10,000 sat). Moves on
@@ -139,7 +149,9 @@ show.
 
 `<data>/<network>/observatory.sqlite` holds the services, probes,
 terms and moves. Its schema is versioned; an observatory refuses records
-written by a later version rather than misreading them.
+written by a later version rather than misreading them. A column added
+later (as the swap's time of a move on Bitcoin) is nullable and added when
+a file is opened, so an older image still opens the file after a rollback.
 
 ## Docker
 

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde::Serialize;
 
 use crate::{
-    budget::Budget,
+    budget::{self, Budget},
     store::{Action, Outcome, Probe, Role, Service, Store},
     terms::{self, HubTerms, ProviderTerms},
 };
@@ -217,7 +217,8 @@ pub struct FeeRow {
 pub struct KindStats {
     pub kind: String,
     pub rate: Rate,
-    /// Median of those that succeeded, in ms.
+    /// Median of those that succeeded, in ms: of a move on Bitcoin, its
+    /// swap, not the waits for blocks.
     pub duration: Option<u64>,
     /// Median cost of those that succeeded, in sat.
     pub cost: Option<u64>,
@@ -422,9 +423,14 @@ fn health(service: &Service, probes: &[&Probe], actions: &[&Action], cx: &Contex
     }
 }
 
+/// The probes of a service as buckets over the range, or over what there
+/// is of it: from its first probe, if later, but at least a forty-eighth of the
+/// range, so that a new service's chart is not all empty cells.
 fn chart(probes: &[&Probe], now: i64, range: Range) -> Vec<Bucket> {
-    let width = range.millis() / BUCKETS;
-    let start = now - range.millis();
+    let first = probes.iter().map(|p| p.at).min().unwrap_or(now);
+    let span = (now - first).clamp(range.millis() / 48, range.millis());
+    let width = (span / BUCKETS).max(1);
+    let start = now - width * BUCKETS;
     let mut buckets: Vec<(u32, u32, Vec<u32>)> = vec![(0, 0, Vec::new()); BUCKETS as usize];
     for probe in probes {
         let i = ((probe.at - start) / width).clamp(0, BUCKETS - 1) as usize;
@@ -608,10 +614,8 @@ fn moves(actions: &[&Action]) -> Vec<KindStats> {
                 .copied()
                 .filter(|a| a.outcome == Outcome::Done)
                 .collect();
-            let mut durations: Vec<u64> = done
-                .iter()
-                .filter_map(|a| u64::try_from(a.ended? - a.started).ok())
-                .collect();
+            // The swap's time, not the waits for blocks of a move on Bitcoin.
+            let mut durations: Vec<u64> = done.iter().filter_map(|a| budget::took(a)).collect();
             let mut costs: Vec<u64> = done.iter().filter_map(|a| a.cost).collect();
             KindStats {
                 kind: kind.to_owned(),

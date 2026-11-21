@@ -111,6 +111,15 @@ async fn the_observatory_moves_its_balance_between_hubs_and_records_each_move() 
         );
         assert!(cost < AMOUNT, "{kind:?} cost {cost}");
         assert!(made.ended.unwrap() >= made.started);
+        // A move on Bitcoin is timed by its swap, the provider's coin out,
+        // not by the blocks waited for after it.
+        if kind == Kind::Chain {
+            let swapped = made.swapped.expect("its swap timed");
+            let all = u64::try_from(made.ended.unwrap() - made.started)?;
+            assert!(swapped < all, "swap {swapped} ms of {all} ms in all");
+        } else {
+            assert_eq!(made.swapped, None, "{kind:?} is timed by all of it");
+        }
     }
     let actions = store.actions_since(0)?;
     let swap = actions.iter().find(|a| a.kind == Kind::Swap.key()).unwrap();

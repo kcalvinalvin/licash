@@ -25,10 +25,11 @@ use axum::{
 use serde::Deserialize;
 
 use crate::{
-    budget::{Budget, Kind},
+    budget::{self, Budget, Kind},
     format::{self, esc},
     store::{Action, Outcome, Role, Store},
-    view::{self, Entry, Health, HubView, ProviderView, Range, Records, View},
+    view::{self, Entry, Health, HubView, Latency, ProviderView, Range, Records, View},
+    viz::{self, Part},
 };
 
 /// How long a computed view is shown before it is computed again.
@@ -371,6 +372,9 @@ fn shell(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta http-equiv=\"refresh\" content=\"120\">\
+         <meta name=\"color-scheme\" content=\"light dark\">\
+         <meta name=\"description\" content=\"Uptime, latency, fees and measured moves of Licash hubs and swap providers\">\
+         <link rel=\"icon\" href=\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%231f8a4c' stroke-width='4'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%231f8a4c'/%3E%3C/svg%3E\">\
          <title>{title} · Licash observatory</title><style>{STYLE}</style></head><body>\
          <header><div class=\"bar\"><a class=\"brand\" href=\"/\">licash <span>observatory</span></a>\
          <span class=\"badges\">{badges}</span>{test}</div>\
@@ -443,16 +447,24 @@ fn overview_body(view: &View) -> String {
         .moves
         .iter()
         .fold((0, 0), |(d, t), k| (d + k.rate.done, t + k.rate.total));
+    out.push_str(&banner(view, hubs_up + providers_up, hubs + providers));
     out.push_str("<section class=\"cards\">");
+    let states = |healths: Vec<&Health>| healths.iter().map(|h| h.up).collect::<Vec<_>>();
     out.push_str(&card(
         "Hubs up",
         &format!("{hubs_up} of {hubs}"),
-        "answering now",
+        &format!(
+            "{} answering now",
+            viz::dots(&states(view.hubs.iter().map(|h| &h.health).collect()))
+        ),
     ));
     out.push_str(&card(
         "Providers up",
         &format!("{providers_up} of {providers}"),
-        "answering now",
+        &format!(
+            "{} answering now",
+            viz::dots(&states(view.providers.iter().map(|p| &p.health).collect()))
+        ),
     ));
     let opening = if view.tor {
         format!("opening a connection over Tor: {}", ms(view.latency.open))
@@ -480,17 +492,62 @@ fn overview_body(view: &View) -> String {
     }
     out.push_str("</section>");
 
+    out.push_str(&time_split(view));
+
     out.push_str("<section><h2>Leaderboards</h2><div class=\"boards\">");
-    out.push_str(&board(view, "Uptime", &view.boards.uptime, |v| {
-        format::uptime(v)
-    }));
-    out.push_str(&board(view, "Round trip", &view.boards.latency, |v| {
-        format::millis(v as u64)
-    }));
-    out.push_str(&board(view, "Moves succeeded", &view.boards.success, |v| {
-        format::percent(v)
-    }));
-    out.push_str("</div></section>");
+    out.push_str(&board(
+        view,
+        "Uptime",
+        &view.boards.uptime,
+        format::uptime,
+        |e| viz::bar(share_class(e.value), e.value, &format::uptime(e.value)),
+    ));
+    let slowest = view
+        .boards
+        .latency
+        .iter()
+        .map(|e| e.value)
+        .fold(1.0_f64, f64::max);
+    out.push_str(&board(
+        view,
+        "Round trip",
+        &view.boards.latency,
+        |v| format::millis(v as u64),
+        |e| {
+            let setup = health_of(view, &e.id).and_then(|h| h.latency.open);
+            let mut parts = vec![Part {
+                class: "ok",
+                share: e.value / slowest,
+                title: format!("Round trip {}", format::millis(e.value as u64)),
+            }];
+            // Opening the connection, mostly Tor's, in its own thin bar.
+            let setup = setup.map(|open| {
+                viz::bar(
+                    "tor",
+                    f64::from(open) / (slowest * 6.0).max(1.0),
+                    &format!("Opening the connection {}", format::millis(u64::from(open))),
+                )
+            });
+            parts.retain(|p| p.share > 0.0);
+            format!("{}{}", viz::meter(&parts), setup.unwrap_or_default())
+        },
+    ));
+    out.push_str(&board(
+        view,
+        "Moves succeeded",
+        &view.boards.success,
+        format::percent,
+        |e| viz::bar(share_class(e.value), e.value, &format::percent(e.value)),
+    ));
+    out.push_str("</div>");
+    if !view.boards.latency.is_empty() {
+        out.push_str(
+            "<ul class=\"legend\"><li><i class=\"key ok\"></i> Round trip on an open connection</li>\
+             <li><i class=\"key tor\"></i> Opening the connection (Tor, stream, TLS), at a sixth \
+             of the scale</li></ul>",
+        );
+    }
+    out.push_str("</section>");
 
     let _ = write!(
         out,
@@ -536,7 +593,102 @@ fn fee_base(what: &str) -> u64 {
     }
 }
 
-fn board(view: &View, title: &str, entries: &[Entry], show: impl Fn(f64) -> String) -> String {
+/// The class of a bar of a share that should be nearly all: green, amber
+/// below 99%, red below 90%.
+fn share_class(share: f64) -> &'static str {
+    if share >= 0.99 {
+        "ok"
+    } else if share >= 0.9 {
+        "some"
+    } else {
+        "bad"
+    }
+}
+
+fn health_of<'a>(view: &'a View, id: &str) -> Option<&'a Health> {
+    let hub = view.hubs.iter().find(|h| h.id == id).map(|h| &h.health);
+    hub.or_else(|| {
+        let provider = view.providers.iter().find(|p| p.id == id);
+        provider.map(|p| &p.health)
+    })
+}
+
+/// How every service is, in a line: green if all answer, amber if some,
+/// red if none.
+fn banner(view: &View, up: usize, all: usize) -> String {
+    let (class, said) = match (up, all) {
+        (_, 0) => ("idle", "No hub or provider found yet".to_owned()),
+        (0, _) => ("bad", "Nothing answers now".to_owned()),
+        (up, all) if up == all && all == 1 => ("ok", "The service answers".to_owned()),
+        (up, all) if up == all => ("ok", format!("All {all} services answer")),
+        (up, all) => ("some", format!("{up} of {all} services answer")),
+    };
+    let moves = view
+        .moves
+        .iter()
+        .fold((0, 0), |(d, t), k| (d + k.rate.done, t + k.rate.total));
+    let moved = match moves {
+        (_, 0) => String::new(),
+        (done, total) => format!(
+            " · {done} of {total} measured moves went through in {}",
+            view.range.label()
+        ),
+    };
+    format!(
+        "<section class=\"banner {class}\"><span class=\"pulse\"></span><span>{}{moved}</span></section>",
+        esc(&said)
+    )
+}
+
+/// Where a probe's time goes, over every probe: Tor's setup apart from the
+/// round trip, and from the services' own work.
+fn time_split(view: &View) -> String {
+    match latency_bar(view.latency, view.tor) {
+        Some(bar) => format!("<section><h2>Where the time goes</h2>{bar}</section>"),
+        None => String::new(),
+    }
+}
+
+/// A bar of `latency` cut in the connection's opening, the round trip and
+/// the service's work, with what each took.
+fn latency_bar(latency: Latency, tor: bool) -> Option<String> {
+    let Latency { open, rtt, work } = latency;
+    let (open, rtt) = (open?, rtt?);
+    let work = work.unwrap_or(0);
+    let total = f64::from(open + rtt + work).max(1.0);
+    let part = |class, value: u32, what: &str| Part {
+        class,
+        share: f64::from(value) / total,
+        title: format!("{what} {}", format::millis(u64::from(value))),
+    };
+    let setup = if tor {
+        "Opening the connection (Tor, stream, TLS)"
+    } else {
+        "Opening the connection"
+    };
+    Some(format!(
+        "<div class=\"split-bar\">{}\
+         <ul class=\"legend\"><li><i class=\"key tor\"></i> {setup} <b>{}</b></li>\
+         <li><i class=\"key ok\"></i> Round trip <b>{}</b></li>\
+         <li><i class=\"key work\"></i> The service's own work <b>{}</b></li></ul></div>",
+        viz::meter(&[
+            part("tor", open, setup),
+            part("ok", rtt, "Round trip"),
+            part("work", work, "The service's own work"),
+        ]),
+        format::millis(u64::from(open)),
+        format::millis(u64::from(rtt)),
+        format::millis(u64::from(work)),
+    ))
+}
+
+fn board(
+    view: &View,
+    title: &str,
+    entries: &[Entry],
+    show: impl Fn(f64) -> String,
+    meter: impl Fn(&Entry) -> String,
+) -> String {
     let mut out = format!("<div class=\"board\"><h3>{}</h3>", esc(title));
     if entries.is_empty() {
         out.push_str("<p class=\"dim\">Not enough measured yet.</p></div>");
@@ -550,10 +702,11 @@ fn board(view: &View, title: &str, entries: &[Entry], show: impl Fn(f64) -> Stri
         };
         let _ = write!(
             out,
-            "<li><span class=\"who\">{} <span class=\"tag\">{role}</span></span>\
-             <span class=\"num\">{}</span></li>",
+            "<li><div class=\"line\"><span class=\"who\">{} <span class=\"tag\">{role}</span></span>\
+             <span class=\"num\">{}</span></div>{}</li>",
             link(view, &entry.id, &entry.label),
-            show(entry.value)
+            show(entry.value),
+            meter(entry)
         );
     }
     out.push_str("</ol></div>");
@@ -577,7 +730,9 @@ fn how(view: &View) -> String {
          is ranked once probed 3 times in the range.</p><p>The observatory also moves a small \
          balance of its own between hubs, at random times, as often as its monthly budget \
          allows: cheap moves often, payouts on Bitcoin seldom. <b>Moves succeeded</b> counts \
-         those that went through each hub or provider.</p></details></section>"
+         those that went through each hub or provider. A move on Bitcoin is timed by its \
+         swap, from asking the provider to its coin being on the network, not by the \
+         blocks waited for after it; what it costs is counted in all.</p></details></section>"
     )
 }
 
@@ -588,12 +743,19 @@ fn hubs_body(view: &View) -> String {
             .into();
     }
     let mut out = String::from(
-        "<section><table><thead><tr><th>Hub</th><th>State</th><th class=\"num\">Uptime</th>\
-         <th class=\"num\">Round trip</th><th class=\"num\">Pay in Licash</th>\
+        "<section><table><thead><tr><th>Hub</th><th>State</th><th>Probes</th>\
+         <th class=\"num\">Uptime</th><th class=\"num\">Round trip</th><th class=\"num\">Pay in Licash</th>\
          <th class=\"num\">Lightning out</th><th class=\"num\">Lightning in</th>\
          <th class=\"num\">Bitcoin in</th><th class=\"num\">Protection</th>\
          <th class=\"num\">Into it</th></tr></thead><tbody>",
     );
+    let deepest = view
+        .hubs
+        .iter()
+        .map(|h| h.inbound)
+        .max()
+        .unwrap_or(0)
+        .max(1);
     for hub in &view.hubs {
         let terms = hub.terms.as_ref();
         let lightning = terms.and_then(|t| t.lightning.as_ref());
@@ -602,11 +764,12 @@ fn hubs_body(view: &View) -> String {
             .map(protection_line);
         let _ = write!(
             out,
-            "<tr><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
              <td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
              <td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
             link(view, &hub.id, &title(&hub.name, &hub.host)),
             state(&hub.health),
+            viz::strip(&hub.health.chart, &format!("Probes over {}", view.range.label())),
             opt(hub.health.uptime.map(format::uptime)),
             ms(hub.health.latency.rtt),
             opt(terms.and_then(|t| t.fees).map(|f| format::terms(&f.spend))),
@@ -617,7 +780,15 @@ fn hubs_body(view: &View) -> String {
                 .map(|d| format::terms(&d.fee))),
             opt(protection),
             if hub.inbound > 0 {
-                format!("up to {}", format::sat(hub.inbound))
+                format!(
+                    "up to {}{}",
+                    format::sat(hub.inbound),
+                    viz::bar(
+                        "ok",
+                        hub.inbound as f64 / deepest as f64,
+                        "What providers can move into it, against the deepest hub",
+                    )
+                )
             } else {
                 "<span class=\"dim\">–</span>".into()
             },
@@ -636,8 +807,8 @@ fn providers_body(view: &View) -> String {
         return "<section class=\"calm\"><p>No swap provider found yet.</p></section>".into();
     }
     let mut out = String::from(
-        "<section><table><thead><tr><th>Provider</th><th>State</th><th class=\"num\">Uptime</th>\
-         <th class=\"num\">Round trip</th><th class=\"num\">Move fee</th>\
+        "<section><table><thead><tr><th>Provider</th><th>State</th><th>Probes</th>\
+         <th class=\"num\">Uptime</th><th class=\"num\">Round trip</th><th class=\"num\">Move fee</th>\
          <th class=\"num\">Moves</th><th class=\"num\">Hubs</th>\
          <th class=\"num\">Bitcoin out</th><th class=\"num\">Lightning out</th></tr></thead><tbody>",
     );
@@ -645,11 +816,12 @@ fn providers_body(view: &View) -> String {
         let terms = provider.terms.as_ref();
         let _ = write!(
             out,
-            "<tr><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
              <td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
              <td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
             link(view, &provider.id, &title(&provider.name, &provider.host)),
             state(&provider.health),
+            viz::strip(&provider.health.chart, &format!("Probes over {}", view.range.label())),
             opt(provider.health.uptime.map(format::uptime)),
             ms(provider.health.latency.rtt),
             opt(terms.and_then(|t| t.fee).map(|f| format::terms(&f))),
@@ -714,11 +886,28 @@ fn health_facts(view: &View, health: &Health) -> Vec<(&'static str, String)> {
     rows
 }
 
+/// Where one service's probes spend their time.
+fn service_time(view: &View, health: &Health) -> String {
+    match latency_bar(health.latency, view.tor) {
+        Some(bar) => format!("<section><h2>Where its time goes</h2>{bar}</section>"),
+        None => String::new(),
+    }
+}
+
 fn chart(view: &View, health: &Health) -> String {
     const W: f64 = 720.0;
     const H: f64 = 120.0;
     let n = health.chart.len().max(1) as f64;
     let step = W / n;
+    // What the chart spans: the range, or less of it for a service seen
+    // more lately.
+    let span = match health.chart.first() {
+        Some(first) if view.at - first.at < view.range.millis() * 19 / 20 => {
+            let seen = u64::try_from(view.at - first.at).unwrap_or(0);
+            format!("over the last {}", format::millis(seen))
+        }
+        _ => format!("over {}", view.range.label()),
+    };
     let max = health
         .chart
         .iter()
@@ -728,16 +917,28 @@ fn chart(view: &View, health: &Health) -> String {
         .max(1) as f64;
     let mut out = format!(
         "<figure class=\"chart\"><svg viewBox=\"0 0 {W} {}\" role=\"img\" \
-         aria-label=\"Round trip and uptime over {}\" preserveAspectRatio=\"none\">",
+         aria-label=\"Round trip and uptime {}\" preserveAspectRatio=\"none\">",
         H + 22.0,
-        view.range.label()
+        span
     );
     let mut points = String::new();
+    let mut area = String::new();
+    for quarter in [0.0, 0.5, 1.0] {
+        let y = H - 6.0 - quarter * (H - 16.0);
+        let _ = write!(
+            out,
+            "<line class=\"grid\" x1=\"0\" x2=\"{W}\" y1=\"{y:.1}\" y2=\"{y:.1}\"/>"
+        );
+    }
+    let mut first_x = None;
+    let mut last_x = 0.0;
     for (i, bucket) in health.chart.iter().enumerate() {
         let x = i as f64 * step;
         if let Some(rtt) = bucket.rtt {
             let y = H - 6.0 - (f64::from(rtt) / max) * (H - 16.0);
             let _ = write!(points, "{:.1},{:.1} ", x + step / 2.0, y);
+            first_x.get_or_insert(x + step / 2.0);
+            last_x = x + step / 2.0;
         }
         let (class, said) = match (bucket.ok, bucket.total) {
             (_, 0) => ("none", "not probed".to_owned()),
@@ -754,12 +955,20 @@ fn chart(view: &View, health: &Health) -> String {
             (step - 1.0).max(0.5)
         );
     }
+    if let Some(first) = first_x {
+        let _ = write!(
+            area,
+            "{first:.1},{:.1} {points}{last_x:.1},{:.1}",
+            H - 6.0,
+            H - 6.0
+        );
+    }
     let _ = write!(
         out,
-        "<polyline points=\"{points}\"/></svg><figcaption>Round trip, highest {}, and below, \
-         probes answered, over {}</figcaption></figure>",
+        "<polygon class=\"area\" points=\"{area}\"/><polyline points=\"{points}\"/></svg>\
+         <figcaption>Round trip, highest {}, and below, probes answered, {}</figcaption></figure>",
         format::millis(max as u64),
-        view.range.label()
+        span
     );
     out
 }
@@ -789,6 +998,7 @@ fn hub_body(view: &View, hub: &HubView) -> String {
     out.push_str("</section><section>");
     out.push_str(&chart(view, &hub.health));
     out.push_str("</section></div>");
+    out.push_str(&service_time(view, &hub.health));
     let Some(t) = &hub.terms else {
         out.push_str("<section class=\"calm\"><p>Its terms are not known yet.</p></section>");
         return out;
@@ -883,6 +1093,7 @@ fn provider_body(view: &View, provider: &ProviderView) -> String {
     out.push_str("</section><section>");
     out.push_str(&chart(view, &provider.health));
     out.push_str("</section></div>");
+    out.push_str(&service_time(view, &provider.health));
     let Some(t) = &provider.terms else {
         out.push_str("<section class=\"calm\"><p>Its terms are not known yet.</p></section>");
         return out;
@@ -999,12 +1210,19 @@ fn kinds_table(view: &View) -> String {
              <td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
             esc(label),
             opt(kind.rate.share().map(|s| format!(
-                "{} ({} of {})",
+                "{} ({} of {}){}",
                 format::percent(s),
                 kind.rate.done,
-                kind.rate.total
+                kind.rate.total,
+                viz::bar(share_class(s), s, &format::percent(s)),
             ))),
-            opt(kind.duration.map(format::millis)),
+            opt(kind.duration.map(|d| {
+                let swap = Kind::parse(&kind.kind) == Some(Kind::Chain);
+                match swap {
+                    true => format!("{} <span class=\"dim\">swap</span>", format::millis(d)),
+                    false => format::millis(d),
+                }
+            })),
             opt(kind.cost.map(format::sat)),
             opt(kind.last.map(|at| format::ago(at, view.at))),
         );
@@ -1056,9 +1274,15 @@ fn recent(view: &View, of: Option<&str>) -> String {
                 esc(a.detail.as_deref().unwrap_or_default())
             ),
         };
-        let took = a
-            .ended
-            .map(|e| format::millis(u64::try_from(e - a.started).unwrap_or(0)));
+        // A move on Bitcoin says its swap's time, and the whole apart.
+        let took = budget::took(a).map(|ms| match (a.swapped, a.ended) {
+            (Some(_), Some(ended)) => format!(
+                "{}<br><span class=\"dim\">{} in all</span>",
+                format::millis(ms),
+                format::millis(u64::try_from(ended - a.started).unwrap_or(0))
+            ),
+            _ => format::millis(ms),
+        });
         let _ = write!(
             out,
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
@@ -1097,7 +1321,15 @@ fn moves_body(view: &View) -> String {
             out.push_str(&card(
                 "Spent",
                 &format::sat(budget.spent),
-                &format!("of {} in 30 days", format::sat(budget.monthly)),
+                &format!(
+                    "of {} in 30 days{}",
+                    format::sat(budget.monthly),
+                    viz::bar(
+                        "ok",
+                        budget.spent as f64 / budget.monthly.max(1) as f64,
+                        "Spent of the monthly budget",
+                    )
+                ),
             ));
             out.push_str(&card(
                 "Balance",
@@ -1115,13 +1347,30 @@ fn moves_body(view: &View) -> String {
                 } else {
                     opt(k.next.map(|at| format::until(at, view.at)))
                 };
+                let used = if k.allowance > 0 {
+                    k.spent as f64 / k.allowance as f64
+                } else {
+                    0.0
+                };
+                let class = if used >= 0.9 {
+                    "bad"
+                } else if used >= 0.6 {
+                    "some"
+                } else {
+                    "ok"
+                };
                 let _ = write!(
                     out,
-                    "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
+                    "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}{}</td>\
                      <td class=\"num\">{next}</td></tr>",
                     esc(k.kind.label()),
                     format::sat(k.allowance),
                     format::sat(k.spent),
+                    viz::bar(
+                        class,
+                        used,
+                        &format!("{} of its share spent", format::percent(used.min(1.0))),
+                    ),
                 );
             }
             out.push_str("</tbody></table></section>");
@@ -1137,8 +1386,8 @@ fn moves_body(view: &View) -> String {
 }
 
 const STYLE: &str = r#"
-:root{--bg:#f7f7f5;--fg:#1c1d1f;--dim:#6b6f76;--line:#e3e3df;--card:#fff;--accent:#1f8a4c;--bad:#c0392b;--warn:#b7791f;--idle:#8a8f98;--tint:#e8f4ec}
-@media (prefers-color-scheme:dark){:root{--bg:#111214;--fg:#e8e8e6;--dim:#9a9ea6;--line:#26282c;--card:#18191c;--accent:#3ccf7a;--bad:#ff6b5e;--warn:#f0b450;--idle:#7d828a;--tint:#16271d}}
+:root{--bg:#f7f7f5;--fg:#1c1d1f;--dim:#6b6f76;--line:#e3e3df;--card:#fff;--accent:#1f8a4c;--bad:#c0392b;--warn:#b7791f;--idle:#8a8f98;--tint:#e8f4ec;--tor:#7b6fd6;--work:#5b9fd0}
+@media (prefers-color-scheme:dark){:root{--bg:#111214;--fg:#e8e8e6;--dim:#9a9ea6;--line:#26282c;--card:#18191c;--accent:#3ccf7a;--bad:#ff6b5e;--warn:#f0b450;--idle:#7d828a;--tint:#16271d;--tor:#9d93f0;--work:#6bb2e8}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 a{color:inherit;text-decoration-color:var(--line);text-underline-offset:3px}
@@ -1174,8 +1423,35 @@ h3{font-size:14px;margin:0 0 8px;color:var(--dim);font-weight:600}
 .board ol{margin:0;padding-left:22px}
 .board li{padding:4px 0;border-bottom:1px solid var(--line)}
 .board li:last-child{border:0}
-.board li span.who{display:inline-block;max-width:70%;overflow-wrap:anywhere}
-.board li .num{float:right}
+.board li .line{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
+.board li span.who{overflow-wrap:anywhere}
+.board li .meter{margin-top:6px}
+.board li .meter+.meter{margin-top:3px;height:3px}
+.legend{display:flex;flex-wrap:wrap;gap:4px 18px;list-style:none;padding:0;margin:12px 0 0;font-size:13px;color:var(--dim)}
+.legend b{color:var(--fg);font-variant-numeric:tabular-nums;font-weight:600}
+.key{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:4px;vertical-align:-1px}
+.key.ok{background:var(--accent)}.key.tor{background:var(--tor)}.key.work{background:var(--work)}
+.meter{display:flex;gap:2px;height:6px;border-radius:999px;overflow:hidden;background:var(--line);width:100%}
+.meter i{display:block;height:100%;min-width:2px}
+.meter i.ok{background:var(--accent)}.meter i.some{background:var(--warn)}.meter i.bad{background:var(--bad)}
+.meter i.tor{background:var(--tor)}.meter i.work{background:var(--work)}
+td .meter,.card .meter{height:4px;margin-top:5px;min-width:64px}
+.split-bar{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px}
+.split-bar .meter{height:16px;border-radius:8px}
+.strip{display:block;width:96px;height:14px}
+td:first-child{min-width:150px}
+.strip rect.ok{fill:var(--accent)}.strip rect.some{fill:var(--warn)}.strip rect.bad{fill:var(--bad)}.strip rect.none{fill:var(--line)}
+.dots{display:inline-flex;gap:3px;margin-right:6px;vertical-align:middle}
+.dots i{width:8px;height:8px;border-radius:50%;background:var(--idle)}
+.dots i.ok{background:var(--accent)}.dots i.bad{background:var(--bad)}
+.banner{display:flex;align-items:center;gap:12px;margin:0 0 14px;padding:14px 18px;border-radius:16px;border:1px solid var(--line);background:var(--card);font-weight:600}
+.banner .pulse{width:12px;height:12px;border-radius:50%;background:var(--idle);flex:none}
+.banner.ok{background:var(--tint);border-color:transparent}.banner.ok .pulse{background:var(--accent)}
+.banner.some .pulse{background:var(--warn)}.banner.bad .pulse{background:var(--bad)}
+@media (prefers-reduced-motion:no-preference){.banner.ok .pulse{animation:pulse 2.6s ease-out infinite}}
+@keyframes pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--accent) 45%,transparent)}70%,100%{box-shadow:0 0 0 9px transparent}}
+tbody tr:hover td{background:color-mix(in srgb,var(--tint) 55%,transparent)}
+.card{transition:border-color .15s}.card:hover{border-color:var(--accent)}
 .tag{font-size:11px;color:var(--dim);border:1px solid var(--line);border-radius:6px;padding:0 5px}
 table{width:100%;border-collapse:separate;border-spacing:0;overflow:hidden}
 th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
@@ -1193,6 +1469,8 @@ section{margin-bottom:8px;overflow-x:auto}
 .chart{margin:0;padding:12px}
 .chart svg{width:100%;height:150px;display:block}
 .chart polyline{fill:none;stroke:var(--accent);stroke-width:2;vector-effect:non-scaling-stroke}
+.chart polygon.area{fill:var(--accent);opacity:.13}
+.chart line.grid{stroke:var(--line);stroke-width:1;vector-effect:non-scaling-stroke;stroke-dasharray:3 4}
 .chart rect.ok{fill:var(--accent)}.chart rect.some{fill:var(--warn)}.chart rect.bad{fill:var(--bad)}.chart rect.none{fill:var(--line)}
 .chart figcaption{font-size:12px;color:var(--dim)}
 .urls{list-style:none;padding:0;margin:0}.urls li{padding:4px 0;overflow-wrap:anywhere}

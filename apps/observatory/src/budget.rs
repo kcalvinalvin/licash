@@ -103,6 +103,21 @@ pub fn jitter(mean: Duration, random: u64) -> Duration {
     mean.mul_f64(0.5 + unit)
 }
 
+/// How long an action took, in ms, as its kind says: the swap's time where
+/// it was timed apart (a move on Bitcoin, which leaves out the waits for
+/// blocks), else the whole of it. None for one not ended, or for a move on
+/// Bitcoin not timed: never the waits for blocks in its stead.
+pub fn took(action: &Action) -> Option<u64> {
+    if let Some(swapped) = action.swapped {
+        return Some(swapped);
+    }
+    if action.kind == Kind::Chain.key() {
+        return None;
+    }
+    let ended = action.ended?;
+    u64::try_from(ended - action.started).ok()
+}
+
 /// What `actions` cost, those of `kind` if given.
 pub fn spent(actions: &[Action], kind: Option<Kind>) -> u64 {
     actions
@@ -191,6 +206,7 @@ mod tests {
             cost: Some(cost),
             outcome: Outcome::Done,
             detail: None,
+            swapped: None,
         }
     }
 

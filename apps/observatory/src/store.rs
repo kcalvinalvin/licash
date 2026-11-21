@@ -12,10 +12,14 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 
-/// The schema this version writes. A file of a later one is refused.
+/// The schema this version writes. A file of a later one is refused. It is
+/// bumped only when an older binary could misread or miswrite a file: a
+/// nullable column added at the end is invisible to one that names its
+/// columns, so it is ensured at open instead (see `ensure_columns`), and an
+/// older image still opens the file after a rollback.
 const VERSION: i64 = 1;
 
 const SCHEMA: &str = "
@@ -59,7 +63,10 @@ CREATE TABLE actions (
     quoted INTEGER,
     cost INTEGER,
     outcome TEXT NOT NULL,
-    detail TEXT
+    detail TEXT,
+    -- How long its swap took, in ms, where that is less than all of it:
+    -- a move on Bitcoin leaves out the waits for blocks.
+    swapped INTEGER
 );
 CREATE INDEX actions_started ON actions (started);
 ";
@@ -166,6 +173,10 @@ pub struct Action {
     pub outcome: Outcome,
     /// Why it failed, in a line.
     pub detail: Option<String>,
+    /// How long its swap took in ms, where that is not all of it: a move on
+    /// Bitcoin counts its provider's part, not the waits for blocks. None
+    /// where it was not timed, as in a move made before this was recorded.
+    pub swapped: Option<u64>,
 }
 
 /// The observatory's file, one connection shared.
@@ -195,6 +206,7 @@ impl Store {
                 path.display()
             ),
         }
+        ensure_columns(&db)?;
         Ok(Self { db: Mutex::new(db) })
     }
 
@@ -344,10 +356,19 @@ impl Store {
         outcome: Outcome,
         cost: Option<u64>,
         detail: Option<&str>,
+        swapped: Option<u64>,
     ) -> anyhow::Result<()> {
         self.db().execute(
-            "UPDATE actions SET ended = ?2, outcome = ?3, cost = ?4, detail = ?5 WHERE id = ?1",
-            params![id, ended, outcome.name(), cost.map(sql), detail],
+            "UPDATE actions SET ended = ?2, outcome = ?3, cost = ?4, detail = ?5, swapped = ?6
+             WHERE id = ?1",
+            params![
+                id,
+                ended,
+                outcome.name(),
+                cost.map(sql),
+                detail,
+                swapped.map(sql)
+            ],
         )?;
         Ok(())
     }
@@ -367,7 +388,7 @@ impl Store {
         let db = self.db();
         let mut query = db.prepare(
             "SELECT id, kind, started, ended, source, target, via, amount, quoted, cost,
-                    outcome, detail
+                    outcome, detail, swapped
              FROM actions WHERE started >= ?1 ORDER BY started",
         )?;
         let rows = query.query_map([since], |r| {
@@ -384,6 +405,7 @@ impl Store {
                 cost: r.get::<_, Option<i64>>(9)?.map(nat),
                 outcome: Outcome::parse(&r.get::<_, String>(10)?),
                 detail: r.get(11)?,
+                swapped: r.get::<_, Option<i64>>(12)?.map(nat),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -401,6 +423,24 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// Columns added since the first version, each nullable and at the end of
+/// its table: added to a file written before it, once. Taking the write
+/// lock first means that of two processes opening the file, the second finds
+/// the column made, rather than failing to make it again.
+fn ensure_columns(db: &Connection) -> anyhow::Result<()> {
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let has: i64 = tx.query_row(
+        "SELECT count(*) FROM pragma_table_info('actions') WHERE name = 'swapped'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has == 0 {
+        tx.execute_batch("ALTER TABLE actions ADD COLUMN swapped INTEGER")?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn sql(n: u64) -> i64 {

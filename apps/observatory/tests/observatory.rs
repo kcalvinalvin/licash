@@ -262,6 +262,7 @@ fn action(kind: Kind, source: &str, outcome: Outcome, cost: u64) -> Action {
         cost: None,
         outcome,
         detail: None,
+        swapped: None,
     }
 }
 
@@ -272,7 +273,7 @@ async fn the_pages_show_what_was_seen() {
     let started = action(Kind::Hub, HUB_KEY, Outcome::Running, 2);
     let id = w.store.action_started(&started).unwrap();
     w.store
-        .action_ended(id, store::now(), Outcome::Done, Some(2), None)
+        .action_ended(id, store::now(), Outcome::Done, Some(2), None, None)
         .unwrap();
     let id = w.store.action_started(&started).unwrap();
     w.store
@@ -282,6 +283,7 @@ async fn the_pages_show_what_was_seen() {
             Outcome::Failed,
             Some(1),
             Some("the hub refused"),
+            None,
         )
         .unwrap();
     let month = w.store.actions_since(0).unwrap();
@@ -459,4 +461,171 @@ async fn several_networks_are_served_each_under_its_name() {
     assert_eq!(status, 404);
     let (status, _) = get_page(router, "/bitcoin/").await;
     assert_eq!(status, 200);
+}
+
+/// The first layout of `actions`, as the image first deployed wrote it.
+const FIRST_LAYOUT: &str = "
+CREATE TABLE services (
+    id TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    -- The Nostr key that announced it, in hex; none for one configured.
+    key TEXT,
+    name TEXT,
+    -- Its URLs, a JSON array, in the order announced.
+    urls TEXT NOT NULL,
+    first_seen INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL
+);
+CREATE TABLE probes (
+    at INTEGER NOT NULL,
+    service TEXT NOT NULL,
+    url TEXT NOT NULL,
+    ok INTEGER NOT NULL,
+    open_ms INTEGER,
+    rtt_ms INTEGER,
+    info_ms INTEGER,
+    error TEXT
+);
+CREATE INDEX probes_at ON probes (at);
+CREATE TABLE terms (
+    service TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    info TEXT NOT NULL,
+    PRIMARY KEY (service, at)
+);
+CREATE TABLE actions (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    started INTEGER NOT NULL,
+    ended INTEGER,
+    source TEXT,
+    target TEXT,
+    via TEXT,
+    amount INTEGER NOT NULL,
+    quoted INTEGER,
+    cost INTEGER,
+    outcome TEXT NOT NULL,
+    detail TEXT
+);
+CREATE INDEX actions_started ON actions (started);
+";
+
+#[test]
+fn a_file_of_the_first_layout_gains_its_column_and_keeps_its_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.sqlite");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(FIRST_LAYOUT).unwrap();
+    db.execute(
+        "INSERT INTO actions (kind, started, ended, amount, quoted, cost, outcome)
+         VALUES ('chain', 1000, 142000, 10000, 1338, 1328, 'done')",
+        [],
+    )
+    .unwrap();
+    db.pragma_update(None, "user_version", 1).unwrap();
+    drop(db);
+
+    for _ in 0..2 {
+        let store = Store::open(&path).unwrap();
+        let moves = store.actions_since(0).unwrap();
+        assert_eq!(moves.len(), 1, "its move is kept");
+        assert_eq!(moves[0].cost, Some(1328));
+        assert_eq!(moves[0].swapped, None, "never timed: unknown");
+        assert_eq!(
+            budget::took(&moves[0]),
+            None,
+            "not the waits for blocks in its stead"
+        );
+    }
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 1, "the version is the one an older image reads");
+}
+
+#[test]
+fn a_move_on_bitcoin_is_timed_by_its_swap_and_others_by_all_of_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("o.sqlite")).unwrap();
+    let mut chain = action(Kind::Chain, HUB_KEY, Outcome::Running, 1_338);
+    chain.started = store::now() - 150_000;
+    let id = store.action_started(&chain).unwrap();
+    store
+        .action_ended(
+            id,
+            store::now(),
+            Outcome::Done,
+            Some(1_328),
+            None,
+            Some(38_000),
+        )
+        .unwrap();
+    let hub = action(Kind::Hub, HUB_KEY, Outcome::Running, 3);
+    let id = store.action_started(&hub).unwrap();
+    store
+        .action_ended(id, store::now(), Outcome::Done, Some(3), None, None)
+        .unwrap();
+    let moves = store.actions_since(0).unwrap();
+    let by = |kind: Kind| moves.iter().find(|a| a.kind == kind.key()).unwrap();
+    assert_eq!(
+        budget::took(by(Kind::Chain)),
+        Some(38_000),
+        "the swap, not the 150 s"
+    );
+    assert!(
+        budget::took(by(Kind::Hub)).unwrap() >= 5_000,
+        "the whole of it"
+    );
+
+    let records = Records::read(&store, 0).unwrap();
+    let view = view::compute(
+        records,
+        view::Context {
+            network: "regtest".into(),
+            tor: false,
+            now: store::now(),
+            range: Range::Week,
+            fresh: 60_000,
+            budget: None,
+        },
+    );
+    let kind = view
+        .moves
+        .iter()
+        .find(|k| k.kind == Kind::Chain.key())
+        .unwrap();
+    assert_eq!(kind.duration, Some(38_000));
+}
+
+#[tokio::test]
+async fn a_young_services_chart_covers_what_there_is_of_the_range() {
+    let w = world().await;
+    observer::round(w.store.clone(), watching()).await;
+    let view = view(&w.store, None);
+    let chart = &view.hubs[0].health.chart;
+    assert_eq!(chart.len(), 48);
+    let week = Range::Week.millis();
+    // From a twelfth of the week at most, not all seven days of empty cells.
+    assert!(
+        view.at - chart[0].at <= week / 12 + 1_000,
+        "{}",
+        view.at - chart[0].at
+    );
+    assert!(chart.iter().any(|b| b.total > 0), "its probes are in it");
+    let full = view::compute(
+        Records::read(&w.store, 0).unwrap(),
+        view::Context {
+            network: "regtest".into(),
+            tor: false,
+            now: store::now(),
+            range: Range::Day,
+            fresh: 60_000,
+            budget: None,
+        },
+    );
+    assert!(
+        full.hubs[0].health.chart.last().unwrap().total > 0,
+        "the newest cell has the probe"
+    );
 }

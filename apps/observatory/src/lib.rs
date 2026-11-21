@@ -16,4 +16,5 @@ pub mod probe;
 pub mod store;
 pub mod terms;
 pub mod view;
+pub mod viz;
 pub mod web;
