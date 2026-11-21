@@ -113,7 +113,18 @@ enum Command {
         /// as one on a terminal.
         #[arg(long)]
         qr: bool,
+        /// Instead, extra code N (`codes`), naming no mailbox.
+        #[arg(long, conflicts_with = "onchain")]
+        extra: Option<u32>,
     },
+    /// The wallet's extra codes, by number: codes of keys of their own,
+    /// that no one can tell are this wallet's, or each other's.
+    Codes,
+    /// A new extra code, called LABEL: a payment code of keys of its own,
+    /// the next number's, that no one can tell is this wallet's, naming no
+    /// mailbox. What it is paid is collected by `mailbox` and paid on to
+    /// this wallet, less its hub's fee.
+    NewCode { label: String },
     /// Pay the payee of a payment code AMOUNT, the hub's fee on top, at a
     /// hub it names that this wallet trusts and holds enough at, else once
     /// a swap through a provider announced on Nostr brought it there: sent
@@ -141,6 +152,10 @@ enum Command {
         /// paid and may pay back.
         #[arg(long)]
         share_code: bool,
+        /// Tell the payee extra code N instead (`codes`), as `--share-code`
+        /// does this wallet's own.
+        #[arg(long, conflicts_with = "share_code")]
+        share_extra: Option<u32>,
     },
     /// Receive the payments the wallet's hubs keep for it and those sent to
     /// its mailbox, on the relays its hubs name, and unlink their notes;
@@ -732,7 +747,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             show_qr(qr && !json, &text);
             show(json, json!({ "code": text, "onchain": true }), text.clone());
         }
-        Command::Code { hub, qr, .. } => {
+        Command::Code { hub, qr, extra, .. } => {
             let hubs = match hub.is_empty() {
                 false => hub,
                 true => contract::code_hubs(&wallet, &path)?,
@@ -740,11 +755,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if hubs.is_empty() {
                 bail!("no hub: `licash-wallet add-hub URL` trusts one");
             }
-            let code = wallet.payment_code(&hubs)?;
+            let code = match extra {
+                Some(index) => wallet.extra_code(index, &hubs)?,
+                None => wallet.payment_code(&hubs)?,
+            };
             let licash = code.licash.as_ref().expect("a Licash code");
             let mailbox = licash.mailbox.is_some();
             let text = if qr { code.qr() } else { code.to_string() };
-            if !mailbox {
+            if !mailbox && extra.is_none() {
                 eprintln!(
                     "warning: none of its hubs names mailbox relays: payments they do not keep are handed over"
                 );
@@ -765,13 +783,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             details,
             note,
             share_code,
+            share_extra,
         } => {
-            let from = match share_code {
-                true => {
-                    let hubs = contract::code_hubs(&wallet, &path)?;
-                    wallet.payment_code(&hubs)?.licash
-                }
-                false => None,
+            let hubs = || contract::code_hubs(&wallet, &path);
+            let from = match (share_code, share_extra) {
+                (_, Some(index)) => wallet.extra_code(index, &hubs()?)?.licash,
+                (true, None) => wallet.payment_code(&hubs()?)?.licash,
+                (false, None) => None,
             };
             let note = PaymentNote { text: note, from };
             let route = route(tor.clone(), cli.proxy.as_deref())?;
@@ -784,6 +802,56 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 note: &note,
             };
             pay(&wallet, &route, &code, amount, how).await?;
+        }
+        Command::Codes => {
+            let hubs = contract::code_hubs(&wallet, &path)?;
+            let mut rows = Vec::new();
+            let mut lines = Vec::new();
+            for at in wallet.code_activity()? {
+                let code = at.code;
+                let text = match hubs.is_empty() {
+                    true => None,
+                    false => Some(wallet.extra_code(code.index, &hubs)?.to_string()),
+                };
+                let received: u64 = at.received.iter().map(|r| r.amount).sum();
+                let fees: u64 = at.swept.iter().map(|s| s.fee).sum();
+                lines.push(format!(
+                    "{}  {}  received {} in {} payments, {} in fees  {}",
+                    code.index,
+                    say::terminal(&code.label),
+                    say::sat(received),
+                    at.received.len(),
+                    say::sat(fees),
+                    text.as_deref().unwrap_or("(no hub)"),
+                ));
+                rows.push(json!({
+                    "index": code.index, "label": code.label, "code": text,
+                    "created_at": code.created_at, "received": received,
+                    "payments": at.received.len(), "fees": fees,
+                }));
+            }
+            if lines.is_empty() {
+                lines.push("no extra codes: `licash-wallet new-code LABEL` makes one".into());
+            }
+            show(json, json!({ "codes": rows }), lines.join("\n"));
+        }
+        Command::NewCode { label } => {
+            let code = wallet.add_code(&label).await?;
+            let hubs = contract::code_hubs(&wallet, &path)?;
+            let text = match hubs.is_empty() {
+                true => None,
+                false => Some(wallet.extra_code(code.index, &hubs)?.to_string()),
+            };
+            show(
+                json,
+                json!({ "index": code.index, "label": code.label, "code": text }),
+                format!(
+                    "extra code {}: {}",
+                    code.index,
+                    text.as_deref()
+                        .unwrap_or("no hub yet, `licash-wallet add-hub URL` trusts one")
+                ),
+            );
         }
         Command::Mailbox => {
             let route = route(tor.clone(), cli.proxy.as_deref())?;
@@ -1850,6 +1918,12 @@ async fn pay(
 /// The payments `collected` took, warned of what it did not look through
 /// or take.
 fn collected_said(collected: licash_nostr::wallet::Collected) -> Vec<licash_wallet::Received> {
+    for (index, reason) in &collected.codes.failed {
+        eprintln!(
+            "warning: extra code {index} not collected ({}): again next time",
+            say::terminal(reason)
+        );
+    }
     for (id, reason) in &collected.skipped {
         eprintln!("warning: {id} in the mailbox {}", say::terminal(reason));
     }
@@ -1912,7 +1986,12 @@ async fn watch(wallet: &Wallet<Http>, route: &Route, every: u64, json: bool) -> 
     loop {
         let collect = licash_nostr::wallet::collect_kept(wallet, route, &mut kept);
         let received = match collect.await {
-            Ok(collected) => collected_said(collected),
+            Ok(collected) => {
+                for (row, line) in at_codes(wallet, &collected.codes) {
+                    show(json, json!({ "received_at_code": row }), line);
+                }
+                collected_said(collected)
+            }
             Err(e) => {
                 eprintln!(
                     "warning: nothing received ({})",
@@ -2009,6 +2088,11 @@ fn not_mailed(id: &str, why: &str) {
 /// only. Then mail the payments due to their payees.
 async fn mailbox(wallet: &Wallet<Http>, route: &Route, json: bool) -> anyhow::Result<()> {
     let collected = licash_nostr::wallet::collect(wallet, route).await?;
+    let (code_rows, code_lines): (Vec<_>, Vec<_>) =
+        at_codes(wallet, &collected.codes).into_iter().unzip();
+    let swept: Vec<String> = (collected.codes.swept.iter())
+        .map(|(_, paid)| paid.id.clone())
+        .collect();
     let received = collected_said(collected);
     let unlinking = async {
         match received.is_empty() {
@@ -2029,18 +2113,59 @@ async fn mailbox(wallet: &Wallet<Http>, route: &Route, json: bool) -> anyhow::Re
         .iter()
         .map(|r| {
             let said = note_said(notes.get(&r.id));
-            format!("received {} at {}{said}", say::sat(r.amount), r.hub)
+            match swept.contains(&r.id) {
+                true => format!(
+                    "moved {} in from extra codes at {}",
+                    say::sat(r.amount),
+                    r.hub
+                ),
+                false => format!("received {} at {}{said}", say::sat(r.amount), r.hub),
+            }
         })
         .collect();
+    lines.extend(code_lines);
     if lines.is_empty() {
         lines.push("nothing new".into());
     }
     show(
         json,
-        json!({ "received": rows, "unlinked": unlinked }),
+        json!({ "received": rows, "at_codes": code_rows, "unlinked": unlinked }),
         lines.join("\n"),
     );
     Ok(())
+}
+
+/// The payments the wallet's extra codes took in `codes`, as JSON and as
+/// lines, their notes said: their wallets' own notes.
+fn at_codes(
+    wallet: &Wallet<Http>,
+    codes: &licash_wallet::CodesCollected,
+) -> Vec<(serde_json::Value, String)> {
+    if codes.received.is_empty() {
+        return Vec::new();
+    }
+    let activity = wallet.code_activity().unwrap_or_default();
+    codes
+        .received
+        .iter()
+        .map(|(index, r)| {
+            let at = activity.iter().find(|a| a.code.index == *index);
+            let note = at.and_then(|a| a.notes.get(&r.id));
+            let label = at.map(|a| a.code.label.as_str()).unwrap_or_default();
+            let (text, from) = note_json(note);
+            let row = json!({
+                "code": index, "label": label, "id": r.id, "hub": r.hub,
+                "amount": r.amount, "note": text, "from": from,
+            });
+            let line = format!(
+                "received {} at extra code {index} ({}){}",
+                say::sat(r.amount),
+                say::terminal(label),
+                note_said(note)
+            );
+            (row, line)
+        })
+        .collect()
 }
 
 /// How [`pay`] pays: its fees at most, where to write a payment not

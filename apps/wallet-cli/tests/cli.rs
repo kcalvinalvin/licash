@@ -1623,6 +1623,70 @@ fn a_payment_to_a_code_tells_its_payee_a_note_and_who_paid() {
 }
 
 #[test]
+fn an_extra_code_is_paid_apart_from_the_wallets_own_and_paid_on_to_it() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (_relay, relay) = support::relay(&runtime);
+    let hub = Server::keeping(FEE, vec![relay]);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, alice_address) = party(dir.path(), "alice", Some(&hub));
+    let (bob, _) = party(dir.path(), "bob", Some(&hub));
+    let funding = serde_json::to_string(&hub.pay(&address(&alice_address), 100)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funding)));
+    assert!(ok(wallet(&bob, &["codes"], None)).contains("no extra codes"));
+
+    let made = json(&bob, &["new-code", " Bob  online"]);
+    assert_eq!(
+        (made["index"].as_u64(), made["label"].as_str()),
+        (Some(1), Some("Bob online"))
+    );
+    let extra = made["code"].as_str().unwrap().to_owned();
+    let shown = json(&bob, &["code", "--extra", "1"]);
+    assert_eq!(shown["code"], extra.as_str());
+    assert_eq!(shown["mailbox"], false);
+    let own = json(&bob, &["code"])["code"].as_str().unwrap().to_owned();
+    assert_ne!(own, extra);
+
+    // Alice tells it who pays: an extra code of her own, not her wallet's.
+    json(&alice, &["new-code", "Alice online"]);
+    let alices = json(&alice, &["code", "--extra", "1"])["code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let args = ["pay", &extra, "30", "--note", "hi", "--share-extra", "1"];
+    // No mailbox named: printed to hand over too, though kept at the hub.
+    let handover = json(&alice, &args);
+    assert!(handover["signed"].is_string(), "{handover}");
+
+    let got = json(&bob, &["collect"]);
+    let at = &got["at_codes"][0];
+    assert_eq!(
+        (at["code"].as_u64(), at["amount"].as_u64()),
+        (Some(1), Some(30))
+    );
+    assert_eq!(at["note"], "hi");
+    assert!(alices.ends_with(at["from"].as_str().unwrap()), "{at}");
+    // Paid on to Bob's own code, less the hub's fee, and taken.
+    let moved = got["received"][0]["amount"].as_u64().unwrap();
+    assert!(moved < 30 && moved > 0, "{got}");
+    assert_eq!(available(&bob), (moved, 0));
+    let listed = json(&bob, &["codes"]);
+    let first = &listed["codes"][0];
+    assert_eq!(
+        (first["received"].as_u64(), first["fees"].as_u64()),
+        (Some(30), Some(30 - moved))
+    );
+    assert!(json(&bob, &["collect"])["at_codes"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    failed(
+        wallet(&bob, &["code", "--extra", "2"], None),
+        1,
+        "no extra code 2",
+    );
+}
+
+#[test]
 fn paying_a_code_does_not_wait_for_older_payments_to_be_mailed() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (_relay, relay) = support::relay(&runtime);

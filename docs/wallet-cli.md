@@ -98,6 +98,18 @@ one, empty if nothing is said; a note is asked only of such a hub, its info
 fetched again first if it named none (so the first note after a hub's
 upgrade may stand out), and another refuses the payment, nothing paid. `received`, `history`
 and `mailbox` show what a payment's note said, and who paid, once proved.
+`new-code LABEL` makes an extra code, numbered from 1, of keys of its own
+derived from the seed, naming no mailbox: no one can tell it is the
+wallet's, or another extra code's. `codes` lists them, what each received
+and its fees; `code --extra N` shows one, and `pay --share-extra N` shares
+it instead of the wallet's own. `mailbox`, `collect` and `watch` (any
+inbox collect) take what each was paid at its hubs first, from a wallet
+file of its own (`WALLET.codes/N.sqlite`), and pay it on to the wallet's
+own code, less the hub's fee (an amount below the fee waits): shown as
+received at the extra code, the payment on as moved in. A hub keeps a
+payment in its inbox for 14 days, after which its payer must hand it over.
+A wallet restored from its seed has no extra codes until made again, in
+the same order.
 Where the wallet holds
 too little, it swaps what it lacks there first through a provider
 announced on its hubs' relays, only if given `--max-fee` (all fees,

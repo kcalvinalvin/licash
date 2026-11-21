@@ -799,6 +799,9 @@ pub struct Collected {
     /// Where payments were not looked for, a hub's URL or [`MAILBOX`], and
     /// why: looked for again next time.
     pub failed: Vec<(String, String)>,
+    /// What the wallet's extra codes were paid, and paid on to it: taken
+    /// among [`Collected::received`] ([`licash_wallet::Inboxed::codes`]).
+    pub codes: licash_wallet::CodesCollected,
 }
 
 /// Where [`Collected::failed`] names the mailbox.
@@ -868,6 +871,7 @@ fn collected<T: Transport>(
         received: inboxed.received,
         skipped: Vec::new(),
         failed: inboxed.failed,
+        codes: inboxed.codes,
     };
     match mail {
         Ok(mail) => take(wallet, mail, done, &mut collected),
