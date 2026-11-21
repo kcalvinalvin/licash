@@ -275,6 +275,13 @@ fun Receive(engine: Engine, back: () -> Unit) {
                 )
                 Spacer(Modifier.height(16.dp))
             }
+            val pending = !editing && error == null && when {
+                lightning -> amount != null && request == null
+                way == Way.DONATIONS -> donations == null
+                way == Way.SILENT -> silent == null
+                else -> (if (way == Way.BITCOIN) bitcoin else code) == null
+            }
+            val wait = rememberWait(pending)
             // In upper case, which a QR code holds in fewer modules.
             when {
                 editing -> {
@@ -303,6 +310,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
                     else -> QrCode(made.qr)
                 }
             }
+            if (!editing) Waited(wait, Modifier.fillMaxWidth().padding(top = 8.dp), center = true)
             error?.let {
                 Spacer(Modifier.height(8.dp))
                 Text(it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)

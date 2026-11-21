@@ -190,6 +190,7 @@ internal fun OptimizeNotes(engine: Engine, hub: Hub, dismiss: () -> Unit) {
         engine.optimizationQuote(hub.url).onSuccess { quote = it }.onFailure { error = explain(it) }
         loading = false
     }
+    val wait = rememberWait(loading || busy)
     Sheet("Optimize notes", dismiss, dismissable = !busy) {
         Say("Smaller notes leave receiving room and help recovery fit its note limit. Automatic shaping normally handles this.")
         Say("Doing it manually bypasses privacy rest and the daily fee budget, but not the fees you agreed to.")
@@ -214,6 +215,7 @@ internal fun OptimizeNotes(engine: Engine, hub: Hub, dismiss: () -> Unit) {
                 }
             }
         }
+        Waited(wait)
         error?.let { Problem(it) }
         TextButton(onClick = dismiss, enabled = !busy) { Text("Done") }
     }
@@ -255,6 +257,7 @@ internal fun AddHub(engine: Engine, action: String = "Add") {
             modifier = Modifier.testTag("add-address"),
         ) { Text(if (adding) "…" else action) }
     }
+    Waited(rememberWait(adding))
     error?.let { Problem(it) }
 }
 
@@ -271,6 +274,11 @@ internal fun FoundHubs(engine: Engine, ui: Ui, auto: Boolean) {
     var looking by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var adding by remember { mutableStateOf<FoundHub?>(null) }
+    // The one being added, once picked, then the last added.
+    var joining by remember { mutableStateOf<String?>(null) }
+    var joined by remember { mutableStateOf<String?>(null) }
+    val lookWait = rememberWait(looking)
+    val joinWait = rememberWait(joining != null)
     fun look() {
         looking = true
         error = null
@@ -297,6 +305,11 @@ internal fun FoundHubs(engine: Engine, ui: Ui, auto: Boolean) {
     TextButton(enabled = !looking, onClick = ::look, modifier = Modifier.testTag("find-hubs")) {
         Text(if (looking) "Looking…" else if (found == null) "Find hubs" else "Look again")
     }
+    Waited(lookWait, Modifier.padding(start = 12.dp))
+    (joining?.let { "Adding $it…" } ?: joined?.let { "Added $it" })?.let {
+        Text(it, Modifier.padding(start = 12.dp, top = 8.dp).testTag("joining"), style = MaterialTheme.typography.bodyMedium)
+        Waited(joinWait, Modifier.padding(start = 12.dp))
+    }
     adding?.let { f ->
         Sheet(f.name ?: name(f.hub.url), dismiss = { adding = null }) {
             Text(
@@ -310,7 +323,13 @@ internal fun FoundHubs(engine: Engine, ui: Ui, auto: Boolean) {
             Say("Add it only if you trust who runs it.")
             BigButton("Add hub", Modifier.fillMaxWidth().testTag("add-hub")) {
                 adding = null
-                scope.launch { engine.addHub(f.hub.url).onFailure { error = explain(it) } }
+                val named = f.name ?: name(f.hub.url)
+                joining = named
+                joined = null
+                scope.launch {
+                    engine.addHub(f.hub.url).onSuccess { joined = named }.onFailure { error = explain(it) }
+                    joining = null
+                }
             }
         }
     }

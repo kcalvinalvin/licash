@@ -100,6 +100,7 @@ fun MoveSheet(engine: Engine, from: Holding, hubs: List<Holding>, moved: () -> U
             Say("If it never arrives, your notes come back once the lock expires.")
         }
         if (busy) LinearProgressIndicator(Modifier.fillMaxWidth().padding(vertical = 12.dp))
+        Waited(rememberWait(busy))
         error?.let { Problem(it) }
         Spacer(Modifier.height(8.dp))
         val target = to

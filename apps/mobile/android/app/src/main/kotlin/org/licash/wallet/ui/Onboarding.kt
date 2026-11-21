@@ -82,6 +82,7 @@ fun Onboarding(engine: Engine, ui: Ui) {
         }
         Spacer(Modifier.height(16.dp))
         error?.let { Text(it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center) }
+        Waited(rememberWait(busy), Modifier.padding(bottom = 8.dp), center = true)
         BigButton(
             if (busy) "Creating…" else "Create wallet",
             Modifier.fillMaxWidth().testTag("create"),
