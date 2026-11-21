@@ -45,7 +45,7 @@ pub(super) const HEADER_CYCLES: u64 = 28_000;
 pub(super) const COMPACT_HEADER_CYCLES: u64 = 10_000;
 /// Of the program of note format v3, whose issuance proofs hash their base
 /// (one fixed-base multiplication more a linked note): the answered test
-/// input, 15 headers and 35.2 kB more, took 79.3 M cycles (73.0 M under the
+/// input, 15 headers and 35.2 kB more, took 79.2 M cycles (73.0 M under the
 /// program before). Its like of funded notes, 27.6 kB, took 70.2 M: they
 /// cost more a byte, and the model reads them 11% under.
 pub(super) const BYTE_CYCLES: u64 = 2_250;
@@ -1110,14 +1110,14 @@ mod tests {
             tail: 100.0,
         };
         assert_eq!(speed.seconds(500_001), MARGIN * (3.0 * 3.0 + 100.0));
-        // The statement's answered test input, 36,402 bytes of which 15
-        // headers, under the program of note format v3: 79.3 M measured.
-        let measured: f64 = 79_275_586.0;
-        let estimated = cycles(COMPACT_HEADER_CYCLES, 15, 36_402 - 15 * 80) as f64;
+        // The statement's answered test input, 36,401 bytes of which 15
+        // headers, under the program of note format v3: 79.2 M measured.
+        let measured: f64 = 79_167_509.0;
+        let estimated = cycles(COMPACT_HEADER_CYCLES, 15, 36_401 - 15 * 80) as f64;
         assert!((estimated / measured - 1.0).abs() < 0.01, "{estimated}");
-        // Its like of funded notes, 28,773 bytes: 70.2 M, read 11% under.
-        let estimated = cycles(COMPACT_HEADER_CYCLES, 15, 28_773 - 15 * 80) as f64;
-        assert!((estimated / 70_228_864.0 - 1.0).abs() < 0.12, "{estimated}");
+        // Its like of funded notes, 28,775 bytes: 70.2 M, read 11% under.
+        let estimated = cycles(COMPACT_HEADER_CYCLES, 15, 28_775 - 15 * 80) as f64;
+        assert!((estimated / 70_213_532.0 - 1.0).abs() < 0.12, "{estimated}");
     }
 
     #[test]

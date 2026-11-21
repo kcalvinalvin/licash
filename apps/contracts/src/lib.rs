@@ -369,7 +369,7 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
 /// when this one changes. Its notes are of the note format v3 (graph id
 /// [`licash::recovery::BOUND_BASE_FROM`]).
 pub const SIGNET: [u8; 32] =
-    hex!("152617b235fb8866611a01eb0abc5e6946392b098658b6b0df23ae756a4dc6b9");
+    hex!("696d978c9c055a8a365ac9eb65b8ee907b3441f6f0bca1db912f787d63567d7f");
 
 /// Whether [`SIGNET`] decides the compact filing: true only for a program
 /// built from a tree whose `licash::recovery` reads it, and set in the
@@ -520,7 +520,7 @@ mod tests {
     fn the_hub_statement_image_is_pinned() {
         assert_eq!(
             SIGNET,
-            hex!("152617b235fb8866611a01eb0abc5e6946392b098658b6b0df23ae756a4dc6b9"),
+            hex!("696d978c9c055a8a365ac9eb65b8ee907b3441f6f0bca1db912f787d63567d7f"),
             "keep every funded contract's pinned guest available when changing opening trust"
         );
         // Emptied at the note format v3, whose build reads no earlier Base:
