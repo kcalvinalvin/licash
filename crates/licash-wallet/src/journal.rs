@@ -70,9 +70,8 @@ impl<T: Transport> Wallet<T> {
             ];
             for sql in ends {
                 let mut stmt = c.prepare(sql)?;
-                let rows = stmt.query_map([], |r| {
-                    Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, i64>(1)?))
-                })?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, i64>(1)?)))?;
                 for row in rows {
                     let (id, at) = row?;
                     journal.ended.insert(hex::encode(id), at);
