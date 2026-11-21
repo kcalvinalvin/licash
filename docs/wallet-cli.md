@@ -62,13 +62,12 @@ one refused for its fee is not retried at a higher one. `optimize <hub>`
 previews a remint with its fee; `optimize <hub> --max-fee SAT` makes it
 now, within that fee and the contract ceilings, bypassing the rests and the
 daily budget. `history` lists a remint as `optimized notes`, with its fee.
-A wallet file is upgraded to version 16 when first opened by this version,
-which older versions refuse: notes unlinked before version 8 begin their
-rest then, no lock reads as claimed by a recovery or owed to the wallet
-on Bitcoin, no payout as paying a silent payment address, no cold storage
-is configured, each hub's deposits are numbered from the seed from then on
-(those made before keep their random secrets and are not looked for), and
-nothing is reminted or asked of a hub by the upgrade itself.
+A wallet file is never migrated: one of another version is refused and left
+as it is. A wallet of the release before note format v3 (wallet schema 3)
+holds notes whose issuance proofs this version does not verify: spend or pay
+out its notes, and let its contracts close, with that release's binary, then
+`init` a new wallet in another file. Hubs of v3 are new hubs, and refuse
+wallets of v2, which refuse them in turn.
 
 `code` prints a payment code (a BIP321 URI, `--qr` for a QR code) naming the
 wallet, the hubs it is paid at and its Nostr mailbox, if they name relays.

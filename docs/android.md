@@ -161,6 +161,17 @@ address shown in Receive. How the app looks and speaks, and the shared parts to 
   way are untouched. Nothing runs on its own: existing wallets see no change
   until a backup, restore or reset is asked for.
 
+## Upgrading from note format v2
+
+A wallet of the release before note format v3 (wallet schema 3) holds notes
+whose issuance proofs this version does not verify. It is refused when the
+app starts ("a wallet of an earlier version"), shown as the wallet's
+problem, and its file is left as it is; a backup of one is refused on
+restore. Before updating, spend or pay out its notes, and let its contracts
+close, with the release before. Its APK installs over this one with the
+wallet's files kept (the version code does not change), so keep a copy.
+Then clear the app's data and create a new wallet: hubs of v3 are new hubs.
+
 ## Build
 
 Needs a JDK 17 or later, the Android SDK (platform 37) with the NDK at
