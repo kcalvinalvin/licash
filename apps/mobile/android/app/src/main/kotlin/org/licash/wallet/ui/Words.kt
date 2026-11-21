@@ -76,6 +76,12 @@ data class Protection(val protected: ULong, val open: ULong) {
 /** How much of `balance` is protected. */
 fun protection(balance: Balance): Protection = Protection(balance.total - balance.credit, balance.credit)
 
+/**
+ * The protection Home says beside the balance: none while one is being set
+ * up (`opening`), which Home says instead, so it never says both.
+ */
+fun homeProtection(balance: Balance, opening: Boolean): Protection? = if (opening) null else protection(balance)
+
 const val PROTECTED = "Protected"
 const val NOT_PROTECTED = "Not protected"
 
@@ -421,6 +427,14 @@ fun lack(insufficient: Boolean, noHub: Boolean, notes: ULong, bitcoin: ULong, of
     bitcoin > 0uL -> Lack.BITCOIN
     else -> Lack.NOTHING
 }
+
+/**
+ * Whether bitcoin held can be added to the balance now: a coin on Bitcoin,
+ * none being added already, and none paying for a protection being set up
+ * (`opening`). Otherwise it is on its way, and only waited for.
+ */
+fun addable(balance: Balance, opening: Boolean): Boolean =
+    balance.onchain > 0uL && balance.moving == 0uL && !opening
 
 /**
  * What is on Bitcoin, paid to the wallet and not its own to keep, that is

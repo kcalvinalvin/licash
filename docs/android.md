@@ -25,8 +25,11 @@ Home says when bitcoin paid to the wallet waits outside the balance and no
 protection is offered for it ("N sat on Bitcoin, not in your balance"); it
 opens the page for what is on Bitcoin, which lists each hub's protection to
 open. A payment that finds too little to pay with, and nothing in notes,
-says so in plain words and sends the payer to that page, or to Receive if
-nothing is held.
+says so in plain words and offers to fix it: "Add to balance" moves the
+largest coin in (unprotected, as it says), "Protect it" opens the
+protection offered for it, if any; a coin still on its way gets no button,
+and with nothing held, Receive. While protection is being set up, Home says
+so instead of how much is protected.
 
 Every tap answers. A button doing work shows it, with the seconds; a sheet
 that starts work stays open on it and gives the reason in place if it

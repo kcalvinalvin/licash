@@ -110,14 +110,17 @@ private sealed interface Step {
     /** A note the hub of a payment would not carry: paid without it if the user says. */
     data class NoNote(val code: String, val amount: ULong?, val hub: String) : Step
 
-    /** Too little in the balance to pay, and bitcoin to protect into it. */
-    data class ProtectFirst(val why: String) : Step
-
-    /** Too little to pay with, nothing to offer, but bitcoin held or on its way: not in the balance yet. */
-    data class AddFirst(val why: String) : Step
+    /**
+     * Too little to pay with, but bitcoin held or on its way, not in the
+     * balance yet: added now if `addable`, or protected first if `offered`.
+     */
+    data class AddFirst(val why: String, val addable: Boolean, val offered: Boolean) : Step
 
     /** Too little to pay with, and nothing held at all. */
     data class NothingYet(val why: String) : Step
+
+    /** A coin on Bitcoin of `amount` being added to the balance. */
+    data class Adding(val amount: ULong) : Step
 }
 
 /**
@@ -134,7 +137,6 @@ fun Send(
     cashOut: String? = null,
     ownAddress: String? = null,
     cashOutAmount: ULong? = null,
-    toBitcoin: (() -> Unit)? = null,
     toReceive: (() -> Unit)? = null,
     back: () -> Unit,
 ) {
@@ -169,9 +171,10 @@ fun Send(
         val why = explain(e)
         val b = ui.balance
         val bitcoin = b.onchain + b.moving + b.opening + ui.incoming.sumOf { it.amount }
+        val addable = addable(b, ui.opening != null)
         return when (lack(e is LicashException.Insufficient, noHub(e), b.notes, bitcoin, ui.offer != null)) {
-            Lack.OFFER -> Step.ProtectFirst(why)
-            Lack.BITCOIN -> Step.AddFirst(why)
+            Lack.OFFER -> Step.AddFirst(why, addable, offered = true)
+            Lack.BITCOIN -> Step.AddFirst(why, addable, offered = false)
             Lack.NOTHING -> Step.NothingYet(why)
             Lack.OTHER -> Step.Failed(why, title)
         }
@@ -503,20 +506,34 @@ fun Send(
                             )
                             is Step.FeeRose -> Ask("The fee went up", feeRose(s.agreed, s.asked), "See new price", s.requote, back)
                             is Step.Failed -> Ask(s.title, s.why, "Try again", { step = Step.Looking }, back, failed = true)
-                            is Step.ProtectFirst -> Ask(
-                                "Protect your bitcoin first",
-                                "${s.why}\n\n$PROTECT_FIRST",
-                                "Protect",
-                                { protecting = true },
-                                back,
-                            )
-                            is Step.AddFirst -> Ask(
+                            is Step.AddFirst -> Outcome(
+                                Tone.ASK,
                                 "Your bitcoin isn't in your balance yet",
-                                "${s.why}\n\n$ADD_FIRST",
-                                "See your bitcoin",
-                                toBitcoin ?: back,
-                                back,
-                            )
+                                "${s.why}\n\n" + addFirst(s.addable, s.offered && offer != null),
+                                detailTag = "ask",
+                            ) {
+                                // On its way only: nothing to do but wait.
+                                if (s.addable) {
+                                    BigButton("Add to balance", Modifier.fillMaxWidth().testTag("add-to-balance")) {
+                                        step = Step.Busy
+                                        scope.launch {
+                                            step = engine.moveLargest().fold(
+                                                { Step.Adding(it.amount) },
+                                                { Step.Failed(explain(it), "Couldn't add it") },
+                                            )
+                                        }
+                                    }
+                                    Spacer(Modifier.height(12.dp))
+                                }
+                                if (s.offered && offer != null) {
+                                    BigButton("Protect it", Modifier.fillMaxWidth().testTag("protect-it"), quiet = true) {
+                                        protecting = true
+                                    }
+                                    Spacer(Modifier.height(12.dp))
+                                }
+                                BigButton("Cancel", Modifier.fillMaxWidth().testTag("cancel"), quiet = true, onClick = back)
+                            }
+                            is Step.Adding -> Told("Adding ${sat(s.amount)}", ADDING, back)
                             is Step.NothingYet -> Ask(
                                 "Nothing to pay with yet",
                                 "${s.why}\n\n$RECEIVE_FIRST",
@@ -532,12 +549,19 @@ fun Send(
     }
 }
 
-/** Why protecting comes before paying, with nothing in the balance yet. */
-internal const val PROTECT_FIRST = "You pay from your balance, and your bitcoin joins it once protected: " +
-    "one of your coins pays for the protection, whole, and what is left of it joins your balance, covered."
+/**
+ * Why bitcoin held is not paid with yet, and what can be done: added now
+ * if `addable`, else only waited for; protected first if `offered`.
+ */
+internal fun addFirst(addable: Boolean, offered: Boolean): String = when {
+    !addable -> "You pay from your balance, and your bitcoin is still on its way to it. Try again once it has arrived."
+    offered -> "You pay from your balance. Add your largest coin to it now, held at your hub without protection, " +
+        "or protect it first: safer, for a fee."
+    else -> "You pay from your balance. Add your largest coin to it now, held at your hub without protection."
+}
 
-/** Why bitcoin held is not paid with yet, and what to do. */
-internal const val ADD_FIRST = "You pay from your balance. Open your bitcoin to protect it and add it to your balance."
+/** A coin being added to the balance, before it can be paid with. */
+internal const val ADDING = "It joins your balance once confirmed on Bitcoin, in about an hour. Pay then."
 
 /** What to do when nothing is held at all. */
 internal const val RECEIVE_FIRST = "You pay from your balance, and it is empty. Receive some first."

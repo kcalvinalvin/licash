@@ -198,7 +198,7 @@ private fun Total(ui: Ui, open: () -> Unit) {
             color = colors.onSurfaceVariant,
         )
     }
-    val held = protection(ui.balance)
+    val held = homeProtection(ui.balance, ui.opening != null) ?: return
     held.label?.let { label ->
         Spacer(Modifier.height(12.dp))
         Pill(

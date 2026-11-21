@@ -1,6 +1,7 @@
 package org.licash.wallet.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -28,6 +29,25 @@ class WordsTest {
         assertEquals(Lack.OTHER, lack(insufficient = false, noHub = true, notes = 40uL, bitcoin = 100uL, offered = false))
         assertEquals(Lack.OTHER, lack(insufficient = true, noHub = false, notes = 40uL, bitcoin = 0uL, offered = false))
         assertEquals(Lack.OTHER, lack(insufficient = false, noHub = false, notes = 0uL, bitcoin = 100uL, offered = false))
+    }
+
+    @Test
+    fun a_coin_on_bitcoin_is_added_at_once_unless_it_is_still_on_its_way() {
+        assertTrue(addable(balance(onchain = 10_000uL), opening = false))
+        // Being added already, paying for protection, or not on Bitcoin yet: only waited for.
+        assertFalse(addable(balance(onchain = 10_000uL).copy(moving = 5_000uL), opening = false))
+        assertFalse(addable(balance(onchain = 10_000uL), opening = true))
+        assertFalse(addable(balance(), opening = false))
+        assertTrue(addFirst(addable = false, offered = true).contains("on its way"))
+        assertTrue(addFirst(addable = true, offered = true).contains("protect it first"))
+        assertFalse(addFirst(addable = true, offered = false).contains("protect it first"))
+    }
+
+    @Test
+    fun home_never_says_protected_while_protection_is_being_set_up() {
+        val held = balance(notes = 10_000uL, covered = 10_000uL)
+        assertEquals(protection(held), homeProtection(held, opening = false))
+        assertNull(homeProtection(held, opening = true))
     }
 
     @Test
