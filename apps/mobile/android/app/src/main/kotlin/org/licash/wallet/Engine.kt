@@ -11,9 +11,12 @@ import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -1667,23 +1670,26 @@ class Engine(context: Context) {
     /**
      * Force contract `id` closed, its hub silent, in the background: the
      * notes at its hub, up to its cap, leave the balance, claimed on
-     * Bitcoin. Told once claimed, or why not.
+     * Bitcoin. Told once claimed, or why not. The result is for whoever
+     * waits on it, and it goes on, and is told, if none does.
      */
-    fun forceClose(id: String) {
+    fun forceClose(id: String): Deferred<Result<Unit>> {
         val light = light
         if (light == null) {
             notices.tryEmit(Event("Not connected to Bitcoin yet: try again in a moment."))
-            return
+            return CompletableDeferred(Result.failure(LicashException.Unavailable("not connected to Bitcoin yet: try again in a moment")))
         }
         AppLog.info("forcing contract $id closed")
-        scope.launch {
+        return scope.async {
             try {
                 val forced = local { it.forceCloseContract(GoChain(light), id) }
                 AppLog.info("contract $id forced closed: ${forced.stage}, ${forced.claimed} sat claimed")
                 notices.tryEmit(Event("Forcing closed: ${sat(forced.claimed)} claimed on Bitcoin"))
+                Result.success(Unit)
             } catch (e: Exception) {
                 AppLog.warn("forcing contract $id closed", e)
                 notices.tryEmit(Event("Not forced closed. ${explain(e)}"))
+                Result.failure<Unit>(e)
             } finally {
                 refresh()
                 poke()
@@ -1694,23 +1700,26 @@ class Engine(context: Context) {
     /**
      * Close contract `id` early with its hub, in the background: what it
      * holds at the hub, up to its cap, and its reserve, back on Bitcoin
-     * in the hub's transaction. Told once it is signed, or why not.
+     * in the hub's transaction. Told once it is signed, or why not. The
+     * result is for whoever waits on it, as [forceClose]'s.
      */
-    fun closeContract(id: String) {
+    fun closeContract(id: String): Deferred<Result<Unit>> {
         val light = light
         if (light == null) {
             notices.tryEmit(Event("Not connected to Bitcoin yet: try again in a moment."))
-            return
+            return CompletableDeferred(Result.failure(LicashException.Unavailable("not connected to Bitcoin yet: try again in a moment")))
         }
         AppLog.info("closing contract $id early")
-        scope.launch {
+        return scope.async {
             try {
                 val fold = local { it.closeContract(GoChain(light), id) }
                 AppLog.info("contract $id closed early by $fold")
                 notices.tryEmit(Event("Closed with the hub: your notes and reserve come back on Bitcoin once its transaction confirms"))
+                Result.success(Unit)
             } catch (e: Exception) {
                 AppLog.warn("closing contract $id early", e)
                 notices.tryEmit(Event("Not closed. ${explain(e)}"))
+                Result.failure<Unit>(e)
             } finally {
                 refresh()
                 poke()

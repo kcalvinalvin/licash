@@ -11,6 +11,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -19,6 +21,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -175,7 +178,11 @@ private fun HubsPage(engine: Engine, ui: Ui) {
     val scope = rememberCoroutineScope()
     var shown by remember { mutableStateOf<Hub?>(null) }
     var optimizing by remember { mutableStateOf<Hub?>(null) }
-    var failed by remember { mutableStateOf<String?>(null) }
+    // Approving a hub's fees: its sheet stays while it is done.
+    var approving by remember { mutableStateOf(false) }
+    var approveError by remember { mutableStateOf<String?>(null) }
+    val approveWait = rememberWait(approving)
+    val feel = rememberFeel()
     fun raised(hub: Hub) = ui.raised.find { it.hub == hub.url }
     if (ui.hubs.isNotEmpty()) {
         Group("") {
@@ -186,7 +193,6 @@ private fun HubsPage(engine: Engine, ui: Ui) {
             }
         }
     }
-    failed?.let { Problem(it) }
     Group("Add a hub") { AddHub(engine) }
     Group("More hubs") { FoundHubs(engine, ui, auto = false) }
     shown?.let { hub ->
@@ -195,11 +201,29 @@ private fun HubsPage(engine: Engine, ui: Ui) {
             full = true,
             raised = raised(hub),
             approve = { r ->
-                shown = null
-                scope.launch { failed = engine.approveFees(r).exceptionOrNull()?.let(::explain) }
+                approving = true
+                approveError = null
+                scope.launch {
+                    engine.approveFees(r)
+                        .onSuccess {
+                            shown = null
+                            feel.confirm()
+                        }
+                        .onFailure {
+                            approveError = explain(it)
+                            feel.reject()
+                        }
+                    approving = false
+                }
             },
             optimize = if (ui.developer) ({ shown = null; optimizing = hub }) else null,
-        ) { shown = null }
+            approving = approving,
+            approveError = approveError,
+            approveWait = approveWait,
+        ) {
+            shown = null
+            approveError = null
+        }
     }
     optimizing?.let { hub -> OptimizeNotes(engine, hub) { optimizing = null } }
 }
@@ -362,6 +386,10 @@ private fun Advanced(engine: Engine, ui: Ui, balance: () -> Unit) {
     val scope = rememberCoroutineScope()
     var logs by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
+    var erasing by remember { mutableStateOf(false) }
+    var eraseError by remember { mutableStateOf<String?>(null) }
+    val eraseWait = rememberWait(erasing)
+    val feel = rememberFeel()
     Group("") {
         Entry("Balance and notes", onClick = balance)
         Divider()
@@ -393,14 +421,31 @@ private fun Advanced(engine: Engine, ui: Ui, balance: () -> Unit) {
         Entry("Delete wallet", tag = "delete-wallet", color = MaterialTheme.colorScheme.error) { deleting = true }
     }
     if (deleting) {
-        Sheet("Delete this wallet?", dismiss = { deleting = false }) {
+        Sheet("Delete this wallet?", dismiss = { deleting = false; eraseError = null }, dismissable = !erasing) {
             Say("What it holds is lost for good, unless you saved a backup file.")
-            BigButton("Delete", Modifier.fillMaxWidth().testTag("delete"), danger = true) {
-                deleting = false
-                scope.launch { engine.delete() }
+            // Stays while it is done: then the first screen shows in its place.
+            BigButton(
+                if (erasing) "Deleting…" else "Delete",
+                Modifier.fillMaxWidth().testTag("delete"),
+                danger = true,
+                busy = erasing,
+            ) {
+                erasing = true
+                eraseError = null
+                scope.launch {
+                    engine.delete()
+                        .onSuccess { deleting = false }
+                        .onFailure {
+                            eraseError = explain(it)
+                            feel.reject()
+                        }
+                    erasing = false
+                }
             }
+            Waited(eraseWait)
+            eraseError?.let { Problem(it) }
             Spacer(Modifier.height(12.dp))
-            BigButton("Cancel", Modifier.fillMaxWidth(), quiet = true) { deleting = false }
+            BigButton("Cancel", Modifier.fillMaxWidth(), enabled = !erasing, quiet = true) { deleting = false; eraseError = null }
         }
     }
 }
@@ -513,10 +558,45 @@ private fun LightClient(engine: Engine) {
     var peers by remember { mutableStateOf(engine.prefs.peers) }
     var cdn by remember { mutableStateOf(engine.prefs.cdn) }
     var explorer by remember { mutableStateOf(engine.prefs.explorer) }
+    // Applying restarts the light client: said while it is, then that it was.
+    var applying by remember { mutableStateOf(false) }
+    var applied by remember { mutableStateOf(false) }
+    var applyError by remember { mutableStateOf<String?>(null) }
+    val applyWait = rememberWait(applying)
+    val feel = rememberFeel()
     Column(Modifier.padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Field(peers, { peers = it }, "Nodes", "host:port, separated by commas")
-        Field(cdn, { cdn = it }, "Block server", "default, a URL, or empty for none")
-        FilledTonalButton(onClick = { scope.launch { engine.setChain(peers, cdn) } }) { Text("Apply") }
+        Field(peers, { peers = it; applied = false }, "Nodes", "host:port, separated by commas")
+        Field(cdn, { cdn = it; applied = false }, "Block server", "default, a URL, or empty for none")
+        FilledTonalButton(
+            enabled = !applying,
+            onClick = {
+                applying = true
+                applied = false
+                applyError = null
+                scope.launch {
+                    engine.setChain(peers, cdn)
+                        .onSuccess {
+                            applied = true
+                            feel.confirm()
+                        }
+                        .onFailure {
+                            applyError = explain(it)
+                            feel.reject()
+                        }
+                    applying = false
+                }
+            },
+            modifier = Modifier.testTag("apply-chain"),
+        ) {
+            if (applying) {
+                CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+            }
+            Text(if (applying) "Applying…" else "Apply")
+        }
+        Waited(applyWait)
+        if (applied) Text("Applied", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        applyError?.let { Problem(it) }
     }
     Divider()
     Row(

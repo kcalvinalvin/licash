@@ -347,7 +347,16 @@ internal fun GiveUpSheet(recovery: Recovery?, busy: Boolean, confirm: () -> Unit
  * `shortfall` of her coins for a challenge's fee, if she holds none.
  */
 @Composable
-internal fun ForceSheet(c: Contract, held: ULong, shortfall: ULong?, force: () -> Unit, dismiss: () -> Unit) {
+internal fun ForceSheet(
+    c: Contract,
+    held: ULong,
+    shortfall: ULong?,
+    busy: Boolean,
+    error: String?,
+    wait: Wait,
+    force: () -> Unit,
+    dismiss: () -> Unit,
+) {
     val claimed = if (held < c.cap) held else c.cap
     Sheet("Force close", dismiss) {
         Say(
@@ -364,7 +373,14 @@ internal fun ForceSheet(c: Contract, held: ULong, shortfall: ULong?, force: () -
             )
         }
         Say("Once its request is signed, it cannot be canceled, even before it is on Bitcoin.")
-        BigButton("Force close", Modifier.fillMaxWidth().testTag("force-close-confirm"), danger = true) { force() }
+        BigButton(
+            if (busy) "Forcing closed…" else "Force close",
+            Modifier.fillMaxWidth().testTag("force-close-confirm"),
+            danger = true,
+            busy = busy,
+        ) { force() }
+        Waited(wait)
+        error?.let { Problem(it) }
     }
 }
 
@@ -437,6 +453,9 @@ internal fun EndSheet(
     c: Contract,
     height: Int,
     held: ULong,
+    busy: Boolean,
+    error: String?,
+    wait: Wait,
     cashOut: () -> Unit,
     close: () -> Unit,
     dismiss: () -> Unit,
@@ -462,10 +481,21 @@ internal fun EndSheet(
             )
         }
         if (ends != null) Say("Otherwise it ends by itself in $ends.")
-        BigButton("Close and receive", Modifier.fillMaxWidth().testTag("end-close")) { close() }
+        BigButton(
+            if (busy) "Closing…" else "Close and receive",
+            Modifier.fillMaxWidth().testTag("end-close"),
+            busy = busy,
+        ) { close() }
         if (held > 0uL) {
             Spacer(Modifier.height(12.dp))
-            BigButton("Cash out ${sat(held)} first", Modifier.fillMaxWidth().testTag("end-cash-out"), quiet = true) { cashOut() }
+            BigButton(
+                "Cash out ${sat(held)} first",
+                Modifier.fillMaxWidth().testTag("end-cash-out"),
+                enabled = !busy,
+                quiet = true,
+            ) { cashOut() }
         }
+        Waited(wait)
+        error?.let { Problem(it) }
     }
 }

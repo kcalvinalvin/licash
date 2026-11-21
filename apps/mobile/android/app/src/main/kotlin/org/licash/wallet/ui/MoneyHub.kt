@@ -66,10 +66,16 @@ internal fun HubPage(
     val held = holding.available + holding.pending
     // Protecting: the hub asked what it costs, then what it quotes.
     var quoting by remember { mutableStateOf(false) }
+    val quoteWait = rememberWait(quoting)
     var quote by remember { mutableStateOf<ContractQuote?>(null) }
     var ending by remember { mutableStateOf<Contract?>(null) }
     var forcing by remember { mutableStateOf<Contract?>(null) }
     var shortfall by remember { mutableStateOf<ULong?>(null) }
+    // A close of `ending` or `forcing`, asked and not done: the sheet may be left, it goes on.
+    var closing by remember { mutableStateOf(false) }
+    var closeError by remember { mutableStateOf<String?>(null) }
+    val closeWait = rememberWait(closing)
+    val feel = rememberFeel()
     var canceling by remember { mutableStateOf<String?>(null) }
     var cancelingBusy by remember { mutableStateOf(false) }
     var allowing by remember { mutableStateOf<String?>(null) }
@@ -110,9 +116,14 @@ internal fun HubPage(
             quiet = true,
         ) { cashOut(holding.hub, null) }
         if (hub?.contracts != null && ui.opening == null) {
-            BigButton("Protect", Modifier.weight(1f).testTag("open-contract"), enabled = !quoting) { protect() }
+            BigButton(
+                if (quoting) "Asking…" else "Protect",
+                Modifier.weight(1f).testTag("open-contract"),
+                busy = quoting,
+            ) { protect() }
         }
     }
+    Waited(quoteWait, Modifier.padding(horizontal = 4.dp, vertical = 4.dp))
     if (suggest && ui.opening == null) {
         Group("Not protected") {
             Text(
@@ -121,7 +132,11 @@ internal fun HubPage(
                 style = MaterialTheme.typography.bodyMedium,
             )
             Row(Modifier.padding(bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                BigButton("Protect", Modifier.weight(1f).testTag("suggest-protect"), enabled = !quoting) { protect() }
+                BigButton(
+                    if (quoting) "Asking…" else "Protect",
+                    Modifier.weight(1f).testTag("suggest-protect"),
+                    busy = quoting,
+                ) { protect() }
                 BigButton("Cash out part", Modifier.weight(1f).testTag("suggest-cash-out"), quiet = true) {
                     cashOut(holding.hub, cover.missing)
                 }
@@ -221,15 +236,33 @@ internal fun HubPage(
             c,
             ui.chain.height,
             holding.available,
+            busy = closing,
+            error = closeError,
+            wait = closeWait,
             cashOut = {
                 ending = null
                 cashOut(c.hub, null)
             },
             close = {
-                ending = null
-                engine.closeContract(c.id)
+                closing = true
+                closeError = null
+                scope.launch {
+                    engine.closeContract(c.id).await()
+                        .onSuccess {
+                            ending = null
+                            feel.confirm()
+                        }
+                        .onFailure {
+                            closeError = explain(it)
+                            feel.reject()
+                        }
+                    closing = false
+                }
             },
-            dismiss = { ending = null },
+            dismiss = {
+                ending = null
+                closeError = null
+            },
         )
     }
     forcing?.let { c ->
@@ -238,14 +271,30 @@ internal fun HubPage(
             c,
             held,
             shortfall,
+            busy = closing,
+            error = closeError,
+            wait = closeWait,
             force = {
-                forcing = null
-                shortfall = null
-                engine.forceClose(c.id)
+                closing = true
+                closeError = null
+                scope.launch {
+                    engine.forceClose(c.id).await()
+                        .onSuccess {
+                            forcing = null
+                            shortfall = null
+                            feel.confirm()
+                        }
+                        .onFailure {
+                            closeError = explain(it)
+                            feel.reject()
+                        }
+                    closing = false
+                }
             },
             dismiss = {
                 forcing = null
                 shortfall = null
+                closeError = null
             },
         )
     }

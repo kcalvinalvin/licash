@@ -75,10 +75,13 @@ internal fun HubFees(
     raised: FeesRaised? = null,
     approve: (FeesRaised) -> Unit = {},
     optimize: (() -> Unit)? = null,
+    approving: Boolean = false,
+    approveError: String? = null,
+    approveWait: Wait? = null,
     dismiss: () -> Unit,
 ) {
     val blockSecs = LocalBlockSeconds.current
-    Sheet(if (full) name(hub.url) else "Fees and limits", dismiss) {
+    Sheet(if (full) name(hub.url) else "Fees and limits", dismiss, dismissable = !approving) {
         if (full) {
             SelectionContainer {
                 Text(
@@ -98,7 +101,13 @@ internal fun HubFees(
                 }
             }
             Problem(RAISED_MEANS, error = false)
-            BigButton("Approve fees", Modifier.fillMaxWidth().testTag("approve-fees")) { approve(r) }
+            BigButton(
+                if (approving) "Approving…" else "Approve fees",
+                Modifier.fillMaxWidth().testTag("approve-fees"),
+                busy = approving,
+            ) { approve(r) }
+            Waited(approveWait)
+            approveError?.let { Problem(it) }
         }
         // What a payment costs, a section a direction: limits under each.
         Group("Paying") {
@@ -231,6 +240,7 @@ internal fun AddHub(engine: Engine, action: String = "Add") {
     var url by remember { mutableStateOf("") }
     var adding by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    val feel = rememberFeel()
     Row(
         Modifier.fillMaxWidth().padding(vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -250,7 +260,9 @@ internal fun AddHub(engine: Engine, action: String = "Add") {
             onClick = {
                 adding = true
                 scope.launch {
-                    engine.addHub(url.trim()).onSuccess { url = ""; error = null }.onFailure { error = explain(it) }
+                    engine.addHub(url.trim())
+                        .onSuccess { url = ""; error = null; feel.confirm() }
+                        .onFailure { error = explain(it); feel.reject() }
                     adding = false
                 }
             },
@@ -273,12 +285,15 @@ internal fun FoundHubs(engine: Engine, ui: Ui, auto: Boolean) {
     var found by remember { mutableStateOf<HubsFound?>(null) }
     var looking by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    // The one picked, in its sheet, until it is added; `joining` while it is.
     var adding by remember { mutableStateOf<FoundHub?>(null) }
-    // The one being added, once picked, then the last added.
-    var joining by remember { mutableStateOf<String?>(null) }
+    var joining by remember { mutableStateOf(false) }
+    var joinError by remember { mutableStateOf<String?>(null) }
+    // The last added, said under the list.
     var joined by remember { mutableStateOf<String?>(null) }
+    val feel = rememberFeel()
     val lookWait = rememberWait(looking)
-    val joinWait = rememberWait(joining != null)
+    val joinWait = rememberWait(joining)
     fun look() {
         looking = true
         error = null
@@ -306,12 +321,12 @@ internal fun FoundHubs(engine: Engine, ui: Ui, auto: Boolean) {
         Text(if (looking) "Looking…" else if (found == null) "Find hubs" else "Look again")
     }
     Waited(lookWait, Modifier.padding(start = 12.dp))
-    (joining?.let { "Adding $it…" } ?: joined?.let { "Added $it" })?.let {
-        Text(it, Modifier.padding(start = 12.dp, top = 8.dp).testTag("joining"), style = MaterialTheme.typography.bodyMedium)
-        Waited(joinWait, Modifier.padding(start = 12.dp))
+    joined?.let {
+        Text("Added $it", Modifier.padding(start = 12.dp, top = 8.dp).testTag("joined"), style = MaterialTheme.typography.bodyMedium)
     }
     adding?.let { f ->
-        Sheet(f.name ?: name(f.hub.url), dismiss = { adding = null }) {
+        val named = f.name ?: name(f.hub.url)
+        Sheet(named, dismiss = { adding = null; joinError = null }, dismissable = !joining) {
             Text(
                 f.hub.url,
                 modifier = Modifier.padding(bottom = 8.dp).testTag("found-url"),
@@ -321,16 +336,31 @@ internal fun FoundHubs(engine: Engine, ui: Ui, auto: Boolean) {
             )
             Line("Paying", paying(f.hub))
             Say("Add it only if you trust who runs it.")
-            BigButton("Add hub", Modifier.fillMaxWidth().testTag("add-hub")) {
-                adding = null
-                val named = f.name ?: name(f.hub.url)
-                joining = named
-                joined = null
+            // Stays here while it is added, which asks the hub a few times:
+            // closed once it is, or why not said under the button.
+            BigButton(
+                if (joining) "Adding…" else "Add hub",
+                Modifier.fillMaxWidth().testTag("add-hub"),
+                busy = joining,
+            ) {
+                joining = true
+                joinError = null
                 scope.launch {
-                    engine.addHub(f.hub.url).onSuccess { joined = named }.onFailure { error = explain(it) }
-                    joining = null
+                    engine.addHub(f.hub.url)
+                        .onSuccess {
+                            joined = named
+                            adding = null
+                            feel.confirm()
+                        }
+                        .onFailure {
+                            joinError = explain(it)
+                            feel.reject()
+                        }
+                    joining = false
                 }
             }
+            Waited(joinWait)
+            joinError?.let { Problem(it) }
         }
     }
 }

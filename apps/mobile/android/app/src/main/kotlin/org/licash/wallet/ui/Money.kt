@@ -95,8 +95,8 @@ fun Money(
         }
         val fail = { why: String -> error = why }
         when (at) {
-            null -> Summary(engine, ui, held, notes, visited, go, fail) { changed++ }
-            ON_BITCOIN -> OnBitcoin(engine, ui, fail)
+            null -> Summary(engine, ui, held, notes, visited, go) { changed++ }
+            ON_BITCOIN -> OnBitcoin(engine, ui)
             else -> HubPage(
                 engine,
                 ui,
@@ -125,7 +125,6 @@ private fun Summary(
     notes: List<Notes>,
     visited: List<Holding>,
     go: (String?) -> Unit,
-    fail: (String) -> Unit,
     changed: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
@@ -134,6 +133,10 @@ private fun Summary(
     val scope = rememberCoroutineScope()
     // A hub only visited the owner asks about, by its URL.
     var adding by remember { mutableStateOf<String?>(null) }
+    var joining by remember { mutableStateOf(false) }
+    var joinError by remember { mutableStateOf<String?>(null) }
+    val feel = rememberFeel()
+    val joinWait = rememberWait(joining)
     Text(sat(share.total), modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp), style = Heading)
     if (share.total > 0uL) {
         Row(
@@ -179,15 +182,32 @@ private fun Summary(
         }
     }
     adding?.let { url ->
-        Sheet(name(url), dismiss = { adding = null }) {
+        Sheet(name(url), dismiss = { adding = null; joinError = null }, dismissable = !joining) {
             Say("Left over from paying someone at this hub. Add the hub to use it: only if you trust who runs it.")
-            BigButton("Add hub", Modifier.fillMaxWidth().testTag("add-visited")) {
-                adding = null
+            // Stays while the hub is added; closed once it is, else why not under it.
+            BigButton(
+                if (joining) "Adding…" else "Add hub",
+                Modifier.fillMaxWidth().testTag("add-visited"),
+                busy = joining,
+            ) {
+                joining = true
+                joinError = null
                 scope.launch {
-                    engine.addHub(url).onFailure { fail(explain(it)) }
+                    engine.addHub(url)
+                        .onSuccess {
+                            adding = null
+                            feel.confirm()
+                        }
+                        .onFailure {
+                            joinError = explain(it)
+                            feel.reject()
+                        }
                     changed()
+                    joining = false
                 }
             }
+            Waited(joinWait)
+            joinError?.let { Problem(it) }
         }
     }
 }
@@ -213,12 +233,17 @@ private fun Share(icon: ImageVector, tint: Color, label: String, amount: ULong, 
  * once warned.
  */
 @Composable
-private fun OnBitcoin(engine: Engine, ui: Ui, fail: (String) -> Unit) {
+private fun OnBitcoin(engine: Engine, ui: Ui) {
     val b = ui.balance
     val scope = rememberCoroutineScope()
     val coming = ui.incoming.sumOf { it.amount }
     var choosing by remember { mutableStateOf(false) }
     var warned by remember { mutableStateOf(false) }
+    // Adding without protection, once confirmed: the sheet stays while it is done.
+    var adding by remember { mutableStateOf(false) }
+    var addError by remember { mutableStateOf<String?>(null) }
+    val feel = rememberFeel()
+    val addWait = rememberWait(adding)
     Text(
         sat(b.onchain + b.moving + b.opening),
         modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp),
@@ -249,12 +274,31 @@ private fun OnBitcoin(engine: Engine, ui: Ui, fail: (String) -> Unit) {
     }
     if (choosing && offer != null) OfferSheet(engine, offer) { choosing = false }
     if (warned) {
-        Sheet("Not protected", dismiss = { warned = false }) {
+        Sheet("Not protected", dismiss = { warned = false; addError = null }, dismissable = !adding) {
             Say(UNPROTECTED_MOVE)
-            BigButton("Add anyway", Modifier.fillMaxWidth().testTag("move-in-anyway"), danger = true) {
-                warned = false
-                scope.launch { engine.moveLargest().onFailure { fail(explain(it)) } }
+            BigButton(
+                if (adding) "Adding…" else "Add anyway",
+                Modifier.fillMaxWidth().testTag("move-in-anyway"),
+                danger = true,
+                busy = adding,
+            ) {
+                adding = true
+                addError = null
+                scope.launch {
+                    engine.moveLargest()
+                        .onSuccess {
+                            warned = false
+                            feel.confirm()
+                        }
+                        .onFailure {
+                            addError = explain(it)
+                            feel.reject()
+                        }
+                    adding = false
+                }
             }
+            Waited(addWait)
+            addError?.let { Problem(it) }
         }
     }
 }
