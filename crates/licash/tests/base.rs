@@ -374,6 +374,20 @@ fn absent_or_unsupported_base_terms_are_rejected_not_defaulted() {
     }
 }
 
+/// A Base reads, of one spend or claim, at least the notes of any spend a
+/// proposal may be and a claim of every item beside her lock's refund.
+#[test]
+fn a_base_reads_every_spend_a_proposal_may_be() {
+    let least = licash::base::MIN_AUTHORIZATIONS;
+    assert!(least as usize >= licash::spend::MAX_INPUTS + licash::claim::MAX_ITEMS);
+    let mut p = parts();
+    p.limits.max_authorizations = least - 1;
+    assert!(Base::new(p).is_err());
+    let mut p = parts();
+    p.limits.max_authorizations = least;
+    assert!(Base::new(p).is_ok());
+}
+
 /// A work depth at the most a field holds is refused, never overflowed.
 #[test]
 fn a_work_depth_at_the_most_is_refused_without_overflow() {

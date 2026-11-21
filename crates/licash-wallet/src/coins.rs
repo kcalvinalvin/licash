@@ -3,9 +3,8 @@
 
 use licash_api::NoteFee;
 
-/// The most notes one payment spends, which keeps a spend and its grant
-/// well within what a hub reads.
-pub const MAX_INPUTS: usize = 64;
+/// The most notes one payment spends: the most a proposal may.
+pub const MAX_INPUTS: usize = licash::spend::MAX_INPUTS;
 
 /// `amount` in the fewest notes of `denoms`, largest first. None if the
 /// denominations cannot make it.

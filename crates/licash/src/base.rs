@@ -24,6 +24,13 @@ const MAX_MONEY: u64 = 2_100_000_000_000_000;
 /// The one graph a Base can name: Lichen's hub-proves graph.
 pub const GRAPH_VERSION: u32 = 2;
 
+/// The fewest notes a Base's statement may read of one spend or one claim
+/// (`Limits::max_authorizations`): every spend's
+/// ([`crate::spend::MAX_INPUTS`]), so that any is evidence the Hub can cite,
+/// and a claim of all the items there may be beside the refund of a lock of
+/// her own that many notes, each of whose inputs authorizes it.
+pub const MIN_AUTHORIZATIONS: u32 = (crate::spend::MAX_INPUTS + crate::claim::MAX_ITEMS) as u32;
+
 fn bad(reason: &str) -> Error {
     Error::Protocol(reason.into())
 }
@@ -323,7 +330,7 @@ impl Base {
         if !(60..=4_000_000).contains(&limits.max_transaction_bytes)
             || limits.max_publication_bytes == 0
             || limits.max_publication_bytes > limits.max_transaction_bytes
-            || limits.max_authorizations < 32
+            || limits.max_authorizations < MIN_AUTHORIZATIONS
             || limits.max_source_inputs == 0
         {
             return Err(bad("native resource limits"));

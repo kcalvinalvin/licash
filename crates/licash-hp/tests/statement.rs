@@ -453,6 +453,84 @@ fn export_inputs() {
     }
 }
 
+/// With `LICASH_HP_INPUTS` set, the statement's input of the most evidence
+/// a claim may need (`worst.bin`, docs/r0.md): each of her 32 settled notes
+/// spent in a spend of its own of the most inputs a proposal may have, 63
+/// other notes of hers with it, all cited. Printed: its bytes and how long
+/// the statement takes natively, beside the answered input's.
+#[test]
+fn export_worst_inputs() {
+    let Ok(dir) = std::env::var("LICASH_HP_INPUTS") else {
+        return;
+    };
+    use licash::spend::MAX_INPUTS;
+    let issuer = IssuerKeys::random(3).unwrap();
+    let keyset = issuer.keyset().unwrap();
+    let base = base_on(keyset.clone(), 53, graph());
+    let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
+    let notes: Vec<_> = ds.iter().map(|d| mint(&issuer, &keyset, d)).collect();
+    let bob = HoldRoot::from_seed(&[9; 32]).unwrap();
+    let others = MAX_INPUTS as u32 - 1;
+    let spends: Vec<_> = (0..32u32)
+        .map(|i| {
+            let shared = 100 + i as u8;
+            let mut inputs = vec![notes[i as usize].clone()];
+            inputs.extend(
+                (0..others).map(|j| mint(&issuer, &keyset, &derive(SPEND, &hold(), 4, shared, j))),
+            );
+            let mut owners = vec![owner(SPEND, 23, i)];
+            owners.extend((0..others).map(|j| owner(SPEND, shared, j)));
+            // 64 * 4 = 256 = 32 * 8.
+            let to = (0..32)
+                .map(|j| Output::from_derivation(&derive(41, &bob, 8, shared, j)).unwrap())
+                .collect();
+            let proposal = Proposal::new(&keyset, &inputs, point(43), to, None).unwrap();
+            let signed =
+                SignedProposal::sign(&keyset, proposal, &inputs, Authorization::Plain, &owners)
+                    .unwrap();
+            Evidence::Spend {
+                signed,
+                notes: inputs,
+                unlock: None,
+            }
+        })
+        .collect();
+    let parts = claim::Parts {
+        items: ds
+            .iter()
+            .map(|d| Item::Settled(d.message().clone()))
+            .collect(),
+        sources: vec![],
+        activations: vec![],
+        authorizations: sorted(&ds),
+    };
+    let witness = Witness {
+        notes: notes.clone(),
+        sources: vec![],
+        activations: vec![],
+        funded: vec![],
+    };
+    let f = file(issuer, base, parts, &ds, 128, witness);
+    let x = exit(&f.base, f.b, &f.e, &f.bytes, 0);
+    let (owed, _) = decide(&f.base, &keys(), &x, &spends).unwrap();
+    assert_eq!(owed.owed, 0);
+    let worst = input(&f.base, x, spends);
+    let (a, spent) = stale();
+    let answered = input(&a.base, exit(&a.base, a.b, &a.e, &a.bytes, 64), vec![spent]);
+    for (name, i) in [("worst", worst), ("answered", answered)] {
+        let bytes = i.to_bytes();
+        let start = std::time::Instant::now();
+        let read = HubInput::from_bytes(&bytes).unwrap();
+        check(&read).unwrap();
+        println!(
+            "{name}: {} input bytes, read and checked natively in {:?}",
+            bytes.len(),
+            start.elapsed()
+        );
+        std::fs::write(format!("{dir}/{name}.bin"), bytes).unwrap();
+    }
+}
+
 #[test]
 fn the_contract_is_bases() {
     let issuer = IssuerKeys::random(3).unwrap();
@@ -1330,4 +1408,64 @@ mod chained {
             std::fs::write(format!("{dir}/{name}.bin"), bytes).unwrap();
         }
     }
+}
+
+/// [`stale`], but the 16 notes she paid away after her backup went out in
+/// one spend of the most a proposal may be: 48 more of hers with them, to
+/// the most outputs. The guest's input reads it back
+/// (`HubInput::from_bytes`), and the statement holds of the response it
+/// decides: the hub proves what its evidence voids. Of more, no proposal
+/// is made, nor released by a hub (formerly, one of 129 notes was, and no
+/// statement could read it).
+#[test]
+fn the_largest_spend_a_proposal_may_be_is_proven_against_a_claim() {
+    use licash::spend::{MAX_INPUTS, MAX_OUTPUTS};
+    let issuer = IssuerKeys::random(3).unwrap();
+    let keyset = issuer.keyset().unwrap();
+    let base = base_on(keyset.clone(), 53, graph());
+    let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
+    let notes: Vec<_> = ds.iter().map(|d| mint(&issuer, &keyset, d)).collect();
+    let extra = MAX_INPUTS as u32 - 16;
+    let extra_ds: Vec<_> = (0..extra)
+        .map(|i| derive(SPEND, &hold(), 4, 24, i))
+        .collect();
+    let mut inputs = notes[..16].to_vec();
+    inputs.extend(extra_ds.iter().map(|d| mint(&issuer, &keyset, d)));
+    let mut owners: Vec<_> = (0..16).map(|i| owner(SPEND, 23, i)).collect();
+    owners.extend((0..extra).map(|i| owner(SPEND, 24, i)));
+    let bob = HoldRoot::from_seed(&[9; 32]).unwrap();
+    // 64 * 4 = 256 = 128 * 2.
+    let to: Vec<_> = (0..MAX_OUTPUTS as u32)
+        .map(|i| Output::from_derivation(&derive(41, &bob, 2, 29, i)).unwrap())
+        .collect();
+    let proposal = Proposal::new(&keyset, &inputs, point(43), to, None).unwrap();
+    let signed =
+        SignedProposal::sign(&keyset, proposal, &inputs, Authorization::Plain, &owners).unwrap();
+    let parts = claim::Parts {
+        items: ds
+            .iter()
+            .map(|d| Item::Settled(d.message().clone()))
+            .collect(),
+        sources: vec![],
+        activations: vec![],
+        authorizations: sorted(&ds),
+    };
+    let witness = Witness {
+        notes: notes.clone(),
+        sources: vec![],
+        activations: vec![],
+        funded: vec![],
+    };
+    let f = file(issuer, base, parts, &ds, 128, witness);
+    let spent = Evidence::Spend {
+        signed,
+        notes: inputs,
+        unlock: None,
+    };
+    let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
+    let (owed, _) = decide(&f.base, &keys(), &x, std::slice::from_ref(&spent)).unwrap();
+    assert_eq!(owed.owed, 64);
+    let bytes = input(&f.base, x, vec![spent]).to_bytes();
+    let read = HubInput::from_bytes(&bytes).expect("the guest reads the spend back");
+    assert!(check(&read).is_ok());
 }

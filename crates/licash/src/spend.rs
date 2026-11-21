@@ -14,6 +14,19 @@ use crate::{
 
 const TAG: &[u8] = b"LICASH-SP\x02";
 pub const OUTPUT_BYTES: usize = 8 + 33 + 32;
+
+/// The most inputs a proposal spends. A spend is evidence against a claim
+/// of any of its notes, and a statement reads at most its Base's
+/// `max_authorizations` notes of one (never fewer than this,
+/// [`crate::base`]): a spend of more could never be cited, and a hub that
+/// retired its notes would answer nothing to a claim of one.
+pub const MAX_INPUTS: usize = 64;
+
+/// The most outputs of one branch of a proposal: two splits of an amount in
+/// every denomination a keyset has, a payment and its change. With
+/// [`MAX_INPUTS`], its signed proposal fits the bytes a statement reads of
+/// one ([`crate::recovery::MAX_PUBLICATION_BYTES`]), granted or a lock.
+pub const MAX_OUTPUTS: usize = 128;
 pub const TIMED_TERMS_BYTES: usize = 1 + 32 + 4 + 4 + 32;
 
 fn bad(reason: &str) -> Error {
@@ -322,7 +335,7 @@ impl std::fmt::Debug for TimedLock {
 
 impl TimedLock {
     pub fn new(terms: TimedTerms, refund: Vec<Output>) -> Result<Self, Error> {
-        count(&refund)?;
+        bounded(&refund, MAX_OUTPUTS)?;
         Ok(Self { terms, refund })
     }
     pub fn terms(&self) -> &TimedTerms {
@@ -438,8 +451,7 @@ impl Proposal {
 
     fn verify_structure(&self) -> Result<(), Error> {
         non_identity(&self.eph)?;
-        count(&self.inputs)?;
-        count(&self.outputs)?;
+        bounded(&self.inputs, MAX_INPUTS)?;
         let mut seen = BTreeSet::new();
         let mut total = 0u128;
         for input in &self.inputs {
@@ -452,7 +464,7 @@ impl Proposal {
         }
         let mut targets = BTreeSet::new();
         let mut check_outputs = |outputs: &[Output]| -> Result<(), Error> {
-            count(outputs)?;
+            bounded(outputs, MAX_OUTPUTS)?;
             let mut value = 0u128;
             for output in outputs {
                 non_identity(&output.blinded)?;
@@ -554,6 +566,14 @@ fn count<T>(items: &[T]) -> Result<u32, Error> {
         return Err(bad("empty proposal vector"));
     }
     u32::try_from(items.len()).map_err(|_| bad("proposal count overflow"))
+}
+
+/// [`count`], and no more than `most`.
+fn bounded<T>(items: &[T], most: usize) -> Result<u32, Error> {
+    if items.len() > most {
+        return Err(bad("more inputs or outputs than a proposal may have"));
+    }
+    count(items)
 }
 
 /// The commitment a Base makes to the outputs its holder funds, in

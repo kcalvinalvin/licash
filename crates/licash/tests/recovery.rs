@@ -3188,3 +3188,55 @@ fn a_lock_a_lean_filing_shows_voids_any_other_claim_of_its_inputs() {
     let none = recovery::owed(&o.base, &request, &unsigned, &[], &chain).unwrap();
     assert!(none.owed == 0 && none.ineligible.is_some());
 }
+
+/// Every spend a proposal may be is evidence every Base's statement reads:
+/// the most inputs and outputs, granted, decode under the fewest notes a
+/// Base admits, and a proposal of one more input or output is none. A hub
+/// retiring the notes of a spend its statement cannot read would answer
+/// nothing to a claim of one, and her timeout pay her for it.
+#[test]
+fn the_largest_spend_a_proposal_may_be_is_evidence_under_every_base() {
+    use licash::spend::{MAX_INPUTS, MAX_OUTPUTS};
+    let o = open_with(7);
+    let keyset = o.base.parts().keyset.clone();
+    let ds: Vec<_> = (0..MAX_INPUTS as u32)
+        .map(|i| derive(SPEND, &hold(), 2, 23, i))
+        .collect();
+    let notes: Vec<_> = ds.iter().map(|d| mint(&o.issuer, &keyset, d)).collect();
+    let owners: Vec<_> = (0..MAX_INPUTS as u32)
+        .map(|i| owner(SPEND, 23, i))
+        .collect();
+    let to = |n: usize| (0..n as u32).map(|i| bob(1, i)).collect::<Vec<_>>();
+    let proposal = Proposal::new(&keyset, &notes, point(43), to(MAX_OUTPUTS), None).unwrap();
+    let prepared = PreparedGrant::new(&o.issuer, &proposal).unwrap();
+    let signed = SignedProposal::sign(
+        &keyset,
+        proposal,
+        &notes,
+        Authorization::Granted(Box::new(prepared.offer())),
+        &owners,
+    )
+    .unwrap();
+    assert!(signed.to_bytes().len() <= recovery::MAX_PUBLICATION_BYTES);
+    let unlock = prepared.release(&keyset, &notes, &signed).unwrap();
+    let evidence = [Evidence::Spend {
+        signed,
+        notes: notes.clone(),
+        unlock: Some(unlock),
+    }];
+    let least = licash::base::MIN_AUTHORIZATIONS as usize;
+    let read = evidence_from_bytes(&keyset, least, &evidence_to_bytes(&evidence)).unwrap();
+    assert_eq!(read.len(), 1);
+
+    // One more output, or one more input, is no proposal.
+    assert!(Proposal::new(&keyset, &notes, point(43), to(MAX_OUTPUTS + 1), None).is_err());
+    let mut more = notes.clone();
+    more.push(mint(&o.issuer, &keyset, &derive(SPEND, &hold(), 2, 23, 99)));
+    let balanced: Vec<_> = (0..more.len() as u32).map(|i| bob(2, i)).collect();
+    assert!(Proposal::new(&keyset, &more, point(43), balanced.clone(), None).is_err());
+    assert!(Proposal::new(&keyset, &more[1..], point(43), balanced[1..].to_vec(), None).is_ok());
+    // Nor a lock of one more refund output.
+    let refund = TimedLock::new(terms(), to(MAX_OUTPUTS + 1));
+    assert!(refund.is_err());
+    assert!(TimedLock::new(terms(), to(MAX_OUTPUTS)).is_ok());
+}
