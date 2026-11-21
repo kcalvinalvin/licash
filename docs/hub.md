@@ -38,7 +38,9 @@ done with it.
 
 `status` shows income, released payments and open locks. `status --details`
 adds the internal note and event counts; `status --json` keeps the full
-machine-readable statistics. Normal text logs omit timestamps and Rust
+machine-readable statistics. `audit` lists the spends the ledger retired
+notes for that no contract's dispute can cite, and fails if there are any
+(see [Upgrading](#upgrading)). Normal text logs omit timestamps and Rust
 targets. Configuration is diagnostic detail (`RUST_LOG=debug`); warnings
 remain visible. `--log json` retains structured logging.
 
@@ -472,7 +474,15 @@ the claimed notes for (owner-signed, a granted one with its unlock), the locks o
 gave them up by, other claims of them, and, for each timed lock the claim names, the branch it did
 not settle it on (its preimage, or its expiry). A candidate its statement
 refuses, or that voids nothing but items not valid anyway, is left out
-alone, and the others cited. While its ledger gives it
+alone, and the others cited. So that each spend is one it can cite, the
+hub releases and locks none of more than 64 notes or whose evidence (its
+notes and signed proposal) is over 64,000 bytes: refused as invalid
+(`licash::spend::MAX_INPUTS`, `licash_hub::MAX_EVIDENCE_BYTES`), its notes
+not retired. A record its ledger holds against the claim and cannot cite
+(one it cannot read back, or one its statement cannot) is evidence lost:
+an alert names the contract and why at once, on the first round it
+decides, since nothing the hub does by itself will cite it. `licash-hub
+audit` lists such spends of a ledger beforehand. While its ledger gives it
 no evidence (its scan behind the claim's block, a halt), it responds
 nothing and tries again at each poll; once half the blocks it may respond
 in are gone, an alert names the contract and why, and the hub answers on
@@ -756,6 +766,30 @@ again. Before starting it:
   lacking one responds to none of its contested claims.
 - Expect no migration: a database or file of an earlier layout is refused
   by name, never read nor replaced.
+
+### From a ledger of schema 1
+
+A hub of note format v3 reads a `hub.sqlite` of ledger schema 2 only, and
+its contracts run a rebuilt program, whose statement reads no proposal of
+more than 64 inputs or 128 outputs a branch. Nothing of a schema 1 ledger
+carries over: its contracts end under the hub that opened them.
+
+1. On the old binary, stop new openings: restart it with
+   `--contracts-max-live 1`, which refuses an opening while any contract is
+   live.
+2. Find the spends its ledger retired notes for that no dispute can cite
+   (a release before refused none): `licash-hub audit` (read-only; beside
+   the running hub or without it, `--json` for a list). Each of these
+   spends' notes, claimed on Bitcoin, goes unanswered and its holder's
+   timeout pays her for it: the loss is the hub's. The command fails while
+   it finds any. Back up `hub.sqlite` with the list.
+3. Have every contract closed. The hub closes none by itself: each holder
+   closes hers early from her app (her claim folded into the close), or it
+   ends at its close height. Keep the old hub running, answering, until
+   each close and each claim under way is buried.
+4. Once holders have spent their notes of it down, stop it, move `<data>`
+   aside (keep it: its seed and ledger), and make a hub anew with `init` in
+   a new `<data>`, its programs installed.
 
 Contracts opened before keep their graph, program and reserve; only new openings take the new
 graph, and apps older than it open none until they are updated. Read the
