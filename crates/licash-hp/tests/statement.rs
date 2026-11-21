@@ -447,10 +447,18 @@ fn export_inputs() {
     };
     let (f, spent) = stale();
     println!("filing: {} bytes", f.bytes.len());
-    let answered = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 64), vec![cite(spent)]);
+    let answered = input(
+        &f.base,
+        exit(&f.base, f.b, &f.e, &f.bytes, 64),
+        vec![cite(spent)],
+    );
     let unanswered = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 127), vec![]);
     let (f, spent) = funded_notes();
-    let funded = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 64), vec![cite(spent)]);
+    let funded = input(
+        &f.base,
+        exit(&f.base, f.b, &f.e, &f.bytes, 64),
+        vec![cite(spent)],
+    );
     let inputs = [
         ("answered", answered),
         ("unanswered", unanswered),
@@ -465,43 +473,48 @@ fn export_inputs() {
 
 /// With `LICASH_HP_INPUTS` set, the statement's input of the most evidence
 /// a claim may need (`worst.bin`, docs/r0.md): each of her 32 settled notes
-/// spent in a spend of its own of the most inputs a proposal may have, 63
-/// other notes of hers with it, all cited. Printed: its bytes and how long
-/// the statement takes natively, beside the answered input's.
+/// spent in a spend of its own of the most inputs and outputs a proposal
+/// may have, 63 other notes with it, each cited as the Hub cites it, by her
+/// signature alone; and `worst-alone.bin`, each spent alone to one output,
+/// whose bodies are the least. Printed: their bytes, of which their
+/// spends' bodies, and how long the statement takes natively, beside the
+/// answered input's.
 #[test]
 fn export_worst_inputs() {
     let Ok(dir) = std::env::var("LICASH_HP_INPUTS") else {
         return;
     };
-    use licash::spend::MAX_INPUTS;
+    use licash::spend::{MAX_INPUTS, MAX_OUTPUTS};
     let issuer = IssuerKeys::random(3).unwrap();
     let keyset = issuer.keyset().unwrap();
     let base = base_on(keyset.clone(), 53, graph());
     let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
     let notes: Vec<_> = ds.iter().map(|d| mint(&issuer, &keyset, d)).collect();
     let bob = HoldRoot::from_seed(&[9; 32]).unwrap();
-    let others = MAX_INPUTS as u32 - 1;
-    let spends: Vec<_> = (0..32u32)
-        .map(|i| {
-            let shared = 100 + i as u8;
-            let mut inputs = vec![notes[i as usize].clone()];
-            inputs.extend(
-                (0..others).map(|j| mint(&issuer, &keyset, &derive(SPEND, &hold(), 4, shared, j))),
-            );
-            let mut owners = vec![owner(SPEND, 23, i)];
-            owners.extend((0..others).map(|j| owner(SPEND, shared, j)));
-            // 64 * 4 = 256 = 32 * 8.
-            let to = (0..32)
-                .map(|j| Output::from_derivation(&derive(41, &bob, 8, shared, j)).unwrap())
-                .collect();
-            let proposal = Proposal::new(&keyset, &inputs, point(43), to, None).unwrap();
-            let signed =
-                SignedProposal::sign(&keyset, proposal, &inputs, Authorization::Plain, &owners)
-                    .unwrap();
-            // As the Hub cites it: by the signature of her note alone.
-            licash::recovery::by_signature(&signed, None, &[0].into()).unwrap()
-        })
-        .collect();
+    let spends = |others: u32, outputs: u32| -> Vec<Evidence> {
+        (0..32u32)
+            .map(|i| {
+                let shared = 100 + i as u8;
+                let mut inputs = vec![notes[i as usize].clone()];
+                inputs.extend(
+                    (0..others)
+                        .map(|j| mint(&issuer, &keyset, &derive(SPEND, &hold(), 4, shared, j))),
+                );
+                let mut owners = vec![owner(SPEND, 23, i)];
+                owners.extend((0..others).map(|j| owner(SPEND, shared, j)));
+                let denom = 4 * u64::from(others + 1) / u64::from(outputs);
+                let to = (0..outputs)
+                    .map(|j| Output::from_derivation(&derive(41, &bob, denom, shared, j)).unwrap())
+                    .collect();
+                let proposal = Proposal::new(&keyset, &inputs, point(43), to, None).unwrap();
+                let signed =
+                    SignedProposal::sign(&keyset, proposal, &inputs, Authorization::Plain, &owners)
+                        .unwrap();
+                // As the Hub cites it: by the signature of her note alone.
+                licash::recovery::by_signature(&signed, None, &[0].into()).unwrap()
+            })
+            .collect()
+    };
     let parts = claim::Parts {
         items: ds
             .iter()
@@ -517,20 +530,43 @@ fn export_worst_inputs() {
         activations: vec![],
         funded: vec![],
     };
-    let f = file(issuer, base, parts, &ds, 128, witness);
+    let f = file(issuer.clone(), base, parts, &ds, 128, witness);
     let x = exit(&f.base, f.b, &f.e, &f.bytes, 0);
-    let (owed, _) = decide(&f.base, &keys(), &x, &spends).unwrap();
-    assert_eq!(owed.owed, 0);
-    let worst = input(&f.base, x, spends);
+    // 64 notes of 4 to 128 outputs of 2; and one of 4 to one.
+    let (most, alone) = (
+        spends(MAX_INPUTS as u32 - 1, MAX_OUTPUTS as u32),
+        spends(0, 1),
+    );
+    let bodies = |evidence: &[Evidence]| -> usize {
+        (evidence.iter())
+            .map(|e| match e {
+                Evidence::Signed { body, .. } => body.len(),
+                _ => 0,
+            })
+            .sum()
+    };
+    for spends in [&most, &alone] {
+        let (owed, _) = decide(&f.base, &keys(), &x, spends).unwrap();
+        assert_eq!(owed.owed, 0);
+    }
     let (a, spent) = stale();
-    let answered = input(&a.base, exit(&a.base, a.b, &a.e, &a.bytes, 64), vec![cite(spent)]);
-    for (name, i) in [("worst", worst), ("answered", answered)] {
+    let answered = input(
+        &a.base,
+        exit(&a.base, a.b, &a.e, &a.bytes, 64),
+        vec![cite(spent)],
+    );
+    let inputs = [
+        ("worst", bodies(&most), input(&f.base, x.clone(), most)),
+        ("worst-alone", bodies(&alone), input(&f.base, x, alone)),
+        ("answered", 0, answered),
+    ];
+    for (name, bodies, i) in inputs {
         let bytes = i.to_bytes();
         let start = std::time::Instant::now();
         let read = HubInput::from_bytes(&bytes).unwrap();
         check(&read).unwrap();
         println!(
-            "{name}: {} input bytes, read and checked natively in {:?}",
+            "{name}: {} input bytes, {bodies} of spends' bodies, read and checked natively in {:?}",
             bytes.len(),
             start.elapsed()
         );
@@ -613,7 +649,12 @@ fn the_hub_proves_the_same_of_a_spend_cited_by_its_signatures() {
     let (owed, _) = decide(&f.base, &keys(), &x, std::slice::from_ref(&cited)).unwrap();
     assert_eq!((owed.owed, owed.mask), (64, 0xffff));
     let bytes = input(&f.base, x.clone(), vec![cited.clone()]).to_bytes();
-    assert!(bytes.len() < input(&f.base, x.clone(), vec![spent.clone()]).to_bytes().len());
+    assert!(
+        bytes.len()
+            < input(&f.base, x.clone(), vec![spent.clone()])
+                .to_bytes()
+                .len()
+    );
     assert_eq!(
         check(&HubInput::from_bytes(&bytes).unwrap()).unwrap(),
         journal
