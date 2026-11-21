@@ -47,9 +47,11 @@ mod recoveries;
 mod refunds;
 mod safety;
 mod shaping;
+mod stats;
 mod vias;
 
 pub use contacts::Contact;
+pub use stats::{BalancePoint, Flow, HubAmount, StatEvent, Stats, Unlink, Way};
 
 /// A wallet, kept in a directory of its own.
 #[derive(uniffi::Object)]

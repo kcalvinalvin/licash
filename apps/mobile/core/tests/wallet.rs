@@ -2655,3 +2655,90 @@ fn a_phone_names_what_a_restore_needs_of_its_hub_and_refuses_what_it_is_not() {
     assert!(refused("zz", &root).contains("hex"));
     assert!(refused(&address, "0707").contains("32 bytes"));
 }
+
+/// What a phone did and what it cost, as the Stats screen reads it: each
+/// event once, a coin paid on Bitcoin and turned into notes counted
+/// as what came and as a move, the fees of payments the history hides
+/// included, and the balance replayed from the records the balance now.
+#[test]
+fn a_phone_counts_what_it_did_and_what_it_cost_and_replays_its_balance() {
+    use licash_mobile::{Flow, Way};
+
+    let net = Net::new(false);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let hub = alice.holdings().unwrap()[0].hub.clone();
+    let preimage = [5; 32];
+    let hash = licash::spend::lock_hash(&preimage);
+    let request = net.node.invoice(200_000, hash, 6, Outcome::Pay(preimage));
+    alice.pay_invoice(request, hub.clone()).unwrap();
+    net.runtime.block_on(net.lightning.round());
+    alice.resume().unwrap();
+    let done = alice.optimize_notes(hub, 1).unwrap().unwrap();
+
+    let stats = alice.stats(light.clone()).unwrap();
+    let of = |flow: Flow, way: Way| {
+        stats
+            .events
+            .iter()
+            .filter(|e| e.flow == flow && e.way == way)
+            .collect::<Vec<_>>()
+    };
+    // The coin that came, once; its conversion into notes, apart.
+    let came = of(Flow::Received, Way::Bitcoin);
+    assert_eq!(came.len(), 1, "{:?}", stats.events);
+    assert_eq!(
+        (came[0].amount, came[0].fee, came[0].state),
+        (3_000, 0, State::Done)
+    );
+    assert!(came[0].at.is_some());
+    let moved = of(Flow::Moved, Way::Bitcoin);
+    assert_eq!(moved.len(), 1, "{:?}", stats.events);
+    let history = alice.history().unwrap();
+    let line = history.iter().find(|a| a.kind == Kind::Moved).unwrap();
+    assert_eq!((moved[0].amount, moved[0].fee), (line.amount, line.fee));
+    assert_eq!(moved[0].hub_fee, Some(line.fee));
+
+    // The Lightning payment: the gateway's fee, and how long it took.
+    let paid = of(Flow::Sent, Way::Lightning);
+    assert_eq!((paid.len(), paid[0].amount, paid[0].fee), (1, 200, 2));
+    assert_eq!(paid[0].hub_fee, Some(2));
+    assert!(paid[0].took.is_some());
+    // The payment to itself making notes of 202 is no line of the history,
+    // and costs 1.
+    let hidden = of(Flow::Normalized, Way::Licash);
+    assert_eq!((hidden.len(), hidden[0].fee), (1, 1));
+
+    // The optimization, its fee its own.
+    let optimized = of(Flow::Optimized, Way::Licash);
+    assert_eq!(optimized.len(), 1);
+    assert_eq!(optimized[0].id, done.id.unwrap());
+    assert_eq!((optimized[0].amount, optimized[0].fee), (0, 1));
+
+    // Fees add up to the history's, and the hidden one.
+    let total: u64 = stats.events.iter().map(|e| e.fee).sum();
+    let shown: u64 = history
+        .iter()
+        .filter(|a| a.state == State::Done)
+        .map(|a| a.fee)
+        .sum();
+    assert_eq!(total, shown + 1, "{:?}", stats.events);
+
+    // Replayed to now, the balance is what it is.
+    let balance = alice.balance().unwrap();
+    let now = i64::MAX;
+    let [point] = &alice.balance_over(vec![now], light.clone()).unwrap()[..] else {
+        panic!("one point");
+    };
+    assert_eq!(point.licash, balance.notes + balance.notes_pending);
+    assert_eq!(point.bitcoin, balance.onchain);
+    assert_eq!(
+        point.hubs.iter().map(|h| h.amount).sum::<u64>(),
+        point.licash
+    );
+    // And before anything, nothing.
+    let [before] = &alice.balance_over(vec![0], light.clone()).unwrap()[..] else {
+        panic!("one point");
+    };
+    assert_eq!((before.licash, before.bitcoin), (0, 0));
+}

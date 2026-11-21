@@ -36,7 +36,10 @@ use licash_api::{swaps, Code, Fee, Payment, Problem};
 use licash_hub::{Hub, Policy, Timing};
 use licash_hub_service::Services;
 use licash_lightning::fake::{Fake, Outcome};
-use licash_mobile::{Details, InvoiceQuote, Kind, MoveQuote, Network, State, Wallet};
+use licash_mobile::{
+    ChainError, ChainSource, Details, Flow, InvoiceQuote, Kind, MoveQuote, Network, State, Wallet,
+    Way,
+};
 use licash_nostr::Route;
 use licash_swaps::{Config, Provider};
 use licash_transport::Http;
@@ -559,6 +562,35 @@ fn a_phone_moves_its_notes_to_another_of_its_hubs_through_a_provider() {
     let history = phone.history().unwrap();
     assert_eq!(history.iter().filter(|a| a.kind == Kind::Swap).count(), 2);
 
+    // Stats count each move once, with its fee's parts, and what the other
+    // hub's lock brought is no payment received.
+    // The history shows the notes it brought as received besides.
+    let got: Vec<_> = history
+        .iter()
+        .filter(|a| a.kind == Kind::Received)
+        .collect();
+    assert_eq!(got.len(), 3, "{got:?}");
+    let stats = phone.stats(Arc::new(NoBlocks)).unwrap();
+    let moves: Vec<_> = stats
+        .events
+        .iter()
+        .filter(|e| (e.flow, e.way) == (Flow::Moved, Way::Licash))
+        .collect();
+    assert_eq!(moves.len(), 2, "{:?}", stats.events);
+    let first = moves.iter().find(|e| e.amount == 300).unwrap();
+    assert_eq!(
+        (first.fee, first.hub_fee, first.provider_fee, first.state),
+        (5, Some(1), Some(4), State::Done)
+    );
+    assert!(first.took.is_some());
+    let received: Vec<_> = stats
+        .events
+        .iter()
+        .filter(|e| e.flow == Flow::Received)
+        .collect();
+    assert_eq!(received.len(), 1, "{received:?}");
+    assert_eq!(received[0].amount, 1_000);
+
     // Between two hubs only.
     assert!(phone.move_offers(hubs.url(0), hubs.url(0), None).is_err());
 }
@@ -837,4 +869,40 @@ fn a_phone_pays_an_invoice_through_a_provider_when_no_hub_pays_it() {
     // Paid through the provider: not again through it, nor anyone else.
     let again = phone.pay_invoice_via(request, quote.hub, provider.url, provider.fee);
     assert_eq!(again.unwrap().id, paid.id);
+}
+
+/// Bitcoin as no light client tells it: the wallets here have no coins.
+struct NoBlocks;
+
+impl ChainSource for NoBlocks {
+    fn height(&self) -> Result<u32, ChainError> {
+        Ok(0)
+    }
+    fn hash(&self, _: u32) -> Result<Vec<u8>, ChainError> {
+        Err(failed())
+    }
+    fn time(&self, _: u32) -> Result<i64, ChainError> {
+        Err(failed())
+    }
+    fn header(&self, _: u32) -> Result<Vec<u8>, ChainError> {
+        Err(failed())
+    }
+    fn filter(&self, _: Vec<u8>) -> Result<Vec<u8>, ChainError> {
+        Err(failed())
+    }
+    fn block(&self, _: Vec<u8>) -> Result<Vec<u8>, ChainError> {
+        Err(failed())
+    }
+    fn broadcast(&self, _: Vec<u8>) -> Result<(), ChainError> {
+        Err(failed())
+    }
+    fn unconfirmed(&self, _: Vec<u8>) -> Result<Vec<u8>, ChainError> {
+        Ok(Vec::new())
+    }
+}
+
+fn failed() -> ChainError {
+    ChainError::Failed {
+        reason: "no light client".into(),
+    }
 }
