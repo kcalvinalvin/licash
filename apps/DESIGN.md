@@ -48,6 +48,15 @@ a person sees. The apps differ in medium, not in manners.
    0.21%`). Operator views retain their existing percentage precision
    (two decimals below 1%, otherwise one), but never round a nonzero fee
    to `0.00%`.
+10. **Every tap answers.** The control tapped reacts at once, busy where
+    it is or by changing the view, and cannot be tapped again while its
+    work lasts. A wait says what is happening and, once it passes a few
+    seconds, how long it has lasted. A sheet that starts work stays open
+    on it until it ends, and shows the reason if it fails: never closed
+    onto silence. Work that goes on without the owner (a contract being
+    set up, a close in the background) shows where it stands on the page
+    it belongs to. An outcome is seen and felt: a short haptic for done
+    and another for failed, and a tick for a switch; not for every tap.
 
 ## Words
 
@@ -96,6 +105,16 @@ type in `ui/Theme.kt`. Use them; do not restyle a screen on its own.
   under way, a question and a failure all look alike.
 - **States** in a glyph and a word (`Pill`, `Step`), never by color alone;
   progress as a bar or a timeline of steps.
+- **Waiting.** `BigButton(busy = true)` makes a button its own wait: a
+  spinner and its label, not tappable. `Waited` says the seconds. A sheet
+  doing work is not `dismissable` unless the work goes on without it, and
+  closes itself once the work is done.
+- **Haptics** only through `Feel` (`ui/Feel.kt`): `confirm` and `reject`
+  for outcomes (`Outcome` does both by itself) and a switch's tick
+  (`Toggle` does it). Never on every tap, never alone: a haptic repeats
+  what the screen says in words.
+- **Announcing.** An outcome's title is a polite live region, so a screen
+  reader says it. Not the seconds of a wait: they change too often.
 - **Advanced mode** (`ui.developer`) adds the technical: blocks, notes,
   providers, ids, the light client's settings, the log. Basic mode never
   shows them.
