@@ -411,8 +411,8 @@ pub struct Sealing<'a> {
 }
 
 fn seal_challenge(of: &Sealing, commits: [&Pt; 3]) -> Scalar {
-    let parts = [of.issuer_pub, of.unlock_key, of.blinded, of.mask, of.sealed]
-        .map(|p| p.to_point().0);
+    let parts =
+        [of.issuer_pub, of.unlock_key, of.blinded, of.mask, of.sealed].map(|p| p.to_point().0);
     let commits = commits.map(|p| p.to_point().0);
     let mut all: Vec<&[u8]> = parts.iter().map(|p| &p[..]).collect();
     all.extend(commits.iter().map(|p| &p[..]));

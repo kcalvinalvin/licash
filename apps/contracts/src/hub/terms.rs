@@ -528,7 +528,7 @@ mod tests {
     /// mock decides the lean filing, so it quotes the graph of its id (10);
     /// signet's program reads the exit on the hub's header chain and owes a claim
     /// of the same contract no evidence against another, and quotes 13 (its
-    /// notes of the note format v3).
+    /// notes of the note format v4).
     #[test]
     fn the_fixed_quote_is_pinned() {
         let parts = Hub::peek(funded()).unwrap().base.parts().clone();
@@ -537,16 +537,16 @@ mod tests {
             (
                 None,
                 [
-                    "9026bf72eb0305efb1854048eb4148f85f19be45da5e138b64b62b75dca7d6c1",
-                    "86b3ff30860a94f69eebd60baf1057bc6345505ad9139993ce76fbba95d3fe18",
+                    "476f9e498fc8b19e3b07497e9646d485fd5d4883050575cdc2ad3c2834929fe5",
+                    "a8c010bcf8450fa0acd6e820efff059525d3c9e9e9210e6d776b1d9f2402f042",
                 ],
                 3_000,
             ),
             (
                 Some(RANGE),
                 [
-                    "d228449bc10012ad87898bd119bd0941495f6ae9fd2eccb2768096c69520df54",
-                    "614d5d7c22d961526e211e8cd4393fb81e5c485cfd83defacf47ae59edd05dd2",
+                    "e682f1e3f95bced8bb376b7e369186d9d6e56ea1fc8cb44730bc41d0353c5f2e",
+                    "61fa7b59bb72fe5efe9b6f9a8949cf74fb4eb22a67863841b6607867cb063a0d",
                 ],
                 3_024,
             ),
