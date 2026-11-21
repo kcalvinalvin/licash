@@ -42,6 +42,7 @@ mod delivery;
 mod deposits;
 mod inquiry;
 mod journal;
+mod lane;
 mod lightning;
 mod locks;
 mod payment_note;
@@ -93,6 +94,7 @@ pub use deposits::{
 };
 pub use inquiry::Checked;
 pub use journal::{CoinSpan, Journal, NoteSpan};
+pub use lane::{current_lane, in_lane, Lane};
 pub use lightning::{refund_blocks, Invoice, InvoiceState, Payable, ViaQuote, ROUTE_BLOCKS};
 pub use locks::{Incoming, Lock, LockState, Via, CLAIM_MARGIN, PROTECTED_MARGIN};
 pub use payment_note::{note_text, PaymentNote, MAX_NOTE};
@@ -2414,7 +2416,9 @@ impl<T: Transport> Wallet<T> {
         let mut unlinked = 0;
         let mut failed = None;
         for (hub, url) in hubs {
-            match self.unlink_at(hub, &url).await {
+            // Apart from what else the wallet asks of the hub: only once
+            // there is something to unlink.
+            match in_lane(Lane::Fresh, self.unlink_at(hub, &url)).await {
                 Ok(n) => unlinked += n,
                 Err(e) => {
                     tracing::info!(%url, %e, "notes stay linked for now");

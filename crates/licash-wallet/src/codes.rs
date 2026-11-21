@@ -27,10 +27,14 @@ use std::{
 use licash::{
     address::{Address, OwnerKeys},
     crypto::tagged_hash,
+    spend::ChainProfile,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
-use crate::{hub_url, Error, Paid, PaymentCode, PaymentNote, Received, Sent, Transport, Wallet};
+use crate::{
+    hub_url, in_lane, now, Error, Lane, Paid, PaymentCode, PaymentNote, Received, Sent, Transport,
+    Wallet,
+};
 
 /// The most characters of a code's label.
 pub const MAX_LABEL: usize = 40;
@@ -182,8 +186,8 @@ impl<T: Transport> Wallet<T> {
     ) -> Result<(), Error> {
         let wallet = self.code_wallet(index)?;
         // Its payments to this wallet under way, first: their notes held
-        // until done.
-        wallet.resume().await?;
+        // until done. In a lane of their own, as each payment on.
+        in_lane(Lane::Fresh, wallet.resume()).await?;
         let added: Vec<String> = wallet.hubs()?.into_iter().map(|(url, _)| url).collect();
         for (url, _) in hubs {
             if !added.contains(url) {
@@ -205,14 +209,24 @@ impl<T: Transport> Wallet<T> {
                 tracing::info!(index, "notes of an extra code not unlinked: {e}");
             }
         }
+        // On regtest, for tests, at once.
+        let waits = self.network() != ChainProfile::Core30DefaultRegtest;
+        let (receipts, sends) = (wallet.receipts()?, wallet.sends()?);
+        let (seed, me) = (self.code_seed(index), self.address());
         for balance in wallet.balance()? {
             let url = balance.hub;
             let Some(amount) = sweepable(&wallet, &url, balance.available) else {
                 continue;
             };
-            let code = self.code_of(self.address(), false, std::slice::from_ref(&url))?;
+            let due = sweep_due(&seed, &url, &receipts, &sends, &me);
+            if waits && due.is_some_and(|due| now() < due) {
+                continue;
+            }
+            let code = self.code_of(me, false, std::slice::from_ref(&url))?;
             let code = code.licash.ok_or_else(|| Error::Setup("no code".into()))?;
-            match wallet.pay_code(&url, &code, amount).await {
+            // Apart from the payments it took, and its other payments on.
+            let paying = wallet.pay_code(&url, &code, amount);
+            match in_lane(Lane::Fresh, paying).await {
                 Ok(paid) => {
                     // Not kept at the hub: taken here, as no inbox has it.
                     if !paid.kept {
@@ -327,6 +341,47 @@ impl<T: Transport> Wallet<T> {
     }
 }
 
+/// How long, in seconds, an extra code holds a payment it took before
+/// paying it on: at least the least, at most the most, a time of the
+/// payment's own unknown to the hub, so that the hub cannot tell which
+/// payment on follows which payment taken by when they came.
+pub const SWEEP_AFTER: (i64, i64) = (60, 30 * 60);
+
+/// When the extra code of `seed` is to pay on what it holds at the hub at
+/// `url`: once the first payment it took there since it last paid this
+/// wallet, `me`, has waited its time ([`SWEEP_AFTER`]). None if it took
+/// none since: what it holds waited already.
+fn sweep_due(
+    seed: &[u8; 32],
+    url: &str,
+    receipts: &[Received],
+    sends: &[Sent],
+    me: &Address,
+) -> Option<i64> {
+    let paid_on = sends
+        .iter()
+        .filter(|s| {
+            s.hub == url && s.payee == *me && !matches!(s.state, crate::State::Abandoned(_))
+        })
+        .map(|s| s.created_at)
+        .max();
+    receipts
+        .iter()
+        .filter(|r| r.hub == url && paid_on.is_none_or(|at| r.received_at > at))
+        .map(|r| r.received_at.saturating_add(sweep_delay(seed, &r.id)))
+        .min()
+}
+
+/// How long the extra code of `seed` holds payment `id` ([`SWEEP_AFTER`]).
+fn sweep_delay(seed: &[u8; 32], id: &str) -> i64 {
+    let (least, most) = SWEEP_AFTER;
+    let hash = tagged_hash("licash/code/sweep", &[seed, id.as_bytes()]);
+    let mut drawn = [0; 8];
+    drawn.copy_from_slice(&hash[..8]);
+    let span = u64::try_from(most - least + 1).unwrap_or(1);
+    least + i64::try_from(u64::from_be_bytes(drawn) % span).unwrap_or(0)
+}
+
 /// The most of `available` notes at the hub at `url` the wallet of `T` can
 /// pay, its hub's fee on top: none if it cannot pay anything.
 fn sweepable<T: Transport>(wallet: &Wallet<T>, url: &str, available: u64) -> Option<u64> {
@@ -435,6 +490,70 @@ impl<T: Transport> Transport for Lent<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_payment_taken_is_paid_on_after_a_time_of_its_own_within_bounds() {
+        let (least, most) = SWEEP_AFTER;
+        let delays: Vec<i64> = (0..200)
+            .map(|i| sweep_delay(&[7; 32], &format!("{i:064x}")))
+            .collect();
+        assert!(
+            delays.iter().all(|d| (least..=most).contains(d)),
+            "{delays:?}"
+        );
+        // Spread, not one time: the hub cannot tell it.
+        assert!(delays.iter().max().unwrap() - delays.iter().min().unwrap() > (most - least) / 2);
+        // The same payment's the same, run after run; another seed's not.
+        assert_eq!(sweep_delay(&[7; 32], "ab"), sweep_delay(&[7; 32], "ab"));
+        assert_ne!(sweep_delay(&[7; 32], "ab"), sweep_delay(&[8; 32], "ab"));
+    }
+
+    #[test]
+    fn what_a_code_holds_is_due_once_its_first_payment_since_it_paid_on_waited() {
+        let me = OwnerKeys::from_seed(&[1; 32]).unwrap().address();
+        let other = OwnerKeys::from_seed(&[2; 32]).unwrap().address();
+        let seed = [3; 32];
+        let (hub, elsewhere) = ("http://hub", "http://other");
+        let got = |id: &str, hub: &str, at| Received {
+            id: id.into(),
+            hub: hub.into(),
+            amount: 10,
+            received_at: at,
+        };
+        let sent = |payee: &Address, at, state| Sent {
+            id: "s".into(),
+            hub: hub.into(),
+            payee: *payee,
+            amount: 5,
+            fee: 1,
+            state,
+            created_at: at,
+        };
+        // Nothing taken: nothing to wait for.
+        assert_eq!(sweep_due(&seed, hub, &[], &[], &me), None);
+        let receipts = [
+            got("a", hub, 1_000),
+            got("b", hub, 2_000),
+            got("c", elsewhere, 0),
+        ];
+        let due = |sends: &[Sent]| sweep_due(&seed, hub, &receipts, sends, &me);
+        let (a, b) = (
+            1_000 + sweep_delay(&seed, "a"),
+            2_000 + sweep_delay(&seed, "b"),
+        );
+        assert_eq!(due(&[]), Some(a.min(b)));
+        // Paid on after the first: the second's time; a payment elsewhere,
+        // or given up, is not paying on.
+        assert_eq!(due(&[sent(&me, 1_500, crate::State::Done)]), Some(b));
+        assert_eq!(
+            due(&[sent(&other, 1_500, crate::State::Done)]),
+            Some(a.min(b))
+        );
+        let gone = crate::State::Abandoned("no".into());
+        assert_eq!(due(&[sent(&me, 1_500, gone)]), Some(a.min(b)));
+        // Paid on after both: what is left waited already.
+        assert_eq!(due(&[sent(&me, 2_500, crate::State::Done)]), None);
+    }
 
     #[test]
     fn a_label_is_its_words_one_space_apart_and_says_something() {

@@ -91,6 +91,9 @@ pub struct Net {
     pub proof: Mutex<Option<Option<Hex>>>,
     /// What the hubs leave out of the locks' states they serve.
     pub lock_lies: Mutex<Vec<LockLie>>,
+    /// The URLs asked, each with the lane it was asked in
+    /// ([`licash_wallet::current_lane`]).
+    pub asked: Mutex<Vec<(String, Option<u64>)>>,
     dirs: Mutex<Vec<tempfile::TempDir>>,
 }
 
@@ -453,7 +456,13 @@ impl Transport for Link {
         url: &str,
         body: Option<Vec<u8>>,
     ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
-        std::future::ready(self.0.serve(url, body))
+        // Its lane as it is first polled, as a transport reads it.
+        let (net, url) = (self.0.clone(), url.to_owned());
+        async move {
+            let lane = licash_wallet::current_lane();
+            net.asked.lock().unwrap().push((url.clone(), lane));
+            net.serve(&url, body)
+        }
     }
 }
 

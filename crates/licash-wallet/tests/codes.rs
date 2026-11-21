@@ -176,3 +176,80 @@ async fn a_file_of_a_later_version_of_codes_has_none_and_makes_none() {
     assert!(matches!(bob.add_code("x").await, Err(Error::Invalid(_))));
     assert!(bob.collect_codes().await.unwrap().received.is_empty());
 }
+
+#[tokio::test]
+async fn each_payment_is_taken_and_paid_on_in_a_lane_of_its_own_and_feeds_in_none() {
+    use licash_api::inbox::{ACK, INBOX, TAKE};
+    let Pair {
+        net, alice, bob, ..
+    } = pair().await;
+    bob.add_code("a").await.unwrap();
+    bob.add_code("b").await.unwrap();
+    bob.collect_inbox().await.unwrap();
+    let asked = || std::mem::take(&mut *net.asked.lock().unwrap());
+    asked();
+
+    // Idle: the public feeds alone, in no lane, whatever codes it has.
+    bob.collect_inbox().await.unwrap();
+    let idle = asked();
+    assert!(!idle.is_empty());
+    assert!(
+        idle.iter()
+            .all(|(url, lane)| lane.is_none() && url.contains(INBOX) && !url.ends_with(TAKE)),
+        "{idle:?}"
+    );
+
+    for index in [1, 2] {
+        alice.pay_code(HUB, &code(&bob, index), 30).await.unwrap();
+    }
+    asked();
+    // Within an operation: its feeds still in none.
+    let collecting = bob.collect_inbox();
+    let inboxed = licash_wallet::in_lane(licash_wallet::Lane::Operation, collecting)
+        .await
+        .unwrap();
+    assert_eq!(inboxed.codes.swept.len(), 2, "{inboxed:?}");
+    assert_eq!(inboxed.received.len(), 2);
+    let all = asked();
+    let lane_of = |pick: &dyn Fn(&str) -> bool| -> Vec<Option<u64>> {
+        all.iter()
+            .filter(|(url, _)| pick(url))
+            .map(|(_, lane)| *lane)
+            .collect()
+    };
+    let feeds = lane_of(&|url| url.contains(INBOX) && !url.ends_with(TAKE) && !url.ends_with(ACK));
+    assert!(feeds.iter().all(Option::is_none), "{all:?}");
+    // Two taken at the codes, two paid on taken by the wallet: four takes,
+    // in four lanes.
+    let takes = lane_of(&|url| url.ends_with(TAKE));
+    assert_eq!(takes.len(), 4, "{all:?}");
+    let mut apart: Vec<u64> = takes
+        .iter()
+        .map(|lane| lane.expect("a take in a lane"))
+        .collect();
+    apart.sort_unstable();
+    apart.dedup();
+    assert_eq!(apart.len(), 4, "two takes in one lane: {all:?}");
+    // Each acknowledged in its take's lane; the payments on in others.
+    let acks = lane_of(&|url| url.ends_with(ACK));
+    assert!(
+        acks.iter()
+            .all(|lane| lane.is_some_and(|l| apart.contains(&l))),
+        "{all:?}"
+    );
+    let rest: Vec<u64> = (all.iter())
+        .filter(|(url, _)| !url.contains(INBOX))
+        .filter_map(|(_, lane)| *lane)
+        .collect();
+    let mut paying = rest.clone();
+    paying.sort_unstable();
+    paying.dedup();
+    assert!(
+        paying.len() >= 2,
+        "the payments on in one lane, or none: {all:?}"
+    );
+    assert!(
+        rest.iter().all(|lane| !apart.contains(lane)),
+        "a payment on in a take's lane: {all:?}"
+    );
+}

@@ -25,8 +25,8 @@ use licash_api::{
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::{
-    answer, each_at_most, invalid, now, payment_id, unavailable, Error, LicashCode, Paid, Received,
-    Transport, Wallet,
+    answer, each_at_most, in_lane, invalid, now, payment_id, unavailable, Error, Lane, LicashCode,
+    Paid, Received, Transport, Wallet,
 };
 
 /// How long a payment kept at its hub waits for its payee to say it has
@@ -318,7 +318,9 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Ask the hubs of the payments they keep whether their payees said
-    /// they have them, and record those they did.
+    /// they have them, and record those they did: each payment by a
+    /// request of its own, in a lane of its own ([`Lane::Fresh`]), so that
+    /// the hub cannot tell which it keeps are one payer's.
     async fn ask_acks(&self) -> Result<(), Error> {
         type Row = (String, [u8; 32], [u8; 32], [u8; 32]);
         let rows: Vec<Row> = self.store.read(|c| {
@@ -338,10 +340,11 @@ impl<T: Transport> Wallet<T> {
         }
         let acked = each_at_most(HUBS_AT_ONCE, by_hub, |(url, kept)| async move {
             let mut acked = Vec::new();
-            for kept in kept.chunks(inbox::MAX_ASKED) {
+            for kept in kept.chunks(1) {
                 let keys = kept.iter().map(|(_, key, _)| Hex(key.to_vec())).collect();
-                let asked: Result<Acks, Error> =
-                    self.post(&url, inbox::ACKS, &AskAcks { keys }).await;
+                let ask = AskAcks { keys };
+                let asking = self.post(&url, inbox::ACKS, &ask);
+                let asked: Result<Acks, Error> = in_lane(Lane::Fresh, asking).await;
                 match asked {
                     Ok(told) if told.acks.len() == kept.len() => {
                         for ((send, _, ack), told) in kept.iter().zip(told.acks) {
@@ -509,6 +512,9 @@ impl<T: Transport> Wallet<T> {
     /// entry whose payment is not the wallet's, or does not open, is
     /// passed, so that no payer stalls the wallet's inbox with one. At most
     /// [`PAGES_AT_ONCE`] pages are looked through, the rest next time.
+    /// Each payment is taken by a request of its own, in a lane of its own
+    /// ([`Lane::Fresh`]): the hub cannot tell those taken together are one
+    /// payee's by the request or its connection.
     async fn collect_at(
         &self,
         hub: i64,
@@ -536,7 +542,42 @@ impl<T: Transport> Wallet<T> {
                     (inbox::tag(&shared) == tag).then_some((entry.seq, shared))
                 })
                 .collect();
-            for asked in mine.chunks(inbox::MAX_ASKED) {
+            for asked in mine.chunks(1) {
+                let take = self.take_at(url, asked, &scan, &mut refreshed, received);
+                in_lane(Lane::Fresh, take).await?;
+            }
+            let Some(last) = feed.entries.last() else {
+                return Ok(());
+            };
+            after = i64::try_from(last.seq).map_err(invalid)?;
+            self.store.write(|tx| {
+                tx.execute(
+                    "UPDATE hubs SET inbox_after = MAX(COALESCE(inbox_after, 0), ?2) WHERE id = ?1",
+                    params![hub, after],
+                )?;
+                Ok(())
+            })?;
+            if !feed.more {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Take the payments `asked` (by their entries and shared secrets) at
+    /// the hub at `url`, adding those kept to `received`, and acknowledge
+    /// them: its keysets fetched again once if `refreshed` says they were
+    /// not yet.
+    async fn take_at(
+        &self,
+        url: &str,
+        asked: &[(u64, [u8; 32])],
+        scan: &licash::address::ScanKey,
+        refreshed: &mut bool,
+        received: &mut Vec<Received>,
+    ) -> Result<(), Error> {
+        {
+            {
                 let payments = asked.iter().map(|(seq, shared)| Kept {
                     seq: *seq,
                     key: Hex(inbox::key(shared).to_vec()),
@@ -554,8 +595,8 @@ impl<T: Transport> Wallet<T> {
                     let payment = kept.at(url);
                     let opened = match self.open_payment(&payment) {
                         // A keyset the hub added since the wallet last asked.
-                        Err(Error::UnknownHub(_)) if !refreshed => {
-                            refreshed = true;
+                        Err(Error::UnknownHub(_)) if !*refreshed => {
+                            *refreshed = true;
                             self.refresh(url).await?;
                             self.open_payment(&payment)
                         }
@@ -592,20 +633,6 @@ impl<T: Transport> Wallet<T> {
                     let _: Acknowledged = self.post(url, inbox::ACK, &told).await?;
                 }
             }
-            let Some(last) = feed.entries.last() else {
-                return Ok(());
-            };
-            after = i64::try_from(last.seq).map_err(invalid)?;
-            self.store.write(|tx| {
-                tx.execute(
-                    "UPDATE hubs SET inbox_after = MAX(COALESCE(inbox_after, 0), ?2) WHERE id = ?1",
-                    params![hub, after],
-                )?;
-                Ok(())
-            })?;
-            if !feed.more {
-                return Ok(());
-            }
         }
         Ok(())
     }
@@ -614,9 +641,10 @@ impl<T: Transport> Wallet<T> {
     /// the hub keeps no payments, answering that it serves no inbox.
     async fn feed(&self, url: &str, after: i64) -> Result<Option<Feed>, Error> {
         let path = inbox::feed(u64::try_from(after).unwrap_or(0));
-        let response = self
-            .transport
-            .request(&format!("{url}{path}"), None)
+        // Public, asked of every payee alike: on the lane of none.
+        let feed = format!("{url}{path}");
+        let asked = async { self.transport.request(&feed, None).await };
+        let response = in_lane(Lane::Shared, asked)
             .await
             .map_err(|reason| unavailable(url, reason))?;
         let problem = serde_json::from_slice::<licash_api::Problem>(&response.body);
