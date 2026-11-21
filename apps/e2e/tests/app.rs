@@ -193,7 +193,11 @@ async fn separate_code(phone: &Phone, bob: &licash_e2e::Wallet) -> anyhow::Resul
     phone.wait("QR code", 30).await?;
     phone.tap_id("which-code").await?;
     phone.tap_id("new-code").await?;
-    phone.fill_id("code-label", "Forum").await?;
+    // Typed, the keyboard not hidden after: in a sheet, Escape closes the
+    // sheet when no keyboard takes it, and the sheet clears one that shows.
+    phone.tap_id("code-label").await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    phone.type_text("Forum").await?;
     phone.tap_id("create-code").await?;
     let shown = until("the separate code", 30, || async {
         let shown = phone.qr(30).await?;
