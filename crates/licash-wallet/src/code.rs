@@ -147,7 +147,9 @@ impl LicashCode {
         Hrp::parse(hrp).expect("a valid hrp")
     }
 
-    fn to_bytes(&self) -> Vec<u8> {
+    /// Its bytes, as its text writes them in bech32: within 260 for a
+    /// code naming at most [`CODE_HUBS`] hubs.
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = vec![self.network.tag()];
         bytes.extend(self.address.to_bytes());
         if let Some(mailbox) = &self.mailbox {
@@ -191,18 +193,24 @@ impl LicashCode {
         if version != Fe32::Q {
             return Ok(None);
         }
-        let bytes = fes_to_bytes(data)?;
+        let code = Self::from_bytes(&fes_to_bytes(data)?)?;
+        if test != (network_kind(code.network) == NetworkKind::Test) {
+            return Err(invalid(format!(
+                "a code of {} under {}",
+                code.network,
+                checked.hrp()
+            )));
+        }
+        Ok(Some(code))
+    }
+
+    /// The code of version 0 `bytes` write ([`LicashCode::to_bytes`]).
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         let (&network, rest) = bytes.split_first().ok_or_else(|| invalid("empty"))?;
         let network = ChainProfile::ALL
             .into_iter()
             .find(|n| n.tag() == network)
             .ok_or_else(|| invalid(format!("network {network}")))?;
-        if test != (network_kind(network) == NetworkKind::Test) {
-            return Err(invalid(format!(
-                "a code of {network} under {}",
-                checked.hrp()
-            )));
-        }
         if rest.len() < 99 {
             return Err(invalid("too short"));
         }
@@ -243,7 +251,7 @@ impl LicashCode {
         if !records.is_empty() {
             return Err(invalid("a record cut short"));
         }
-        Ok(Some(code))
+        Ok(code)
     }
 
     /// The hub's position and URL a location's `value` writes, if valid.

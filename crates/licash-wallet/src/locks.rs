@@ -860,7 +860,7 @@ impl<T: Transport> Wallet<T> {
             .await?;
         let issued = issued.decode(keyset).map_err(|p| unavailable(&url, p))?;
         let ours = self.opened_branch(&url, keyset, proposal, Branch::Pay, &issued)?;
-        self.keep(keyset, url, proposal, &ours)
+        self.keep(keyset, url, proposal, &ours, None)
     }
 
     /// Whether the lock `id` is owed to the wallet, its preimage revealed.

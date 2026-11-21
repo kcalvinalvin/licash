@@ -288,7 +288,7 @@ impl Net {
             });
         }
         let answer = match (path, body) {
-            (licash_api::INFO, None) => self.info(&hub),
+            (licash_api::INFO, None) => self.info(&hub, kept.lock().unwrap().conduct),
             (licash_api::RELEASE, Some(body)) => release(&hub, &kept, &body),
             (path, None) if path.starts_with("/v1/lock/") => {
                 let lies = self.lock_lies.lock().unwrap().clone();
@@ -317,8 +317,11 @@ impl Net {
         })
     }
 
-    fn info(&self, hub: &Hub) -> Result<Vec<u8>, Problem> {
+    fn info(&self, hub: &Hub, conduct: Conduct) -> Result<Vec<u8>, Problem> {
         let mut info = hub.advertise().map_err(problem)?;
+        if !matches!(conduct, Conduct::None | Conduct::Noteless) {
+            info.features.push(licash_api::inbox::FEATURE_NOTE.into());
+        }
         if let Some(stale) = *self.stale.lock().unwrap() {
             info.fees.spend = stale;
         }
@@ -389,6 +392,7 @@ fn release(hub: &Hub, kept: &Mutex<inbox::Inbox>, body: &[u8]) -> Result<Vec<u8>
             let receipt = licash_api::inbox::Receipt {
                 release: release.release.clone(),
                 unlock: Hex(unlock.to_vec()),
+                note: keep.note.clone(),
             };
             let ephemeral = proposal.ephemeral().0.to_vec();
             let id = *proposal.id().as_bytes();
@@ -505,6 +509,7 @@ impl Net {
         let receipt = licash_api::inbox::Receipt {
             release: payment.release.clone(),
             unlock: payment.unlock.clone(),
+            note: None,
         };
         let eph = ephemeral.public().0.to_vec();
         let inbox = self.sites.lock().unwrap()[url].inbox.clone();
@@ -530,10 +535,12 @@ impl Net {
             tag: Hex(licash_api::inbox::tag(&shared).to_vec()),
             key: Hex(vec![0x55; 32]),
             commitment: Hex(vec![0x66; 32]),
+            note: None,
         };
         let receipt = licash_api::inbox::Receipt {
             release: payment.release.clone(),
             unlock: payment.unlock.clone(),
+            note: None,
         };
         let eph = ephemeral.public().0.to_vec();
         let inbox = self.sites.lock().unwrap()[url].inbox.clone();

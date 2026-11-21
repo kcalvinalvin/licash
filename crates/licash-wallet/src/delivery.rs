@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::PaymentNote;
 use licash::{crypto::Point, spend::ProposalId};
 use licash_api::{
     inbox::{
@@ -133,11 +134,17 @@ pub(crate) fn keep(c: &Connection, id: &ProposalId) -> Result<Option<Keep>, Erro
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    Ok(row.map(|(tag, key, ack)| Keep {
+    let Some((tag, key, ack)) = row else {
+        return Ok(None);
+    };
+    let note = crate::payment_note::sealed(c, id)?.filter(|(_, keep)| *keep);
+    let keep = Keep {
         tag: Hex(tag.to_vec()),
         key: Hex(key.to_vec()),
         commitment: Hex(inbox::commitment(&ack).to_vec()),
-    }))
+        note: None,
+    };
+    Ok(Some(keep.with_note(note.map(|(sealed, _)| sealed))))
 }
 
 /// Record that send `id` is released, its hub keeping it for its payee if
@@ -182,8 +189,27 @@ impl<T: Transport> Wallet<T> {
     /// the mailbox the code names, if any, unless the payee says it has it
     /// within [`ACK_WITHIN`], or at once if the hub does not keep it.
     pub async fn pay_code(&self, url: &str, code: &LicashCode, amount: u64) -> Result<Paid, Error> {
-        self.send_with(url, &code.address, amount, Some(code.mailbox))
+        self.send_with(url, &code.address, amount, Some(code.mailbox), None)
             .await
+    }
+
+    /// [`Wallet::pay_code`], with `note` for its payee
+    /// ([`PaymentNote`]): a code in it must be one of this wallet's. A
+    /// note saying anything is refused, before anything is paid, at a hub
+    /// that keeps none with a payment ([`Error::NoteUnkept`]), its info
+    /// asked again first: its payee could take the payment there without
+    /// it.
+    pub async fn pay_code_saying(
+        &self,
+        url: &str,
+        code: &LicashCode,
+        amount: u64,
+        note: &PaymentNote,
+    ) -> Result<Paid, Error> {
+        let url = crate::hub_url(url)?;
+        let note = self.note_for(&url, note).await?;
+        let mailbox = Some(code.mailbox);
+        (self.send_with(&url, &code.address, amount, mailbox, Some(&note))).await
     }
 
     /// [`Wallet::pay_code`] under `key`, once: no other payment is ever
@@ -209,8 +235,8 @@ impl<T: Transport> Wallet<T> {
                 sent.id
             )));
         }
-        self.send_once(&url, &code.address, amount, Some(code.mailbox), Some(key))
-            .await
+        let mailbox = Some(code.mailbox);
+        (self.send_once(&url, &code.address, amount, mailbox, Some(key), None)).await
     }
 
     /// The payments to mail to their payees' mailboxes now: those whose
@@ -525,7 +551,8 @@ impl<T: Transport> Wallet<T> {
                         }
                     };
                     let proposal = opened.signed.proposal();
-                    match self.keep(&opened.keyset, opened.url.clone(), proposal, &opened.ours) {
+                    let (keyset, at, ours) = (&opened.keyset, opened.url.clone(), &opened.ours);
+                    match self.keep(keyset, at, proposal, ours, payment.note.as_ref()) {
                         Ok(taken) => received.push(taken),
                         Err(Error::AlreadyReceived) => {}
                         Err(e @ Error::Storage(_)) => return Err(e),

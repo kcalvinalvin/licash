@@ -43,6 +43,7 @@ mod inquiry;
 mod journal;
 mod lightning;
 mod locks;
+mod payment_note;
 mod payouts;
 mod renewals;
 mod shaping;
@@ -92,6 +93,7 @@ pub use inquiry::Checked;
 pub use journal::{CoinSpan, Journal, NoteSpan};
 pub use lightning::{refund_blocks, Invoice, InvoiceState, Payable, ViaQuote, ROUTE_BLOCKS};
 pub use locks::{Incoming, Lock, LockState, Via, CLAIM_MARGIN, PROTECTED_MARGIN};
+pub use payment_note::{note_text, PaymentNote, MAX_NOTE};
 pub use payouts::{
     first_spend, payout_depth, Payout, PayoutProgress, PayoutQuote, PayoutState, CLAIM_ROOM,
     PAYOUT_WINDOW,
@@ -210,6 +212,11 @@ pub enum Error {
     PaysNothing,
     #[error("{0}")]
     Invalid(String),
+    /// The hub at `hub` keeps no note with a payment it keeps, so its payee
+    /// may take the payment without its note: nothing was paid. Its
+    /// owner's to pay without the note, or elsewhere.
+    #[error("hub {hub} keeps no note with a payment: pay without the note")]
+    NoteUnkept { hub: String },
     /// The application's view of Bitcoin failed, or served a block that
     /// is not the one asked for: retry later.
     #[error("chain source failed: {0}")]
@@ -1295,34 +1302,42 @@ impl<T: Transport> Wallet<T> {
     /// top. A hub that refuses the fee it advertised is asked again for its
     /// fees, and paid them, once.
     pub async fn send(&self, url: &str, payee: &Address, amount: u64) -> Result<Paid, Error> {
-        self.send_with(url, payee, amount, None).await
+        self.send_with(url, payee, amount, None, None).await
     }
 
     /// [`Wallet::send`], its hub asked to keep the payment for its payee if
     /// `delivered`, then mailed to the payee's mailbox it holds, if any,
-    /// unless the payee collects it ([`delivery`]).
+    /// unless the payee collects it ([`delivery`]), with `note` if any.
     pub(crate) async fn send_with(
         &self,
         url: &str,
         payee: &Address,
         amount: u64,
         delivered: Option<Option<[u8; 32]>>,
+        note: Option<&PaymentNote>,
     ) -> Result<Paid, Error> {
         let url = hub_url(url)?;
         if amount == 0 {
             return Err(Error::Invalid("nothing to pay".into()));
         }
-        match self.send_once(&url, payee, amount, delivered, None).await {
+        match self
+            .send_once(&url, payee, amount, delivered, None, note)
+            .await
+        {
             Err(Error::Refused { problem, .. }) if problem.code == Code::Fee => {
                 tracing::info!(%url, %problem, "fees changed, paying the new ones");
                 self.refresh(&url).await?;
-                self.send_once(&url, payee, amount, delivered, None).await
+                (self.send_once(&url, payee, amount, delivered, None, note)).await
             }
             sent => sent,
         }
     }
 
-    /// One payment, under `key` if given, recorded with it.
+    /// One payment, under `key` if given, recorded with it. One to a code
+    /// (`delivered`) goes with a note, sealed to the size of any other and
+    /// saying `note` if any, unless the wallet's file keeps another
+    /// version of notes: kept by its hub with it too if the hub says it
+    /// does.
     pub(crate) async fn send_once(
         &self,
         url: &str,
@@ -1330,8 +1345,10 @@ impl<T: Transport> Wallet<T> {
         amount: u64,
         delivered: Option<Option<[u8; 32]>>,
         key: Option<[u8; 32]>,
+        note: Option<&PaymentNote>,
     ) -> Result<Paid, Error> {
         let (hub, info) = self.hub(url)?;
+        let noted = delivered.is_some() && self.notes_on()?;
         let fees = self.agreed_fees(hub, url, &info)?;
         let (keyset, plan) = self.payment_plan(hub, amount, &fees)?;
         let selection = plan.selection;
@@ -1352,6 +1369,11 @@ impl<T: Transport> Wallet<T> {
             Some(_) => Some(ephemeral.shared(payee)?),
             None => None,
         };
+        let note = note.cloned().unwrap_or_default();
+        let sealed = match shared {
+            Some(shared) if noted => Some(self.seal_note(&shared, &id, payee, &note)?),
+            _ => None,
+        };
         self.store.write(|tx| {
             tx.execute(
                 "INSERT INTO sends (id, hub, payee, amount, fee, offer, created_at, key)
@@ -1369,6 +1391,10 @@ impl<T: Transport> Wallet<T> {
             )?;
             if let (Some(mailbox), Some(shared)) = (delivered, shared) {
                 delivery::record(tx, &id, mailbox, &shared)?;
+            }
+            if let Some(sealed) = &sealed {
+                let keep = payment_note::kept_by(&info);
+                payment_note::record_sent(tx, &id, sealed, keep, &note)?;
             }
             take(tx, &id, Spender::Send, &selection.inputs)
         })?;
@@ -1475,6 +1501,8 @@ impl<T: Transport> Wallet<T> {
         })?;
         let (hub, url, offer, release, mut unlock, abandoned) = row;
         let keep = self.store.read(|c| delivery::keep(c, id))?;
+        let sealed_note = self.store.read(|c| payment_note::sealed(c, id))?;
+        let sealed_note = sealed_note.map(|(sealed, _)| sealed);
         if let Some(reason) = abandoned {
             return Err(Error::Abandoned {
                 id: hex::encode(id.as_bytes()),
@@ -1565,7 +1593,7 @@ impl<T: Transport> Wallet<T> {
         })?;
         Ok(Paid {
             id: hex::encode(id.as_bytes()),
-            payment: Payment::new(&url, &signed, &notes, &unlock),
+            payment: Payment::new(&url, &signed, &notes, &unlock).with_note(sealed_note),
             kept,
         })
     }
@@ -1984,6 +2012,7 @@ impl<T: Transport> Wallet<T> {
         })?;
         let (hub, url, release, unlock, abandoned) =
             row.ok_or_else(|| Error::UnknownPayment(key.to_owned()))?;
+        let note = self.store.read(|c| payment_note::sealed(c, &id))?;
         let id = hex::encode(id.as_bytes());
         let (release, unlock) = match (release, unlock, abandoned) {
             (_, _, Some(reason)) => return Err(Error::Abandoned { id, reason }),
@@ -1998,7 +2027,8 @@ impl<T: Transport> Wallet<T> {
         let (signed, notes) = release
             .decode(|id| keysets.iter().find(|k| k.id() == id))
             .map_err(invalid)?;
-        Ok(Payment::new(&url, &signed, &notes, &unlock))
+        let payment = Payment::new(&url, &signed, &notes, &unlock);
+        Ok(payment.with_note(note.map(|(sealed, _)| sealed)))
     }
 
     /// The payments made, newest first.
@@ -2069,6 +2099,7 @@ impl<T: Transport> Wallet<T> {
             opened.url,
             opened.signed.proposal(),
             &opened.ours,
+            payment.note.as_ref(),
         )
     }
 
@@ -2124,13 +2155,15 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Keep the notes `ours` of `proposal` paid this wallet, with a
-    /// receipt: unless they are kept already.
+    /// receipt: unless they are kept already. What its payer's sealed
+    /// `note` says is kept either way, if anything.
     fn keep(
         &self,
         keyset: &Keyset,
         url: String,
         proposal: &Proposal,
         ours: &[(licash::address::Received, Note)],
+        note: Option<&licash_api::Hex>,
     ) -> Result<Received, Error> {
         if ours.is_empty() {
             return Err(Error::PaysNothing);
@@ -2153,7 +2186,11 @@ impl<T: Transport> Wallet<T> {
                 params![pid.as_bytes(), keyset.id(), sql(amount)?, received_at],
             )?;
             Ok(amount)
-        })?;
+        });
+        if matches!(amount, Ok(_) | Err(Error::AlreadyReceived)) {
+            self.keep_note(proposal, note);
+        }
+        let amount = amount?;
         let id = hex::encode(pid.as_bytes());
         tracing::info!(%id, amount, "received");
         Ok(Received {

@@ -16,6 +16,9 @@ pub enum Conduct {
     Keeps,
     /// Keeps none and serves no inbox, as an older hub.
     None,
+    /// Keeps them without their notes, naming no notes in its info, as a
+    /// hub of before notes.
+    Noteless,
     /// Answers that it keeps them, then never hands them over.
     Withholds,
     /// Tells an ack of its own of every payment, which it cannot know.
@@ -59,8 +62,19 @@ impl Inbox {
         match self.conduct {
             Conduct::None => return Ok(false),
             Conduct::Withholds => return Ok(true),
-            Conduct::Keeps | Conduct::Forges | Conduct::Repeats | Conduct::Endless => {}
+            Conduct::Keeps
+            | Conduct::Noteless
+            | Conduct::Forges
+            | Conduct::Repeats
+            | Conduct::Endless => {}
         }
+        let receipt = match self.conduct {
+            Conduct::Noteless => Receipt {
+                note: None,
+                ..receipt
+            },
+            _ => receipt,
+        };
         if self.kept.iter().any(|k| k.proposal == proposal) {
             return Ok(true);
         }

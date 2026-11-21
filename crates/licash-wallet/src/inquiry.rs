@@ -261,6 +261,7 @@ impl<T: Transport> Wallet<T> {
                         opened.url,
                         opened.signed.proposal(),
                         &opened.ours,
+                        None,
                     ) {
                         Ok(received) => {
                             checked.recovered += received.amount;
