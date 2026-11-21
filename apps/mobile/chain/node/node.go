@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
@@ -73,14 +74,17 @@ type Mempool interface {
 
 // Node is a running light client.
 type Node struct {
-	cs     *neutrino.ChainService
-	db     walletdb.DB
-	relay  *relay
-	cdn    *cdn
+	cs    *neutrino.ChainService
+	db    walletdb.DB
+	relay *relay
+	// The block-dn server filters come from, once its status is read
+	// (useCDN): none before, or if unusable.
+	cdn    atomic.Pointer[cdn]
 	upkeep *upkeep
 
 	stopOnce sync.Once
 	stopErr  error
+	stopped  chan struct{}
 }
 
 // Start opens the node's data and begins syncing. Peers are asked to relay
@@ -106,13 +110,6 @@ func StartContext(ctx context.Context, cfg Config) (*Node, error) {
 		return nil, err
 	}
 	cfg.DataDir = dir
-	var server *cdn
-	if cfg.CDN != "" {
-		var err error
-		if server, err = newCDN(cfg.CDN, &cfg.Params, cfg.Proxy, log); err != nil {
-			log.Warn("block-dn unusable, syncing from peers", "err", err)
-		}
-	}
 	imp := pinnedImport(ctx, dir, cfg.CDN, cfg.Params.Net, cfg.Pin, cfg.Proxy, cfg.Progress, log)
 	if err := ctx.Err(); err != nil {
 		// Given up on rather than failed: resumed on the next start.
@@ -135,10 +132,38 @@ func StartContext(ctx context.Context, cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	n.cdn = server
+	if cfg.CDN != "" {
+		go n.useCDN(cfg, log)
+	}
 	log.Info("light client started", "network", cfg.Params.Name,
-		"connect", cfg.ConnectPeers, "add", cfg.AddPeers, "cdn", server != nil)
+		"connect", cfg.ConnectPeers, "add", cfg.AddPeers, "cdn", cfg.CDN != "")
 	return n, nil
+}
+
+// cdnTries are the waits before each read of the CDN's status, from the
+// start on: the proxy, Tor, may take a while to be up.
+var cdnTries = []time.Duration{0, 5 * time.Second, 15 * time.Second, 30 * time.Second, time.Minute}
+
+// useCDN has filters come from the block-dn server of cfg once its status
+// is read, tried again as cdnTries says while that fails: a start waits on
+// none of it, and the peers serve meanwhile.
+func (n *Node) useCDN(cfg Config, log *slog.Logger) {
+	var err error
+	for _, wait := range cdnTries {
+		select {
+		case <-n.stopped:
+			return
+		case <-time.After(wait):
+		}
+		var server *cdn
+		if server, err = newCDN(cfg.CDN, &cfg.Params, cfg.Proxy, log); err == nil {
+			n.cdn.Store(server)
+			log.Info("block-dn usable", "server", cfg.CDN)
+			return
+		}
+		log.Debug("block-dn status", "err", err)
+	}
+	log.Warn("block-dn unusable, filters from peers", "err", err)
 }
 
 // A separate layout cannot be contaminated by an older binary's imports.
@@ -208,7 +233,7 @@ func start(cfg Config, imp *neutrino.HeadersImportConfig, log *slog.Logger, bega
 		return nil, fmt.Errorf("subscribing to peers: %w", err)
 	}
 
-	n := &Node{cs: cs, db: db, relay: newRelay(mempool.New(cfg.Mempool))}
+	n := &Node{cs: cs, db: db, relay: newRelay(mempool.New(cfg.Mempool)), stopped: make(chan struct{})}
 	ticker := time.NewTicker(time.Second)
 	n.relay.run(connected, ticker.C)
 	go func() {
@@ -284,6 +309,7 @@ func (c chainNet) current() bool { return c.cs.IsCurrent() }
 // Stop shuts the node down and closes its data. It is safe to call twice.
 func (n *Node) Stop() error {
 	n.stopOnce.Do(func() {
+		close(n.stopped)
 		n.upkeep.stop()
 		n.relay.stop()
 		n.stopErr = n.cs.Stop()
@@ -384,9 +410,9 @@ const filterBatch = 200
 // is current, it comes from the CDN with the others of its file if it can,
 // else from peers with the ones after it.
 func (n *Node) Filter(hash chainhash.Hash) ([]byte, error) {
-	if n.cdn != nil && n.cs.IsCurrent() {
+	if server := n.cdn.Load(); server != nil && n.cs.IsCurrent() {
 		if height, err := n.cs.GetBlockHeight(&hash); err == nil {
-			n.cdn.prefetch(n.cs, uint32(height))
+			server.prefetch(n.cs, uint32(height))
 		}
 	}
 	filter, err := n.cs.GetCFilter(hash, wire.GCSFilterRegular,

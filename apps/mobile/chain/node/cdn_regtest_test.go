@@ -89,6 +89,20 @@ func (f *fakeCDN) taken() []string {
 	return asked
 }
 
+// statusOnly waits for the status the node reads in the background once
+// started, then checks it was all it asked: never headers.
+func (f *fakeCDN) statusOnly(t *testing.T) {
+	t.Helper()
+	var asked []string
+	eventually(t, "the CDN's status read", func() bool {
+		asked = append(asked, f.taken()...)
+		return len(asked) > 0
+	})
+	if !slices.Equal(asked, []string{"/status"}) {
+		t.Fatalf("asked CDN for headers: %v", asked)
+	}
+}
+
 func (f *fakeCDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.asked = append(f.asked, r.URL.Path)
@@ -208,17 +222,13 @@ func TestRegtestPeerHeadersAndCDNFilters(t *testing.T) {
 	if height, hash, err := n.Tip(); err != nil || height != 0 || hash != blocks[0].hash {
 		t.Fatalf("CDN advanced tip without peers: %d %s %v", height, hash, err)
 	}
-	if asked := fake.taken(); !slices.Equal(asked, []string{"/status"}) {
-		t.Fatalf("asked CDN for headers: %v", asked)
-	}
+	fake.statusOnly(t)
 	stop(n)
 
 	// Started again, it imports nothing more and follows Core on.
 	n = run(dir, env(t, "LICASH_BITCOIND_P2P"))
 	defer stop(n)
-	if asked := fake.taken(); !slices.Equal(asked, []string{"/status"}) {
-		t.Fatalf("asked %v on restart", asked)
-	}
+	fake.statusOnly(t)
 	eventually(t, "the node to catch up with Core", func() bool {
 		height, _, err := n.Tip()
 		return err == nil && uint32(height) == tip && n.Synced()
@@ -326,10 +336,7 @@ func TestRegtestCDNHeaderFilesAreNeverRequested(t *testing.T) {
 			t.Errorf("stop: %v", err)
 		}
 	}()
-	asked := fake.taken()
-	if !slices.Equal(asked, []string{"/status"}) {
-		t.Fatalf("asked CDN for headers: %v", asked)
-	}
+	fake.statusOnly(t)
 	eventually(t, "the node to catch up with Core from its peer", func() bool {
 		height, hash, err := n.Tip()
 		return err == nil && uint32(height) == tip && hash == blocks[tip].hash && n.Synced()
