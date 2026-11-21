@@ -17,6 +17,22 @@ announced on Nostr to pick from, or takes one by its address. While a new
 wallet first catches up with Bitcoin, Home lists each step and its
 progress; later, its "Catching up" line opens them.
 
+Home says when bitcoin paid to the wallet waits outside the balance and no
+protection is offered for it ("N sat on Bitcoin, not in your balance"); it
+opens the page for what is on Bitcoin, which lists each hub's protection to
+open. A payment that finds too little to pay with, and nothing in notes,
+says so in plain words and sends the payer to that page, or to Receive if
+nothing is held.
+
+Every tap answers. A button doing work shows it, with the seconds; a sheet
+that starts work stays open on it and gives the reason in place if it
+fails; a close of a protection goes on in the background if the sheet is
+left. A payment's outcome, a finished action and a switch are felt as a
+short haptic, which follows the system's touch feedback setting and asks no
+permission, and an outcome's title is announced by a screen reader. Screens
+fade and slide a little the way they go, and the steps of a payment fade;
+the system's animation setting scales both, or turns them off.
+
 Tap a fee in a payment review or its history for the amount, percentage,
 and supplied recipient split. Current direct-payment estimates show base
 plus percentage times amount, rounded up like the hub. Payouts and moves
