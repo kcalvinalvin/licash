@@ -12,7 +12,7 @@ use licash_e2e::{
     until, Eco, OUTSIDE,
 };
 use licash_nostr::{wallet, Route};
-use licash_wallet::PaymentCode;
+use licash_wallet::{PaymentCode, PaymentNote};
 use serde_json::json;
 
 /// The most keeping its notes few costs at a time, in sat: the wallet
@@ -521,6 +521,8 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let body = text.strip_prefix("licash:").unwrap_or(&text);
     phone.tagged("to", &body[..10], 10).await?;
     phone.tagged("arrives", "Instantly", 10).await?;
+    // A note for Bob, sealed for him alone.
+    phone.fill_id("note-field", "for the pizza").await?;
     phone.tap_id("confirm").await?;
     phone.tagged("result", "Sent", 60).await?;
     // Bob, kept as a contact once paid.
@@ -532,6 +534,13 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     ensure!(
         collected(&bob, 60).await? == 5_000,
         "Bob got other than 5000"
+    );
+    let notes = bob.payment_notes()?;
+    ensure!(
+        notes
+            .values()
+            .any(|n| n.text.as_deref() == Some("for the pizza") && n.from.is_none()),
+        "Bob read no note: {notes:?}"
     );
     let after = changed(phone, held, 30).await?;
     // At most what was shown: the wallet pays no more than it quoted, the
@@ -545,7 +554,12 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     // Bob pays its code back, kept at the hub for the app, which takes it
     // there by itself: nothing mailed.
     let code: PaymentCode = phone.code().await?.parse()?;
-    let paid = wallet::pay(&bob, &code, Some(3_000)).await?;
+    // With a note, and his code: the app shows the note.
+    let thanks = PaymentNote {
+        text: Some("thanks".into()),
+        from: bobs.licash.clone(),
+    };
+    let paid = wallet::pay(&bob, &code, Some(3_000), &thanks).await?;
     ensure!(paid.paid.kept, "not kept at the hub: {paid:?}");
     let now = changed(phone, after, 90).await?;
     ensure!(now == after + 3_000, "{now} held after 3000 received");
@@ -553,6 +567,12 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     ensure!(
         lines.iter().any(|v| v.text == "Received"),
         "no payment received in the history"
+    );
+    ensure!(
+        lines
+            .iter()
+            .any(|v| v.id == "row-memo" && v.text == "thanks"),
+        "no note shown in the history"
     );
     phone.back_to("receive").await?;
     contact(phone, &bob).await?;

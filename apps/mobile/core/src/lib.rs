@@ -112,6 +112,11 @@ pub enum LicashError {
     /// The wallet's own storage failed.
     #[error("{reason}")]
     Failed { reason: String },
+    /// The hub at `hub` would not keep a payment's note with it: nothing
+    /// was paid. Pay without the note ([`Wallet::pay`]), if the user
+    /// chooses.
+    #[error("hub {hub} keeps no note with a payment")]
+    NoteUnkept { hub: String },
 }
 
 impl From<licash_wallet::Error> for LicashError {
@@ -124,6 +129,7 @@ impl From<licash_wallet::Error> for LicashError {
             E::Insufficient { needed, available } => Self::Insufficient { needed, available },
             E::UnknownHub(url) => Self::UnknownHub { url },
             E::FeesRaised { hub } => Self::FeesRaised { hub },
+            E::NoteUnkept { hub } => Self::NoteUnkept { hub },
             E::FeeRose {
                 who, agreed, asked, ..
             } => Self::FeeRose {
@@ -989,9 +995,15 @@ pub struct Activity {
     pub detail: String,
     /// When, in seconds since 1970, if known.
     pub at: Option<i64>,
-    /// What it says it was for: the memo of an invoice paid or asked for.
+    /// What it says it was for: the memo of an invoice paid or asked for,
+    /// or the note of a payment made or taken.
     #[uniffi(default = None)]
     pub memo: Option<String>,
+    /// Who paid it, as they proved to this wallet alone: their payment
+    /// code, of a payment taken whose note shared it. A contact's if
+    /// [`Wallet::contact_of`] finds one.
+    #[uniffi(default = None)]
+    pub from: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]

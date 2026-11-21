@@ -426,6 +426,13 @@ in the background: the periodic job runs while any is on its way. The
 wallet file records where each stands; a `deliveries.json` left by an
 earlier version is no longer read.
 
+Paying a code, a note may be typed for the payee, and "Share my code"
+(off by default) tells them who paid, proved to them alone: both sealed
+for the payee, the hub and relays reading neither. A hub that would not
+keep a note with a payment refuses it, nothing paid, and the app offers
+to send it without the note. The history shows a payment's note, and its
+details who paid: a contact, or a code to save as one.
+
 Settings, About, Export logs shares the app's log and the light client's as
 one file; Storage shows what the app keeps on the phone: the wallet, the Bitcoin
 light client (each network's in advanced mode), Tor's state, logs, caches and

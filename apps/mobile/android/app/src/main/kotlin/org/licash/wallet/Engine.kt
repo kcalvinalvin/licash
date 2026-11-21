@@ -1485,14 +1485,16 @@ class Engine(context: Context) {
     /**
      * Pay `code` `amount`, or what it asks: answered once its hub made the
      * payment, sent to the payee's mailbox right after, in the background.
+     * With `note` for the payee, and this wallet's code if `share`: refused
+     * at a hub that would not keep them ([LicashException.NoteUnkept]).
      */
-    suspend fun pay(code: String, amount: ULong?): Result<Paid> = io {
+    suspend fun pay(code: String, amount: ULong?, note: String? = null, share: Boolean = false): Result<Paid> = io {
         val asked = System.nanoTime()
         val paid = mutex.withLock {
             val waited = (System.nanoTime() - asked) / 1_000_000
             // What a payment waits for before it starts: a round under way.
             if (waited >= 500) AppLog.info("paying waited $waited ms for the wallet")
-            local { it.payNow(code, amount) }
+            local { it.payNow(code, amount, note, share) }
         }
         AppLog.info("paid in ${(System.nanoTime() - asked) / 1_000_000} ms")
         refresh()

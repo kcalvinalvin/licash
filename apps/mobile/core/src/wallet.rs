@@ -13,7 +13,7 @@ use licash_nostr::{
     Route,
 };
 use licash_transport::Http;
-use licash_wallet::{DepositState, PartTo, PaymentCode, Unlinking};
+use licash_wallet::{DepositState, PartTo, PaymentCode, PaymentNote, Unlinking};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
@@ -884,10 +884,20 @@ impl Wallet {
     /// Pay `amount`, or what it asks, to the payment code `code`, in notes:
     /// as [`Wallet::pay_quote`] quoted it last, else at a hub it names that
     /// the wallet trusts and holds enough at. To the payee's mailbox, or
-    /// for them to receive by hand.
-    pub fn pay(&self, code: String, amount: Option<u64>) -> Result<Paid, LicashError> {
+    /// for them to receive by hand. With `note` for the payee, and this
+    /// wallet's code if `share_code`, sealed for the payee alone: refused,
+    /// nothing paid, at a hub that would not keep them with the payment
+    /// ([`LicashError::NoteUnkept`]).
+    pub fn pay(
+        &self,
+        code: String,
+        amount: Option<u64>,
+        note: Option<String>,
+        share_code: bool,
+    ) -> Result<Paid, LicashError> {
         let _timed = crate::log::timed("pay");
-        self.paying(code, amount, true)
+        let note = self.outgoing_note(note, share_code)?;
+        self.paying(code, amount, &note, true)
     }
 
     /// [`Wallet::pay`], answered once its hub released the payment, kept
@@ -900,9 +910,12 @@ impl Wallet {
         self: Arc<Self>,
         code: String,
         amount: Option<u64>,
+        note: Option<String>,
+        share_code: bool,
     ) -> Result<Paid, LicashError> {
         let _timed = crate::log::timed("pay_now");
-        let paid = self.paying(code, amount, false)?;
+        let note = self.outgoing_note(note, share_code)?;
+        let paid = self.paying(code, amount, &note, false)?;
         let after = std::thread::Builder::new()
             .name("licash-paid".into())
             .spawn(move || {
@@ -986,7 +999,7 @@ impl Wallet {
             for (hub, reason) in &inboxed.failed {
                 tracing::warn!(%hub, %reason, "the payments kept at a hub not looked through");
             }
-            return Ok(inboxed.received.iter().map(received_activity).collect());
+            return self.received_activities(&inboxed.received);
         }
         let mut kept = self.mailbox.lock().unwrap_or_else(PoisonError::into_inner);
         let collect = licash_nostr::wallet::collect_kept(&self.wallet, &self.route, &mut kept);
@@ -998,14 +1011,32 @@ impl Wallet {
         for (at, reason) in &collected.failed {
             tracing::warn!(%at, %reason, "payments not looked for");
         }
-        Ok(collected.received.iter().map(received_activity).collect())
+        self.received_activities(&collected.received)
+    }
+
+    /// The lines of the history of the payments `received`.
+    fn received_activities(
+        &self,
+        received: &[licash_wallet::Received],
+    ) -> Result<Vec<Activity>, LicashError> {
+        let notes = self.wallet.payment_notes()?;
+        let lines = received
+            .iter()
+            .map(|r| received_activity(r, notes.get(&r.id)));
+        Ok(lines.collect())
     }
 
     /// [`Wallet::pay`], answered once its hub released the payment, kept
     /// there for the payee if it does: one it does not keep mailed to the
     /// payee's mailbox and its change unlinked `now`, else neither, left
     /// to [`Wallet::deliver`] after.
-    fn paying(&self, code: String, amount: Option<u64>, now: bool) -> Result<Paid, LicashError> {
+    fn paying(
+        &self,
+        code: String,
+        amount: Option<u64>,
+        note: &PaymentNote,
+        now: bool,
+    ) -> Result<Paid, LicashError> {
         let text = code.trim().to_owned();
         let code: PaymentCode = text.parse().map_err(LicashError::invalid)?;
         let planned = self
@@ -1021,13 +1052,16 @@ impl Wallet {
         }
         let _delivering = self.delivering();
         let paid = match &planned {
-            Some(plan) => {
+            Some(plan) => self.runtime.block_on(licash_nostr::wallet::pay_planned(
+                &self.wallet,
+                &code,
+                plan,
+                note,
+            )),
+            None => {
                 self.runtime
-                    .block_on(licash_nostr::wallet::pay_planned(&self.wallet, &code, plan))
+                    .block_on(licash_nostr::wallet::pay(&self.wallet, &code, amount, note))
             }
-            None => self
-                .runtime
-                .block_on(licash_nostr::wallet::pay(&self.wallet, &code, amount)),
         };
         let paid =
             paid.map_err(|e| LicashError::from_any(e, |reason| LicashError::Invalid { reason }))?;
@@ -1058,6 +1092,16 @@ impl Wallet {
             handover,
             undelivered: mailed.and_then(Result::err),
         })
+    }
+
+    /// The note of a payment: `text` if any, and the wallet's code if
+    /// `share`, the code [`Wallet::payment_code`] writes.
+    fn outgoing_note(&self, text: Option<String>, share: bool) -> Result<PaymentNote, LicashError> {
+        let from = match share {
+            true => self.wallet.payment_code(&self.code_hubs()?)?.licash,
+            false => None,
+        };
+        Ok(PaymentNote { text, from })
     }
 
     /// Mail the payments due to their payees' mailboxes, payment `id`
@@ -1094,7 +1138,8 @@ impl Wallet {
             received => received?,
         };
         self.unlink();
-        Ok(received_activity(&received))
+        let note = self.wallet.payment_note(&received.id)?;
+        Ok(received_activity(&received, note.as_ref()))
     }
 
     /// Take the payments in the wallet's mailbox, on the relays its hubs
@@ -1156,6 +1201,7 @@ impl Wallet {
     pub fn history(&self) -> Result<Vec<Activity>, LicashError> {
         let mut history = Vec::new();
         let me = self.wallet.address();
+        let notes = self.wallet.payment_notes()?;
         // Exact-note normalization stays hidden. Explicit/background
         // optimizations are visible, including their fee and progress.
         let sends = self
@@ -1174,6 +1220,7 @@ impl Wallet {
                 licash_wallet::State::Abandoned(why) => (State::Failed, why),
                 _ => (State::Pending, sent.hub),
             };
+            let memo = notes.get(&sent.id).and_then(|n| n.text.clone());
             history.push(Activity {
                 id: sent.id,
                 kind,
@@ -1182,7 +1229,8 @@ impl Wallet {
                 fee: sent.fee,
                 detail,
                 at: Some(sent.created_at),
-                memo: None,
+                memo,
+                from: None,
             });
         }
         let deposits = self.wallet.deposits()?;
@@ -1194,7 +1242,7 @@ impl Wallet {
         let locks: Vec<&String> = locks.collect();
         let receipts = self.wallet.receipts()?.into_iter();
         let receipts = receipts.filter(|r| !locks.contains(&&r.id));
-        history.extend(receipts.map(|r| received_activity(&r)));
+        history.extend(receipts.map(|r| received_activity(&r, notes.get(&r.id))));
         // An invoice is a payment once paid: its hub locked notes to it.
         let paid = invoices.iter().filter(|i| i.lock.is_some());
         history.extend(paid.map(invoice_activity));
@@ -1242,6 +1290,7 @@ impl Wallet {
                 // Its block's: until learned, with those under way first.
                 at: times.get(&coin.height).copied(),
                 memo: None,
+                from: None,
             });
         }
         history.sort_by_key(|a| (a.at.is_some(), std::cmp::Reverse(a.at)));
@@ -1570,6 +1619,7 @@ impl Wallet {
                 detail: "waiting for a block".into(),
                 at: None,
                 memo: None,
+                from: None,
             })
             .collect())
     }
@@ -1996,7 +2046,14 @@ fn no_invoices(memo: bool) -> String {
     }
 }
 
-fn received_activity(received: &licash_wallet::Received) -> Activity {
+/// The line of the history of `received`, saying what its `note` says.
+fn received_activity(received: &licash_wallet::Received, note: Option<&PaymentNote>) -> Activity {
+    let from = note.and_then(|n| n.from.clone()).map(|licash| PaymentCode {
+        address: None,
+        amount: None,
+        silent: None,
+        licash: Some(licash),
+    });
     Activity {
         id: received.id.clone(),
         kind: Kind::Received,
@@ -2005,7 +2062,8 @@ fn received_activity(received: &licash_wallet::Received) -> Activity {
         fee: 0,
         detail: received.hub.clone(),
         at: Some(received.received_at),
-        memo: None,
+        memo: note.and_then(|n| n.text.clone()),
+        from: from.map(|code| code.to_string()),
     }
 }
 
@@ -2052,6 +2110,7 @@ fn lightning_activity(lock: &licash_wallet::Lock, invoice: &str) -> Activity {
         detail,
         at: Some(lock.created_at),
         memo: payable.and_then(|p| p.description),
+        from: None,
     }
 }
 
@@ -2093,6 +2152,7 @@ fn invoice_activity(invoice: &licash_wallet::Invoice) -> Activity {
         detail: shown.reason.unwrap_or(shown.hub),
         at: Some(invoice.received_at.unwrap_or(invoice.created_at)),
         memo: invoice.memo.clone(),
+        from: None,
     }
 }
 
@@ -2132,6 +2192,7 @@ fn moved_activity(deposit: &licash_wallet::Deposit) -> Activity {
         detail,
         at: Some(deposit.created_at),
         memo: None,
+        from: None,
     }
 }
 

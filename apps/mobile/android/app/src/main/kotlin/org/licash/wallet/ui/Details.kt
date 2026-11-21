@@ -127,6 +127,8 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
         }
         error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
         Summary(activity, details, tx, ui.developer, txid?.let { engine.explorerLink(it) }?.let { { view(it) } })
+        // Who paid, as they proved to this wallet alone: a contact, or one to keep.
+        activity.from?.takeIf { activity.kind == Kind.RECEIVED }?.let { SaveContact(engine, it, payer = true) }
         if (unopened) {
             Text(
                 "No app here opens web links.",
@@ -425,7 +427,8 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?, develop
                 if (activity.kind == Kind.OPTIMIZED) Say("Smaller notes leave room for receiving and help recovery fit its note limit.")
             }
         }
-        activity.memo?.let { Line("Memo", it, tag = "memo") }
+        val noted = activity.kind == Kind.SENT || activity.kind == Kind.RECEIVED
+        activity.memo?.let { Line(if (noted) "Note" else "Memo", it, tag = "memo") }
         if (developer) tx?.let { Line("Confirmations", confirmations(it, details)) }
         activity.at?.let { Line("Date", at(it), tag = "date") }
         view?.let {

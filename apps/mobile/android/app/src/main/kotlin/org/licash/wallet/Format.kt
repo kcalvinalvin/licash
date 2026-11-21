@@ -79,6 +79,7 @@ fun explain(e: Throwable): String = when (e) {
     is LicashException.FeesRaised ->
         "${host(e.hub)} raised its fees since your protection there started. Approve them in Settings, under Hubs, to pay there."
     is LicashException.Failed -> plain(e.reason)
+    is LicashException.NoteUnkept -> "${host(e.hub)} can't carry a note with a payment."
     is ChainException.Failed -> plain(e.reason)
     else -> plain(e.message ?: e.toString())
 }

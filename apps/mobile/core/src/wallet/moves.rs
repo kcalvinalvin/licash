@@ -302,5 +302,6 @@ fn activity(swap: &Swap, lock_fee: u64) -> Activity {
         detail,
         at: Some(swap.created_at),
         memo: None,
+        from: None,
     }
 }

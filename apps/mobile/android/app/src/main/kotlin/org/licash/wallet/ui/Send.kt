@@ -105,6 +105,8 @@ private sealed interface Step {
     /** A hub charging more than agreed, in the way of a payment: made `again` once approved. */
     class Approve(val raised: FeesRaised, val again: () -> Unit) : Step
     data class Failed(val why: String, val title: String = "Couldn't pay") : Step
+    /** A note the hub of a payment would not carry: paid without it if the user says. */
+    data class NoNote(val code: String, val amount: ULong?, val hub: String) : Step
 
     /** Too little in the balance to pay, and bitcoin to protect into it. */
     data class ProtectFirst(val why: String) : Step
@@ -150,6 +152,9 @@ fun Send(
     }
     // This wallet's own address, once cashing out to it.
     var own by remember { mutableStateOf(ownAddress) }
+    // A note for the payee of a code, and whether to tell them who paid.
+    var note by remember { mutableStateOf("") }
+    var shareCode by remember { mutableStateOf(false) }
 
     // Too little to pay with: protection offered first, if a coin pays for
     // one, its rest joining the balance; else bitcoin held or coming, to
@@ -241,11 +246,12 @@ fun Send(
     }
 
     suspend fun paying(code: String, amount: ULong?): Step =
-        engine.pay(code, amount).fold(
+        engine.pay(code, amount, noteOf(note), shareCode).fold(
             { Step.Sent(it.amount, it.handover, code, it.kept) },
             { e ->
                 when (e) {
                     is LicashException.Pending -> Step.Later
+                    is LicashException.NoteUnkept -> Step.NoNote(code, amount, e.hub)
                     else -> unpaid(e, { step = Step.Paying(code, amount) }) {
                         step = Step.Busy
                         scope.launch { step = paying(code, amount) }
@@ -367,7 +373,9 @@ fun Send(
                                 // Or someone paid before, by name.
                                 if (cashOut == null) Contacts(engine) { read(it.code) }
                             }
-                            is Step.Paying -> Paying(engine, ui, s) { amount, shown -> plan(s, amount, shown) }
+                            is Step.Paying -> Paying(engine, ui, s, {
+                                NoteFields(note, { note = it }, shareCode, { shareCode = it })
+                            }) { amount, shown -> plan(s, amount, shown) }
                             Step.Busy -> Middle("One moment…")
                             Step.Planning -> Middle("One moment…")
                             is Step.Review -> Review(s.quote, payee(engine, s.code), s.through.takeIf { ui.developer }, { pay(s.code, s.amount) }) {
@@ -455,6 +463,18 @@ fun Send(
                             // Not to pay again: it finishes by itself.
                             Step.Later -> Told("Under way", "It finishes by itself", back)
                             is Step.Received -> Done("Received ${sat(s.amount)}", back)
+                            is Step.NoNote -> Ask(
+                                "Send without the note?",
+                                "${name(s.hub)} can't carry a note with a payment. They would get the payment, but not your note" +
+                                    (if (shareCode) " or your code." else "."),
+                                "Send without the note",
+                                {
+                                    note = ""
+                                    shareCode = false
+                                    pay(s.code, s.amount)
+                                },
+                                back,
+                            )
                             is Step.Trust -> Ask(
                                 "Take it?",
                                 "It is at ${name(s.hub)}, a hub you don't use yet. Taking it adds that hub.",
@@ -579,7 +599,13 @@ private fun Facts(facts: List<Fact>) {
  * added, what it costs is told next, once known.
  */
 @Composable
-private fun Paying(engine: Engine, ui: Ui, s: Step.Paying, pay: (amount: ULong?, shown: ULong?) -> Unit) {
+private fun Paying(
+    engine: Engine,
+    ui: Ui,
+    s: Step.Paying,
+    noting: @Composable () -> Unit,
+    pay: (amount: ULong?, shown: ULong?) -> Unit,
+) {
     var amount by remember { mutableStateOf(s.asked?.toLong()) }
     // What the wallet pays as things stand, at a hub trusted holding
     // enough: none known, a swap or a visit in the way, told next.
@@ -625,6 +651,8 @@ private fun Paying(engine: Engine, ui: Ui, s: Step.Paying, pay: (amount: ULong?,
                 ),
             )
         }
+        Spacer(Modifier.height(16.dp))
+        noting()
         Spacer(Modifier.height(24.dp))
         BigButton(if (s.visit) "Continue" else "Pay", Modifier.fillMaxWidth().testTag("confirm"), enabled = amount != null) {
             pay(if (s.asked == null) amount?.toULong() else null, exact)

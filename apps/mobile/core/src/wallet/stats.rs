@@ -533,6 +533,7 @@ mod tests {
             detail: "http://hub".into(),
             at: Some(at),
             memo: None,
+            from: None,
         }
     }
 

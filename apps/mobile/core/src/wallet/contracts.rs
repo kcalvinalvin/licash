@@ -578,6 +578,7 @@ fn activity(c: &holder::Contract) -> Option<Activity> {
         detail,
         at: Some(c.created_at),
         memo: None,
+        from: None,
     })
 }
 

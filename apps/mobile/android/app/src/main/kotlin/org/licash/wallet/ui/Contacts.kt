@@ -78,9 +78,12 @@ internal fun Contacts(engine: Engine, pay: (Contact) -> Unit) {
     }
 }
 
-/** After paying the code `code`: whom, if a contact, else keeping it as one, by a name. */
+/**
+ * After paying the code `code`, or being paid by its wallet if `payer`:
+ * whom, if a contact, else keeping it as one, by a name.
+ */
 @Composable
-internal fun SaveContact(engine: Engine, code: String) {
+internal fun SaveContact(engine: Engine, code: String, payer: Boolean = false) {
     val scope = rememberCoroutineScope()
     var looked by remember { mutableStateOf(false) }
     var known by remember { mutableStateOf<Contact?>(null) }
@@ -96,7 +99,7 @@ internal fun SaveContact(engine: Engine, code: String) {
         val contact = known
         when {
             contact != null -> Text(
-                "To ${contact.name}",
+                if (payer) "From ${contact.name}" else "To ${contact.name}",
                 modifier = Modifier.fillMaxWidth().testTag("contact"),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
