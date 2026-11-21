@@ -45,11 +45,13 @@ import java.time.DayOfWeek
 import java.time.temporal.WeekFields
 import java.util.Locale
 import org.licash.core.BalancePoint
+import org.licash.core.BalanceSample
 import org.licash.core.Stats
 import org.licash.core.Way
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.digits
+import org.licash.wallet.at
 import org.licash.wallet.explain
 import org.licash.wallet.sat
 import org.licash.wallet.share
@@ -68,11 +70,17 @@ fun StatsScreen(engine: Engine, ui: Ui, back: () -> Unit) {
     var stats by remember { mutableStateOf<Stats?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var points by remember { mutableStateOf<List<BalancePoint>>(emptyList()) }
+    // None written down yet is `null`; one that cannot be read, `failed`.
+    var samples by remember { mutableStateOf<List<BalanceSample>?>(null) }
+    var unread by remember { mutableStateOf(false) }
     val first = stats?.events?.mapNotNull { it.at }?.minOrNull()
     val firstDay = remember { WeekFields.of(Locale.getDefault()).firstDayOfWeek }
     val shown = span(period, now, ago, firstDay = firstDay)
     LaunchedEffect(ui.history) {
         engine.stats().onSuccess { stats = it; error = null }.onFailure { error = explain(it) }
+    }
+    LaunchedEffect(ui.balance) {
+        engine.balanceSamples().onSuccess { samples = it; unread = false }.onFailure { unread = true }
     }
     LaunchedEffect(period, ago, first, ui.history) {
         engine.balanceOver(instants(shown, now, first)).onSuccess { points = it }
@@ -113,6 +121,7 @@ fun StatsScreen(engine: Engine, ui: Ui, back: () -> Unit) {
         }
         Overview(summary)
         Balance(points, ui.developer)
+        Protected(samples, unread, shown, now, period)
         Flows(summary)
         Costing(summary)
         Spending(summary, ui.developer)
@@ -204,6 +213,31 @@ private fun Balance(points: List<BalancePoint>, developer: Boolean) {
             Line("Most", sat(points.maxOf { it.total }))
             Line("Least", sat(points.minOf { it.total }))
             if (developer) Line("Read at", digits(points.size.toULong()) + " moments")
+        }
+    }
+}
+
+/**
+ * How much of what was held was protected on average, from what the wallet
+ * wrote down as its balance changed: only from the first time this version
+ * ran, and only for the time it was written down, which it says.
+ */
+@Composable
+private fun Protected(samples: List<BalanceSample>?, unread: Boolean, shown: Span, now: Long, period: Period) {
+    Group("Protected") {
+        val a = averaged(samples.orEmpty(), shown, now)
+        when {
+            unread -> Say("Not available right now.")
+            samples.isNullOrEmpty() -> Say("Written down from the day this version first ran: nothing yet.")
+            a == null -> Say("Nothing was written down ${if (period == Period.ALL) "yet" else "in this " + period.word.lowercase()}.")
+            else -> {
+                Line("On average", sat(a.protected), tag = "stats-protected", share = ppmShare(a.ppm))
+                Line("Not protected", sat(a.unprotected), tag = "stats-unprotected", share = ppmShare(1_000_000L - a.ppm))
+                if (a.recorded < a.spanSecs) {
+                    Line("Written down for", "${a.recorded * 100 / a.spanSecs}% of it", tag = "stats-recorded")
+                }
+                if (a.since > shown.start) Line("Since", at(a.since), tag = "stats-since")
+            }
         }
     }
 }

@@ -8,7 +8,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.licash.core.Balance
 import org.licash.core.BalancePoint
+import org.licash.core.BalanceSample
 import org.licash.core.Flow
 import org.licash.core.StatEvent
 import org.licash.core.State
@@ -248,5 +250,78 @@ class StatsFiguresTest {
         assertEquals(false, c.up)
         assertEquals(50uL, c.by)
         assertNull(change(emptyList()))
+    }
+}
+
+class AveragedTest {
+    private fun held(notes: ULong, covered: ULong, onchain: ULong = 0uL) =
+        Balance(notes = notes, notesPending = 0uL, onchain = onchain, moving = 0uL, kept = 0uL, opening = 0uL, covered = covered)
+
+    private fun sample(at: Long, notes: ULong, covered: ULong, onchain: ULong = 0uL) =
+        BalanceSample(at = at, balance = held(notes, covered, onchain))
+
+    private val hour = 3_600L
+
+    @Test
+    fun each_sample_holds_until_the_next_and_the_average_weighs_by_time() {
+        // 100 held, 100 protected for 1 h; then 100 held, none protected for 3 h; read at hour 4.
+        val samples = listOf(sample(0, 100uL, 100uL), sample(hour, 100uL, 0uL))
+        val a = averaged(samples, EVER, now = 4 * hour)!!
+        assertEquals(25uL, a.protected)
+        assertEquals(75uL, a.unprotected)
+        assertEquals(250_000L, a.ppm)
+        assertEquals(4 * hour, a.recorded)
+        assertEquals(4 * hour, a.spanSecs)
+        assertEquals(0L, a.since)
+    }
+
+    @Test
+    fun the_share_is_all_protected_over_all_held_not_the_mean_of_shares() {
+        // An hour with 1,000 held, all protected; an hour with 10 held, none.
+        val samples = listOf(sample(0, 1_000uL, 1_000uL), sample(hour, 10uL, 0uL))
+        val a = averaged(samples, EVER, now = 2 * hour)!!
+        assertEquals(990_099L, a.ppm)
+    }
+
+    @Test
+    fun a_span_is_clipped_and_only_what_was_recorded_of_it_counts() {
+        val samples = listOf(sample(10 * hour, 100uL, 100uL))
+        // The span began before the first sample: only from it, said so.
+        val a = averaged(samples, Span(0, 20 * hour), now = 14 * hour)!!
+        assertEquals(4 * hour, a.recorded)
+        assertEquals(4 * hour, a.spanSecs)
+        assertEquals(10 * hour, a.since)
+        // One entirely before it, or not yet begun: nothing.
+        assertNull(averaged(samples, Span(0, 5 * hour), now = 14 * hour))
+        assertNull(averaged(samples, Span(30 * hour, 40 * hour), now = 14 * hour))
+        assertNull(averaged(emptyList(), EVER, now = 14 * hour))
+    }
+
+    @Test
+    fun a_gap_beyond_a_day_and_a_half_with_a_changed_balance_is_left_out() {
+        val gap = 48 * hour
+        val samples = listOf(sample(0, 100uL, 100uL), sample(gap, 100uL, 0uL))
+        // Hours 0 to 48 are unknown; the last holds from 48 to 50.
+        val a = averaged(samples, EVER, now = gap + 2 * hour)!!
+        assertEquals(2 * hour, a.recorded)
+        assertEquals(0uL, a.protected)
+        // The same balance at both ends held across it.
+        val same = listOf(sample(0, 100uL, 100uL), sample(gap, 100uL, 100uL))
+        val b = averaged(same, EVER, now = gap + 2 * hour)!!
+        assertEquals(gap + 2 * hour, b.recorded)
+        assertEquals(1_000_000L, b.ppm)
+        // The last one, old, holds for no time at all.
+        assertNull(averaged(listOf(sample(0, 100uL, 100uL)), EVER, now = 40 * hour))
+    }
+
+    @Test
+    fun what_is_on_bitcoin_is_protected_as_home_says_and_nothing_held_has_no_share() {
+        // Bitcoin held is the wallet's own: all protected, as Home counts it.
+        val a = averaged(listOf(sample(0, 100uL, 0uL, onchain = 100uL)), EVER, now = hour)!!
+        assertEquals(100uL, a.protected)
+        assertEquals(100uL, a.unprotected)
+        val none = averaged(listOf(sample(0, 0uL, 0uL)), EVER, now = hour)!!
+        assertEquals(0L, none.ppm)
+        assertEquals(hour, none.recorded)
     }
 }

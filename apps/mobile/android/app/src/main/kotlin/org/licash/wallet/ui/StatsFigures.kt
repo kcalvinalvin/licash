@@ -7,7 +7,9 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.temporal.TemporalAdjusters
 import java.util.Locale
+import org.licash.core.Balance
 import org.licash.core.BalancePoint
+import org.licash.core.BalanceSample
 import org.licash.core.Flow as Purpose
 import org.licash.core.StatEvent
 import org.licash.core.State
@@ -301,3 +303,73 @@ internal val BalancePoint.total: ULong get() = licash + bitcoin
 /** The change over `points`, none if there is no point. */
 internal fun change(points: List<BalancePoint>): Change? =
     if (points.isEmpty()) null else Change(points.first().total, points.last().total)
+
+/*
+ * How much of the balance was protected on average. Coverage is only known
+ * live, so the wallet writes its balance down as it changes; this reads
+ * those samples back. A sample holds until the next, as the wallet's balance
+ * moves only while the app runs, but not across a gap: two samples more than
+ * [HOLDS] apart that differ say nothing of the time between, which is left
+ * out and said.
+ */
+
+/** The longest a changed balance is taken to have held with no sample after it: a day and a half. */
+internal const val HOLDS = 36 * 3600L
+
+/** What the wallet held, protected and not, on average over what was recorded of a span. */
+internal data class Averaged(
+    val protected: ULong,
+    val unprotected: ULong,
+    /** Protected over all held, over the recorded time, in parts per million. */
+    val ppm: Long,
+    /** Seconds of the span that were recorded, of `spanSecs`. */
+    val recorded: Long,
+    val spanSecs: Long,
+    /** When the first sample was written: nothing is known of before it. */
+    val since: Long,
+)
+
+/**
+ * The average of `samples`, oldest first, over `span` up to `now`: none if
+ * none of it was recorded. Absolute figures are means over recorded time
+ * and the share is all protected over all held, not the mean of shares.
+ */
+internal fun averaged(samples: List<BalanceSample>, span: Span, now: Long): Averaged? {
+    if (samples.isEmpty()) return null
+    val first = samples.first().at
+    val from = maxOf(span.start, first)
+    val to = minOf(span.end, now)
+    if (to <= from) return null
+    var recorded = 0L
+    var protectedSecs = 0.0
+    var unprotectedSecs = 0.0
+    samples.forEachIndexed { i, a ->
+        val next = samples.getOrNull(i + 1)
+        // Until the next sample if it is near or says the same; the last, until now if recent.
+        val until = when {
+            next != null && (next.at - a.at <= HOLDS || same(a.balance, next.balance)) -> next.at
+            next == null && now - a.at <= HOLDS -> now
+            else -> null
+        } ?: return@forEachIndexed
+        val begin = maxOf(a.at, from)
+        val end = minOf(until, to)
+        if (end <= begin) return@forEachIndexed
+        val secs = (end - begin).toDouble()
+        val p = protection(a.balance)
+        recorded += end - begin
+        protectedSecs += p.protected.toDouble() * secs
+        unprotectedSecs += p.open.toDouble() * secs
+    }
+    if (recorded == 0L) return null
+    val all = protectedSecs + unprotectedSecs
+    return Averaged(
+        protected = (protectedSecs / recorded).toULong(),
+        unprotected = (unprotectedSecs / recorded).toULong(),
+        ppm = if (all == 0.0) 0L else (protectedSecs / all * 1_000_000).toLong(),
+        recorded = recorded,
+        spanSecs = to - from,
+        since = first,
+    )
+}
+
+private fun same(a: Balance, b: Balance) = a == b

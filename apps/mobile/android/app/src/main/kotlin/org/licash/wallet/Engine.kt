@@ -38,6 +38,7 @@ import org.licash.core.BackupFound
 import org.licash.core.BackupStep
 import org.licash.core.Balance
 import org.licash.core.BalancePoint
+import org.licash.core.BalanceSample
 import org.licash.core.ChainSource
 import org.licash.core.Code
 import org.licash.core.Contact
@@ -1106,7 +1107,15 @@ class Engine(context: Context) {
                 )
             }
         }
-        if (shown != null) watch()
+        if (shown != null) {
+            // Written down as it changes, for Stats; a failure costs only that history.
+            val balance = shown.balance
+            scope.launch {
+                runCatching { wallet?.recordBalance(balance) }
+                    .onFailure { e -> AppLog.warn("writing the balance down", e) }
+            }
+            watch()
+        }
     }
 
     /**
@@ -1428,6 +1437,9 @@ class Engine(context: Context) {
     /** What the wallet held at each of `instants`, seconds since 1970, replayed from its records. */
     suspend fun balanceOver(instants: List<Long>): Result<List<BalancePoint>> =
         io { local { it.balanceOver(instants, chainSource()) } }
+
+    /** What the wallet held as it changed, for what was protected over time: none if nothing was written down yet. */
+    suspend fun balanceSamples(): Result<List<BalanceSample>?> = io { local { it.balanceSamples() } }
 
     /** Bitcoin as the light client tells it, or, with none running, as nothing. */
     private fun chainSource(): ChainSource = light?.let { GoChain(it) } ?: NoChain
