@@ -118,6 +118,12 @@ gateway, or one and such a provider; with fewer, the page says "No route"
 beside it and the observatory tries again every few minutes, spending
 nothing. A kind that waits shows why on the Moves page.
 
+A swap is quoted at a few providers at random until one agrees to its
+limits: a fee of 1% and 100 sat, and a margin (how long the notes stay
+locked if the provider never pays) of 200 blocks or twelve hours of blocks,
+whichever is more, so that on a network of 30 second blocks a provider asking
+for 482 is not refused for a few hours of a few thousand sat.
+
 Moves are made one at a time, and each costs what the wallet holds less
 after it: fees, and anything lost. Only services that answered their last
 probe are used, a source hub only if it holds enough, and the rest at

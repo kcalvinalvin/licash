@@ -75,6 +75,14 @@ impl Network {
         }
     }
 
+    /// Seconds between two blocks.
+    fn block_secs(self) -> u64 {
+        match self {
+            Network::Mutinynet => 30,
+            _ => 600,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Network::Bitcoin => "bitcoin",
@@ -289,6 +297,7 @@ async fn serve(data: PathBuf, run: Run) -> anyhow::Result<()> {
                 fresh: (fresh * 1000) as i64,
                 shown: budget,
                 chain: run.chain.clone(),
+                block_secs: network.block_secs(),
             };
             tasks.push(tokio::spawn(Mover::new(wallet, moving)?.run()));
         }

@@ -125,7 +125,18 @@ pub struct Moving {
     /// The chain to follow payouts on and broadcast their claims to: moves
     /// on Bitcoin are made only with one.
     pub chain: Option<Source>,
+    /// Seconds between two blocks of the network: what a number of blocks
+    /// is worth in time, for the limits on how long notes may be locked.
+    pub block_secs: u64,
 }
+
+/// The most routes quoted before a swap gives up: each asks a provider, over
+/// Tor.
+const QUOTES: usize = 4;
+
+/// How long the notes of a move may stay locked should a provider never
+/// pay, at most, whatever a block takes: a move moves a few thousand sat.
+const LOCKED: Duration = Duration::from_secs(12 * 3600);
 
 /// A chain source as the wallet reads Bitcoin through it.
 struct Blocks<'a>(&'a Source);
@@ -361,6 +372,14 @@ impl<T: Transport + 'static> Mover<T> {
         kind != Kind::Chain || self.moving.chain.is_some()
     }
 
+    /// What a swap of `amount` may cost and lock: the wallet's usual
+    /// limits, and as long a margin as [`LOCKED`] is in blocks if more, so
+    /// that on a network of quick blocks a provider asking for many of them
+    /// is not refused for what is a few hours.
+    fn limits(&self, amount: u64) -> SwapLimits {
+        limits_for(amount, self.moving.block_secs)
+    }
+
     /// Make a move of `kind` now, as the budget allows: what it was
     /// quoted, once made, its outcome recorded.
     pub async fn move_now(&mut self, kind: Kind) -> Result<u64, Skipped> {
@@ -548,23 +567,37 @@ impl<T: Transport + 'static> Mover<T> {
                 }
             }
         }
-        let (provider, from, to) = pick(&routes).ok_or_else(|| {
-            Skipped::NoRoute(format!(
+        if routes.is_empty() {
+            return Err(Skipped::NoRoute(format!(
                 "no provider moves {amount} sat between two hubs, from one holding it"
-            ))
-        })?;
-        let limits = SwapLimits::usual(amount);
-        let quote = self
-            .wallet
-            .swap_quote(
-                &provider.url,
-                self.url(&from.id),
-                self.url(&to.id),
-                amount,
-                limits,
-            )
-            .await
-            .map_err(|e| Skipped::NoRoute(format!("no quote: {e}")))?;
+            )));
+        }
+        // At random, until a provider quotes: one asking more than the
+        // limits is not the end of the others.
+        shuffle(&mut routes);
+        let limits = self.limits(amount);
+        let mut refused = String::new();
+        let mut quoted = None;
+        for (provider, from, to) in routes.into_iter().take(QUOTES) {
+            let quote = self
+                .wallet
+                .swap_quote(
+                    &provider.url,
+                    self.url(&from.id),
+                    self.url(&to.id),
+                    amount,
+                    limits,
+                )
+                .await;
+            match quote {
+                Ok(quote) => {
+                    quoted = Some((provider, from, to, quote));
+                    break;
+                }
+                Err(e) => refused = format!("no quote: {e}"),
+            }
+        }
+        let (provider, from, to, quote) = quoted.ok_or(Skipped::NoRoute(refused))?;
         let locked = quote.amount + quote.fee;
         let lock_fee = self
             .wallet
@@ -736,7 +769,7 @@ impl<T: Transport + 'static> Mover<T> {
             }
             Kind::Swap => {
                 let provider = self.provider_url(plan)?;
-                let limits = SwapLimits::usual(plan.amount);
+                let limits = self.limits(plan.amount);
                 let mut swap = wallet
                     .swap(&provider, from, to, plan.amount, limits)
                     .await
@@ -1058,6 +1091,23 @@ fn same_url(a: &str, b: &str) -> bool {
     a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
+/// The limits of a swap of `amount` on a network whose blocks take
+/// `block_secs`.
+fn limits_for(amount: u64, block_secs: u64) -> SwapLimits {
+    let mut limits = SwapLimits::usual(amount);
+    let blocks = LOCKED.as_secs() / block_secs.max(1);
+    limits.margin = limits.margin.max(u32::try_from(blocks).unwrap_or(u32::MAX));
+    limits
+}
+
+/// `items` in a random order.
+fn shuffle<T>(items: &mut [T]) {
+    for i in (1..items.len()).rev() {
+        let j = (OsRng.next_u64() % (i as u64 + 1)) as usize;
+        items.swap(i, j);
+    }
+}
+
 /// One of `items`, at random.
 fn pick<T>(items: &[T]) -> Option<&T> {
     if items.is_empty() {
@@ -1082,6 +1132,30 @@ mod tests {
 #[cfg(test)]
 mod progress_tests {
     use super::*;
+
+    #[test]
+    fn a_margin_is_as_many_blocks_as_twelve_hours_where_blocks_are_quick() {
+        // Bitcoin's 10 minutes: 72 blocks, below the wallet's usual 200.
+        assert_eq!(
+            limits_for(2_000, 600).margin,
+            SwapLimits::usual(2_000).margin
+        );
+        // Mutinynet's 30 seconds: 1,440, so a provider asking for 482 is not
+        // refused for what is a few hours.
+        assert_eq!(limits_for(2_000, 30).margin, 1_440);
+        assert_eq!(limits_for(2_000, 0).margin, 43_200, "no division by zero");
+    }
+
+    #[test]
+    fn a_shuffle_keeps_every_route() {
+        let mut routes: Vec<u32> = (0..20).collect();
+        shuffle(&mut routes);
+        routes.sort_unstable();
+        assert_eq!(routes, (0..20).collect::<Vec<_>>());
+        let mut none: Vec<u32> = Vec::new();
+        shuffle(&mut none);
+        assert!(none.is_empty());
+    }
 
     #[test]
     fn a_swap_is_timed_by_its_coin_seen_unconfirmed_and_only_once() {

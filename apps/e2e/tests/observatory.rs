@@ -83,6 +83,7 @@ async fn the_observatory_moves_its_balance_between_hubs_and_records_each_move() 
         fresh: 600_000,
         shown: shown.clone(),
         chain: Some(eco.chain().parse()?),
+        block_secs: 600,
     };
     let mut mover = Mover::new(wallet, moving)?;
 
