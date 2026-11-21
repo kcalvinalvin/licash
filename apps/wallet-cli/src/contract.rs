@@ -600,22 +600,25 @@ pub async fn saw_tip(wallet: &Wallet<Http>, chain: &str) -> anyhow::Result<()> {
 /// contract of the wallet's at the hub would claim its lock's notes should
 /// the hub keep them, and a coin of the wallet's activates the lock on
 /// `chain` for less ([`activation::protects`]); else trusting the hub.
+/// Saying `memo` to its payer, if given.
 pub async fn invoice(
     wallet: &Wallet<Http>,
     path: &Path,
     chain: &str,
     hub: &str,
     amount: u64,
+    memo: Option<&str>,
 ) -> anyhow::Result<licash_wallet::Invoice> {
     let node = node(Some(chain))?;
     let tip = node.height().await.map_err(|e| anyhow::anyhow!(e))?;
     let rate = crate::onchain::rate(&node.0, None).await?;
-    if !activation::protects(wallet, path, hub, amount, rate, tip)? {
+    let protected = activation::protects(wallet, path, hub, amount, rate, tip)?;
+    if protected {
+        wallet.saw_tip(tip);
+    } else {
         tracing::info!(%hub, amount, "no contract at the hub protects the invoice's lock");
-        return Ok(wallet.invoice(hub, amount).await?);
     }
-    wallet.saw_tip(tip);
-    Ok(wallet.invoice_protected(hub, amount).await?)
+    Ok(wallet.invoice_saying(hub, amount, memo, protected).await?)
 }
 
 /// The contracts the wallet forced closed: with --chain, each carried on

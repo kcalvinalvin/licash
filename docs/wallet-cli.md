@@ -133,6 +133,10 @@ itself, never on its hub's word alone: `resume --chain <url>` tells it, as
 does the last block it scanned, and a protected payment waits, unclaimed,
 for a `resume` that knows neither.
 Without `--chain`, or where it can't, the hub is trusted with the notes.
+`invoice <amount> --memo TEXT` has the invoice say TEXT to its payer (its
+words one space apart, at most 100 characters): asked only of a hub naming
+the `memo` feature in its info, and an invoice without it is canceled, never
+printed. The hub and its Lightning node read it too. `invoices` lists it.
 An invoice another wallet asked the same hub for is paid inside the hub,
 for its amount alone, with no gateway fee.
 `pay-invoice <bolt11> --via <provider>` has a swap provider that pays

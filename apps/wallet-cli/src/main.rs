@@ -284,6 +284,10 @@ enum Command {
         /// failing back otherwise. Without, the hub is trusted with them.
         #[arg(long, env = "LICASH_WALLET_CHAIN")]
         chain: Option<String>,
+        /// What the invoice says to its payer, up to 100 characters: the
+        /// hub and its Lightning node read it too.
+        #[arg(long)]
+        memo: Option<String>,
     },
     /// The Lightning invoices asked for, newest first.
     Invoices,
@@ -1120,14 +1124,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             hub,
             qr,
             chain,
+            memo,
         } => {
             let hub = match hub {
                 Some(hub) => hub,
                 None => only_hub(&wallet)?,
             };
+            let memo = memo.as_deref();
             let invoice = match chain {
-                Some(chain) => contract::invoice(&wallet, &path, &chain, &hub, amount).await?,
-                None => wallet.invoice(&hub, amount).await?,
+                Some(chain) => {
+                    contract::invoice(&wallet, &path, &chain, &hub, amount, memo).await?
+                }
+                None => wallet.invoice_saying(&hub, amount, memo, false).await?,
             };
             eprintln!("invoice {}", invoice.hash);
             let request = invoice.request.clone().unwrap_or_default();
@@ -2144,12 +2152,13 @@ fn invoice_json(invoice: &Invoice) -> serde_json::Value {
         "hash": invoice.hash, "hub": invoice.hub, "amount": invoice.amount,
         "request": invoice.request, "state": invoice_state(&invoice.state),
         "created_at": invoice.created_at, "protected": invoice.protected,
+        "memo": invoice.memo,
     })
 }
 
 fn invoice_line(invoice: &Invoice) -> String {
     format!(
-        "{}  invoice {}  {}  via {}{}  {}",
+        "{}  invoice {}  {}  via {}{}  {}{}",
         say::when(invoice.created_at),
         invoice_state(&invoice.state),
         say::sat(invoice.amount),
@@ -2159,7 +2168,11 @@ fn invoice_line(invoice: &Invoice) -> String {
         } else {
             ""
         },
-        invoice.hash
+        invoice.hash,
+        invoice
+            .memo
+            .as_ref()
+            .map_or_else(String::new, |memo| format!("  \"{memo}\"")),
     )
 }
 

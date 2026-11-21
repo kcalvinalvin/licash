@@ -567,6 +567,26 @@ fn owners_pay_invoices_and_get_paid_over_lightning() {
         1,
         "takes 1 to 100",
     );
+    // With a memo for its payer, listed with it: open, so its invoice says
+    // it (the wallet cancels one that does not).
+    let said = ok(wallet(
+        &alice,
+        &["invoice", "5", "--memo", " Pizza  night"],
+        None,
+    ));
+    let listed = &json(&alice, &["invoices"])[0];
+    assert_eq!(listed["request"].as_str(), Some(said.trim()));
+    assert_eq!(
+        (&listed["state"], &listed["memo"]),
+        (&"open".into(), &"Pizza night".into())
+    );
+    let text = ok(wallet(&alice, &["invoices"], None));
+    assert!(text.contains("\"Pizza night\""), "{text}");
+    failed(
+        wallet(&alice, &["invoice", "5", "--memo", "\u{7}"], None),
+        1,
+        "memo",
+    );
 
     // Paying an invoice of 20 locks notes of 22 to the hub, its gateway's
     // fee on top, until the payment buys the preimage. The notes are made
