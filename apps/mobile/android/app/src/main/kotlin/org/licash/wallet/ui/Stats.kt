@@ -231,10 +231,11 @@ private fun Protected(samples: List<BalanceSample>?, unread: Boolean, shown: Spa
             samples.isNullOrEmpty() -> Say("Written down from the day this version first ran: nothing yet.")
             a == null -> Say("Nothing was written down ${if (period == Period.ALL) "yet" else "in this " + period.word.lowercase()}.")
             else -> {
-                Line("On average", sat(a.protected), tag = "stats-protected", share = ppmShare(a.ppm))
-                Line("Not protected", sat(a.unprotected), tag = "stats-unprotected", share = ppmShare(1_000_000L - a.ppm))
+                Line("Protected, on average", sat(a.protected), tag = "stats-protected", share = ppmShare(a.ppm))
+                Line("Not protected, on average", sat(a.unprotected), tag = "stats-unprotected", share = ppmShare(1_000_000L - a.ppm))
                 if (a.recorded < a.spanSecs) {
-                    Line("Written down for", "${a.recorded * 100 / a.spanSecs}% of it", tag = "stats-recorded")
+                    val pct = a.recorded * 100 / a.spanSecs
+                    Line("Written down for", if (pct == 0L) "under 1% of it" else "$pct% of it", tag = "stats-recorded")
                 }
                 if (a.since > shown.start) Line("Since", at(a.since), tag = "stats-since")
             }

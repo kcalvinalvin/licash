@@ -282,12 +282,17 @@ internal fun tallied(t: Tally): String = "${digits(t.count.toULong())} · ${sat(
 
 /**
  * The instants to read the balance at across `span`, up to `now`: the
- * start, then `steps` more spread evenly to the end. All starts at the
- * first thing that happened, `first`, if any.
+ * start, then `steps` more spread evenly to the end. A span that began
+ * before the first thing that happened, `first`, starts there; so does All.
  */
 internal fun instants(span: Span, now: Long, first: Long?, steps: Int = 24): List<Long> {
     val end = minOf(span.end, now)
-    val start = if (span == EVER) (first ?: end) else span.start
+    // From the first thing that happened if that is after the span began: before it, nothing was held.
+    val start = when {
+        span == EVER -> first ?: end
+        first != null && first > span.start -> first - 1
+        else -> span.start
+    }
     if (end <= start) return listOf(end)
     return (0..steps).map { start + (end - start) * it / steps }.distinct()
 }
@@ -367,7 +372,8 @@ internal fun averaged(samples: List<BalanceSample>, span: Span, now: Long): Aver
         unprotected = (unprotectedSecs / recorded).toULong(),
         ppm = if (all == 0.0) 0L else (protectedSecs / all * 1_000_000).toLong(),
         recorded = recorded,
-        spanSecs = to - from,
+        // Of the span so far, unless it has no beginning: then, all there is.
+        spanSecs = to - (if (span.start == Long.MIN_VALUE) from else span.start),
         since = first,
     )
 }

@@ -237,6 +237,9 @@ class StatsFiguresTest {
         assertEquals(listOf(1_000L, 1_500L), instants(span, now = 1_500, first = null, steps = 1))
         // One not begun is read once.
         assertEquals(listOf(500L), instants(span, now = 500, first = null))
+        // A span that began before the first thing that happened starts there, less a second.
+        assertEquals(listOf(1_000L, 1_500L), instants(span, now = 1_500, first = 500, steps = 1))
+        assertEquals(listOf(499L, 1_000L), instants(span.copy(start = 0), now = 1_000, first = 500, steps = 1))
         // All starts at the first thing that happened.
         assertEquals(listOf(100L, 600L), instants(EVER, now = 600, first = 100, steps = 1))
         assertEquals(listOf(600L), instants(EVER, now = 600, first = null))
@@ -289,8 +292,9 @@ class AveragedTest {
         // The span began before the first sample: only from it, said so.
         val a = averaged(samples, Span(0, 20 * hour), now = 14 * hour)!!
         assertEquals(4 * hour, a.recorded)
-        assertEquals(4 * hour, a.spanSecs)
         assertEquals(10 * hour, a.since)
+        // Of the span so far, from its start: 4 of 14 hours.
+        assertEquals(14 * hour, a.spanSecs)
         // One entirely before it, or not yet begun: nothing.
         assertNull(averaged(samples, Span(0, 5 * hour), now = 14 * hour))
         assertNull(averaged(samples, Span(30 * hour, 40 * hour), now = 14 * hour))
