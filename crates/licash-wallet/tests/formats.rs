@@ -53,7 +53,7 @@ fn stored_formats_still_read() {
 }
 
 #[tokio::test]
-#[ignore = "writes the fixtures: only for a new format, with a migration"]
+#[ignore = "writes the fixtures: only for a new format, with a migration or at a reset"]
 async fn write_fixtures() {
     let net = Net::new();
     net.start(HUB, Fee { base: 2, ppm: 0 });

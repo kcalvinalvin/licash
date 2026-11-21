@@ -23,9 +23,11 @@ use crate::Error;
 
 pub(crate) use licash_store::now;
 
-/// The component the ledger's tables are, and its version.
+/// The component the ledger's tables are, and its version. 2 issues notes
+/// of the note format v3; a ledger of 1 holds v2 notes, keysets and
+/// proofs, and is refused rather than read under the other rule.
 pub(crate) const COMPONENT: &str = "ledger";
-pub(crate) const VERSION: i64 = 1;
+pub(crate) const VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE meta (

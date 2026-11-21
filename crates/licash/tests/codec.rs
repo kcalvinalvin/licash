@@ -8,7 +8,7 @@ use licash::{
     spend::{Output, Proposal},
 };
 
-const NOTE_TAG: &[u8] = b"LICASH-NT\x02";
+const NOTE_TAG: &[u8] = b"LICASH-NT\x03";
 /// Tag, keyset, public fields, C, evidence tag, DLEQ, blinding, commitment.
 const LINKED_NOTE_BYTES: usize = 10 + 32 + 104 + 33 + 1 + 64 + 32 + 66;
 

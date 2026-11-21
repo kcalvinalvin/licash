@@ -104,6 +104,8 @@ fn contents(dir: &Path) -> Vec<Vec<u8>> {
 fn info(height: Option<u32>) -> String {
     let fixture = include_str!("../../../../crates/licash-wallet/tests/fixtures/info.json");
     let mut info: serde_json::Value = serde_json::from_str(fixture).unwrap();
+    // No fee to lock: what is free is what is held less what is reserved.
+    info["fees"]["lock"] = serde_json::json!({ "base": 0, "ppm": 0 });
     info["locks"] = match height {
         Some(height) => serde_json::json!({
             "checkpoint": "00", "height": height, "window": 1000, "reaction": 6,

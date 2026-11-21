@@ -4,7 +4,7 @@ use anyhow::{bail, ensure, Result};
 use licash::base::{ChainTerms, Fees, GraphTerms, Limits, Recipe};
 use licash::chain::Checkpoint;
 use licash::note::Keyset;
-use licash::recovery::{CHAINED_FROM, COMPACT_FROM, LEAN_FROM, OWN_CLAIMS_FROM};
+use licash::recovery::{BOUND_BASE_FROM, CHAINED_FROM, COMPACT_FROM, LEAN_FROM};
 use licash::spend::ChainProfile;
 use licash_contract::graph::RETURNING;
 use licash_contract::opening::{Bounds, Floors, Quote};
@@ -380,7 +380,7 @@ impl Timing {
     /// program contracts open under decides it, else the last before.
     fn graph_id(&self) -> u32 {
         match crate::trust(self.profile) {
-            Ok(t) if t.chained.is_some() && t.own_claims => OWN_CLAIMS_FROM,
+            Ok(t) if t.chained.is_some() && t.own_claims => BOUND_BASE_FROM,
             Ok(t) if t.chained.is_some() => CHAINED_FROM,
             Ok(t) if t.lean => LEAN_FROM,
             Ok(t) if t.compact => COMPACT_FROM,
@@ -513,7 +513,8 @@ mod tests {
     /// year 24 sat more; one that doesn't, at its fixed fee alone. Regtest's
     /// mock decides the lean filing, so it quotes the graph of its id (10);
     /// signet's program reads the exit on the hub's header chain and owes a claim
-    /// of the same contract no evidence against another, and quotes 12.
+    /// of the same contract no evidence against another, and quotes 13 (its
+    /// notes of the note format v3).
     #[test]
     fn the_fixed_quote_is_pinned() {
         let parts = Hub::peek(funded()).unwrap().base.parts().clone();
@@ -522,16 +523,16 @@ mod tests {
             (
                 None,
                 [
-                    "c3b45fd557c7d133a33eaea1d13bb90ccd9297a06bac32f402da04245279d2e1",
-                    "af18dfd843a6ea1476141a3b3062335bf11c7555af4d35101c95206d29fd5c83",
+                    "9026bf72eb0305efb1854048eb4148f85f19be45da5e138b64b62b75dca7d6c1",
+                    "86b3ff30860a94f69eebd60baf1057bc6345505ad9139993ce76fbba95d3fe18",
                 ],
                 3_000,
             ),
             (
                 Some(RANGE),
                 [
-                    "dec65303b03cd77361b2e93c675979780ee189a5b7bbddbcacbaa6962c488102",
-                    "b931abecc6d664189696e6f99243eb0ff2eb99cae216009fdaa44b5a901dc7b9",
+                    "d228449bc10012ad87898bd119bd0941495f6ae9fd2eccb2768096c69520df54",
+                    "614d5d7c22d961526e211e8cd4393fb81e5c485cfd83defacf47ae59edd05dd2",
                 ],
                 3_024,
             ),
@@ -552,7 +553,7 @@ mod tests {
             assert_eq!(signet, signet_digest);
             let at = Timing::of(ChainProfile::Core30Signet, range).unwrap();
             let graph = at.quote(keyset.clone(), checkpoint.clone()).graph.id;
-            assert_eq!(graph, licash::recovery::OWN_CLAIMS_FROM);
+            assert_eq!(graph, licash::recovery::BOUND_BASE_FROM);
             assert_eq!((bounds.lock, bounds.response_window), (1_000, 12));
         }
     }

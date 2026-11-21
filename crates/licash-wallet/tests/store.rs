@@ -33,7 +33,7 @@ fn a_wallet_file_says_what_it_is_and_is_whole() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let broken: Option<String> = db
         .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
         .ok()
@@ -55,6 +55,30 @@ fn a_file_of_an_earlier_layout_is_refused_and_left_as_it_is() {
     let refused = Wallet::open(&path(&dir), Link(Net::new())).err().unwrap();
     assert!(refused.to_string().contains("earlier"), "{refused}");
     assert!(Wallet::create(&path(&dir), &[7; 32], REGTEST, Link(Net::new())).is_err());
+    assert_eq!(std::fs::read(path(&dir)).unwrap(), before);
+}
+
+/// A wallet of the version before (schema 3) holds notes of the note
+/// format v2, whose issuance proofs this version does not verify: it is
+/// refused, said to be another version's, and left for that version.
+#[test]
+fn a_wallet_of_the_version_before_is_refused_and_left_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Wallet::create(&path(&dir), &[7; 32], REGTEST, Link(Net::new())).unwrap());
+    Connection::open(path(&dir))
+        .unwrap()
+        .execute(
+            "UPDATE schema_versions SET version = 3 WHERE component = 'wallet'",
+            [],
+        )
+        .unwrap();
+    let before = std::fs::read(path(&dir)).unwrap();
+    let refused = Wallet::open(&path(&dir), Link(Net::new())).err().unwrap();
+    let why = refused.to_string();
+    assert!(
+        why.contains("earlier version") && why.contains("schema 3"),
+        "{why}"
+    );
     assert_eq!(std::fs::read(path(&dir)).unwrap(), before);
 }
 
@@ -156,6 +180,6 @@ fn one_backup_holds_the_tables_of_every_component_in_the_file() {
     assert_eq!(n, 42);
     assert_eq!(
         licash_store::component_version(&copy, "wallet").unwrap(),
-        Some(3)
+        Some(4)
     );
 }

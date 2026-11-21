@@ -58,6 +58,13 @@ pub const CHAINED_FROM: u32 = 11;
 /// against it. Before it, any claim but the one judged is.
 pub const OWN_CLAIMS_FROM: u32 = 12;
 
+/// The first graph id whose notes are of the note format v3, the issuance
+/// proof's challenge hashing its base ([`crate::crypto::dleq_prove`]), and
+/// otherwise judged as [`OWN_CLAIMS_FROM`]'s. It names the change rather
+/// than selecting a rule: the Base of an earlier graph embeds a keyset of
+/// the format before, which this code no longer reads.
+pub const BOUND_BASE_FROM: u32 = 13;
+
 /// Whether, in a contract of graph `id`, another claim of the same
 /// contract voids the notes it holds ([`OWN_CLAIMS_FROM`]).
 pub fn own_claims_void(id: u32) -> bool {

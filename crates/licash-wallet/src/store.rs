@@ -18,9 +18,11 @@ use crate::Error;
 
 pub(crate) use licash_store::now;
 
-/// The component the wallet's tables are, and its version.
+/// The component the wallet's tables are, and its version. 4 holds notes
+/// of the note format v3 (issuance proofs whose challenge hashes their
+/// base); a file of 3 holds v2 notes, which this version cannot spend.
 const COMPONENT: &str = "wallet";
-const VERSION: i64 = 3;
+const VERSION: i64 = 4;
 
 /// A stage of an operation is a table of its own where its columns are
 /// known together (the terms of a deposit, the claim of a payout, a lock's
@@ -490,6 +492,12 @@ impl Store {
         let conn = licash_store::open(path, Kind::Wallet).map_err(setup)?;
         match licash_store::component_version(&conn, COMPONENT).map_err(setup)? {
             Some(VERSION) => {}
+            Some(v) if v < VERSION => {
+                return Err(Error::Setup(format!(
+                    "a wallet of an earlier version (schema {v}, this version reads {VERSION}), \
+                     left as it is: spend or pay out its notes with that version"
+                )))
+            }
             Some(v) => {
                 return Err(Error::Setup(format!(
                     "wallet schema {v}, this version reads {VERSION}"

@@ -263,6 +263,16 @@ fn init_never_replaces_a_seed_or_ledger_and_open_needs_both_matching() {
         .unwrap();
     let why = setup_error(Hub::open(&a.seed, &a.db, Policy::default()));
     assert!(why.contains("schema 3"), "{why}");
+    // A ledger of the release before holds notes of the note format v2:
+    // refused by its schema, not taken for another hub's seed.
+    sql(&a.db)
+        .execute(
+            "UPDATE schema_versions SET version = 1 WHERE component = 'ledger'",
+            [],
+        )
+        .unwrap();
+    let why = setup_error(Hub::open(&a.seed, &a.db, Policy::default()));
+    assert!(why.contains("schema 1"), "{why}");
 }
 
 /// The keyset the hub issues under is its first by index, whatever the
@@ -1594,7 +1604,7 @@ fn the_ledger_is_a_component_of_a_hub_file_and_its_rows_hold_to_their_states() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
     // Rows by themselves: what each refers to is not under test.
     db.pragma_update(None, "foreign_keys", false).unwrap();
 

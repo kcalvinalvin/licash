@@ -21,10 +21,10 @@ use crate::{
 };
 
 const TAG: &[u8] = b"licash/note/v2";
-const NOTE_TAG: &[u8] = b"LICASH-NT\x02";
+const NOTE_TAG: &[u8] = b"LICASH-NT\x03";
 const DST: &[u8] = b"LICASH-V2-secp256k1_XMD:SHA-256_SSWU_RO_";
-const KEYSET_TAG: &[u8] = b"LICASH-KS\x02";
-const ISSUED_TAG: &[u8] = b"LICASH-IS\x02";
+const KEYSET_TAG: &[u8] = b"LICASH-KS\x03";
+const ISSUED_TAG: &[u8] = b"LICASH-IS\x03";
 const MAX_KEYS: usize = 64;
 pub const PUBLIC_FIELDS_BYTES: usize = 8 + 32 + 32 + 32;
 pub const MESSAGE_BYTES: usize = TAG.len() + PUBLIC_FIELDS_BYTES;
@@ -41,8 +41,12 @@ pub(crate) fn non_identity(point: &Point) -> Result<ProjectivePoint, Error> {
     Ok(decoded)
 }
 
+/// The note format, which every keyset id commits to. v3 is v2 with an
+/// issuance proof whose challenge hashes its base
+/// ([`crate::crypto::dleq_prove`]): a note, keyset or Base of v2 is refused
+/// by its framing and id, never verified under the other rule.
 fn format_commitment() -> [u8; 32] {
-    tagged_hash("licash/note-format/v2", &[TAG, DST])
+    tagged_hash("licash/note-format/v3", &[TAG, DST])
 }
 
 /// Separately typed public issuer metadata. Its ID commits the exact note
@@ -389,7 +393,7 @@ impl Note {
         )
     }
 
-    /// `LICASH-NT\x02 ‖ keyset ‖ public fields ‖ C ‖ evidence`, the evidence
+    /// `LICASH-NT\x03 ‖ keyset ‖ public fields ‖ C ‖ evidence`, the evidence
     /// a tag (0 Unlinked, 1 Linked, 2 Granted) and its fields in order.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = NOTE_TAG.to_vec();
@@ -578,7 +582,7 @@ impl MintResponse {
         &self.proof
     }
 
-    /// `LICASH-IS\x02 ‖ keyset ‖ denomination ‖ B ‖ C' ‖ DLEQ ‖ R1 ‖ R2`.
+    /// `LICASH-IS\x03 ‖ keyset ‖ denomination ‖ B ‖ C' ‖ DLEQ ‖ R1 ‖ R2`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let p = &self.proof;
         let mut bytes = ISSUED_TAG.to_vec();

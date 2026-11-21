@@ -12,7 +12,7 @@ use k256::{AffinePoint, NonZeroScalar, ProjectivePoint, Scalar, U256};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::ec::{msm, Pt};
+use crate::ec::{gen_mul, msm, Pt};
 use crate::Error;
 
 /// A compressed secp256k1 point (33 bytes), serialized as hex.
@@ -182,7 +182,8 @@ pub fn unblind(
 }
 
 /// A proof that `C_ = k B_` for the `k` behind the issuer's public key `K = k G`.
-/// Chaum-Pedersen as in Cashu NUT-12: `e = H(R1 || R2 || K || C_)`, `s = r + e k`.
+/// Chaum-Pedersen as in Cashu NUT-12, but with the base in the challenge:
+/// `e = H(R1 || R2 || K || B_ || C_)`, `s = r + e k` ([`dleq_challenge`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dleq {
     pub e: ScalarBytes,
@@ -198,6 +199,7 @@ pub fn dleq_prove(k: &Scalar, blinded: &ProjectivePoint, blind_sig: &ProjectiveP
         &Pt::from_projective(&r1),
         &Pt::from_projective(&r2),
         &Pt::from_projective(&issuer_pub),
+        &Pt::from_projective(blinded),
         &Pt::from_projective(blind_sig),
     );
     let s = r + e * k;
@@ -207,13 +209,19 @@ pub fn dleq_prove(k: &Scalar, blinded: &ProjectivePoint, blind_sig: &ProjectiveP
     }
 }
 
-fn dleq_challenge(r1: &Pt, r2: &Pt, issuer_pub: &Pt, blind_sig: &Pt) -> Scalar {
+/// The challenge hashes the whole statement, `K = kG` and `sig = k base`,
+/// with the commitments: `G` is fixed, but `base` varies from proof to
+/// proof (`B_` at issuance, `Y` once unlinked). Left out, a prover who
+/// knows `k` could pick the base after the challenge, and so the blinding
+/// `r` of a linked proof, and prove a `C` that is not `kY`.
+fn dleq_challenge(r1: &Pt, r2: &Pt, issuer_pub: &Pt, base: &Pt, blind_sig: &Pt) -> Scalar {
     let h = tagged_hash(
-        "licash/dleq",
+        "licash/dleq/v2",
         &[
             &r1.to_point().0,
             &r2.to_point().0,
             &issuer_pub.to_point().0,
+            &base.to_point().0,
             &blind_sig.to_point().0,
         ],
     );
@@ -233,7 +241,7 @@ pub fn dleq_verify_blinded(
     let neg_e = -e;
     let r1 = msm(&[(Pt::generator(), s), (*issuer_pub, neg_e)]);
     let r2 = msm(&[(*blinded, s), (*blind_sig, neg_e)]);
-    if dleq_challenge(&r1, &r2, issuer_pub, blind_sig) == e {
+    if dleq_challenge(&r1, &r2, issuer_pub, blinded, blind_sig) == e {
         Ok(())
     } else {
         Err(Error::BadDleq)
@@ -260,7 +268,7 @@ pub fn dleq_commit(w: &Scalar, blinded: &ProjectivePoint) -> DleqCommit {
 /// (`B_ = Y + rG`, `C = C_ - rK`) with the holder's secret `alpha`,
 /// `beta`. Since `wY = R2 - rR1`, the commitment for `(Y, C)` is
 /// `R1' = R1 + alpha G + beta K`, `R2' = wY + alpha Y + beta C`, with
-/// challenge `e' = H(R1', R2', K, C)`. Returns `(e' + beta, e')`: the
+/// challenge `e' = H(R1', R2', K, Y, C)`. Returns `(e' + beta, e')`: the
 /// first goes to the issuer, whose answer `s = w + (e' + beta) k` makes
 /// `(e', s + alpha)` a DLEQ on `(Y, C)` (`dleq_unblind`). Neither
 /// `e' + beta` nor `s` says anything of `(e', s + alpha)` without `alpha`
@@ -282,7 +290,7 @@ pub fn dleq_blind(
         (*issuer_pub, *beta),
     ]);
     let r2b = msm(&[(r2, Scalar::ONE), (r1, -*r), (*y, *alpha), (*c, *beta)]);
-    let e = dleq_challenge(&r1b, &r2b, issuer_pub, c);
+    let e = dleq_challenge(&r1b, &r2b, issuer_pub, y, c);
     Ok((e + beta, e))
 }
 
@@ -312,7 +320,7 @@ pub fn dleq_unblind(
 /// Verify a DLEQ on unblinded values, as a third party with `(Y, C, r)`
 /// does. With `B_ = Y + r G` and `C_ = C + r K`, `R2 = s B_ - e C_ = s Y -
 /// e C + r R1`: MSMs of two, one and three terms instead of six scalar
-/// multiplications.
+/// multiplications, and `r G` for the challenge's `B_`.
 pub fn dleq_verify_unblinded(
     proof: &Dleq,
     issuer_pub: &Pt,
@@ -324,9 +332,10 @@ pub fn dleq_verify_unblinded(
     let s = proof.s.to_scalar()?;
     let neg_e = -e;
     let r1 = msm(&[(Pt::generator(), s), (*issuer_pub, neg_e)]);
+    let blinded = y.add(&gen_mul(r));
     let blind_sig = c.add(&msm(&[(*issuer_pub, *r)]));
     let r2 = msm(&[(*y, s), (*c, neg_e), (r1, *r)]);
-    if dleq_challenge(&r1, &r2, issuer_pub, &blind_sig) == e {
+    if dleq_challenge(&r1, &r2, issuer_pub, &blinded, &blind_sig) == e {
         Ok(())
     } else {
         Err(Error::BadDleq)
@@ -453,6 +462,51 @@ mod tests {
         // forged C with a valid-looking DLEQ fails
         let forged = gen_mul(&random_scalar());
         assert!(dleq_verify_blinded(&proof, &kpt, &Pt::from_projective(&b_), &forged).is_err());
+    }
+
+    #[test]
+    fn a_linked_proof_binds_its_blinding() {
+        // Knowing k, a prover picks R1 = rho G, R2 = rho Y and C_ = kY + G,
+        // and r = e / s after the challenge: then s G - e K = R1 and
+        // s Y - e C + r R1 = R2 for C = C_ - rK, which is not kY.
+        let k = random_scalar();
+        let kpt = gen_mul(&k);
+        let y = gen_mul(&random_scalar());
+        let rho = random_scalar();
+        let (r1, r2) = (gen_mul(&rho), msm(&[(y, rho)]));
+        let c_ = msm(&[(y, k)]).add(&Pt::generator());
+        let forge = |e: Scalar| {
+            let s = rho + e * k;
+            let r = e * s.invert().unwrap();
+            let c = c_.add(&msm(&[(kpt, -r)]));
+            let proof = Dleq {
+                e: ScalarBytes::from_scalar(&e),
+                s: ScalarBytes::from_scalar(&s),
+            };
+            (proof, c, r)
+        };
+        // Under a challenge without the base, as before, it verified.
+        let unbound = |r1: &Pt, r2: &Pt| {
+            let parts = [r1, r2, &kpt, &c_].map(|p| p.to_point().0);
+            scalar_from_hash(&tagged_hash(
+                "licash/dleq",
+                &parts.each_ref().map(|p| &p[..]),
+            ))
+        };
+        let (proof, c, r) = forge(unbound(&r1, &r2));
+        assert_ne!(c.to_point(), msm(&[(y, k)]).to_point());
+        let e = proof.e.to_scalar().unwrap();
+        let s = proof.s.to_scalar().unwrap();
+        let r1v = msm(&[(Pt::generator(), s), (kpt, -e)]);
+        let r2v = msm(&[(y, s), (c, -e), (r1v, r)]);
+        assert_eq!(unbound(&r1v, &r2v), e);
+        // With the base in the challenge, no choice of it made before r is
+        // the base after it.
+        for base in [y, y.add(&Pt::generator())] {
+            let e = dleq_challenge(&r1, &r2, &kpt, &base, &c_);
+            let (proof, c, r) = forge(e);
+            assert!(dleq_verify_unblinded(&proof, &kpt, &y, &c, &r).is_err());
+        }
     }
 
     #[test]

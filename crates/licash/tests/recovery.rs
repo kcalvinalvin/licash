@@ -2793,10 +2793,17 @@ fn an_invalid_item_of_a_lean_claim_is_worth_nothing_and_the_rest_is_owed() {
 /// cooperative close's, never published, say): from graph id 12 on, the
 /// one before, of the same contract, voids none of her notes; before it,
 /// it voids those both hold, as any other claim does. A claim of another
-/// contract voids them under either.
+/// contract voids them under either. Graph id 13, which only names the
+/// note format v3, is judged as 12.
 #[test]
 fn a_claim_of_the_same_contract_voids_her_notes_only_before_graph_id_12() {
-    for id in [recovery::OWN_CLAIMS_FROM - 1, recovery::OWN_CLAIMS_FROM] {
+    assert!(recovery::chained(recovery::BOUND_BASE_FROM));
+    let ids = [
+        recovery::OWN_CLAIMS_FROM - 1,
+        recovery::OWN_CLAIMS_FROM,
+        recovery::BOUND_BASE_FROM,
+    ];
+    for id in ids {
         let o = open_at(id);
         let keyset = o.base.parts().keyset.clone();
         let ds: Vec<_> = (0..2).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
