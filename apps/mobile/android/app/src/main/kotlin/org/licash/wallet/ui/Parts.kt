@@ -40,6 +40,7 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalBottomSheetProperties
@@ -66,6 +67,7 @@ import androidx.compose.ui.graphics.vector.addPathNodes
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -157,7 +159,11 @@ fun Group(title: String, content: @Composable ColumnScope.() -> Unit) {
 @Composable
 fun Divider() = HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
-/** The one thing to do on a screen; `quiet`, another beside it. */
+/**
+ * The one thing to do on a screen; `quiet`, another beside it. `busy`, its
+ * work under way: a spinner before its label, which then says what is
+ * going on, and no tap until it is done.
+ */
 @Composable
 fun BigButton(
     text: String,
@@ -165,24 +171,31 @@ fun BigButton(
     enabled: Boolean = true,
     quiet: Boolean = false,
     danger: Boolean = false,
+    busy: Boolean = false,
     onClick: () -> Unit,
 ) {
     val shape = RoundedCornerShape(18.dp)
     val label: @Composable RowScope.() -> Unit = {
+        if (busy) {
+            CircularProgressIndicator(Modifier.size(18.dp), color = LocalContentColor.current, strokeWidth = 2.dp)
+            Spacer(Modifier.width(10.dp))
+        }
         Text(text, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
     val colors = MaterialTheme.colorScheme
+    val on = enabled && !busy
+    val shown = modifier.height(56.dp).semantics { if (busy) stateDescription = "Working" }
     when {
-        quiet -> FilledTonalButton(onClick, modifier.height(56.dp), enabled, shape, content = label)
+        quiet -> FilledTonalButton(onClick, shown, on, shape, content = label)
         danger -> Button(
             onClick,
-            modifier.height(56.dp),
-            enabled,
+            shown,
+            on,
             shape,
             ButtonDefaults.buttonColors(containerColor = colors.error, contentColor = colors.onError),
             content = label,
         )
-        else -> Button(onClick, modifier.height(56.dp), enabled, shape, content = label)
+        else -> Button(onClick, shown, on, shape, content = label)
     }
 }
 
@@ -357,8 +370,14 @@ fun Toggle(
     means: String? = null,
     set: (Boolean) -> Unit,
 ) {
+    val feel = rememberFeel()
+    // The row and its switch both turn it: felt once, as it turns.
+    val turn = { to: Boolean ->
+        feel.toggle(to)
+        set(to)
+    }
     Row(
-        Modifier.fillMaxWidth().clickable { set(!on) }.heightIn(min = 56.dp).padding(vertical = 4.dp),
+        Modifier.fillMaxWidth().clickable { turn(!on) }.heightIn(min = 56.dp).padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         icon?.let { Tile(it, MaterialTheme.colorScheme.primary) }
@@ -372,7 +391,7 @@ fun Toggle(
             }
         }
         Spacer(Modifier.width(12.dp))
-        Switch(checked = on, onCheckedChange = set, modifier = Modifier.testTag("toggle $title"))
+        Switch(checked = on, onCheckedChange = turn, modifier = Modifier.testTag("toggle $title"))
     }
 }
 
