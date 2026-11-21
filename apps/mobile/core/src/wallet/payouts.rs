@@ -65,6 +65,32 @@ impl Wallet {
         self.payout_offer(&asked, best)
     }
 
+    /// About the most [`Wallet::payout_quote`] pays out to `address` from
+    /// `hub`, else the hub trusted holding the most: the most of the swap
+    /// providers kept, by their own terms, and no more than all the notes
+    /// there pay. None if none kept pays out from there. Asked once none
+    /// pays an amount out, to offer the most instead.
+    pub fn payout_most(
+        &self,
+        address: String,
+        hub: Option<String>,
+    ) -> Result<Option<u64>, LicashError> {
+        let _timed = crate::log::timed("payout_most");
+        let hub = match hub {
+            Some(hub) => hub,
+            None => self.richest()?,
+        };
+        let held = all_but_fees(self.held(&hub)?);
+        let relays = hub_relays(&self.wallet)?;
+        let infos = self.operation(self.announced.infos(&self.wallet, &relays))?;
+        let mut most = None;
+        for info in &infos {
+            let one = (self.wallet).payout_most(info, &hub, address.trim(), claim_rate())?;
+            most = most.max(one);
+        }
+        Ok(most.map(|m| m.min(held)).filter(|m| *m > 0))
+    }
+
     /// The quotes of [`Wallet::payout_quote`] through each swap provider
     /// that pays it out, in the order it prefers them: to choose from.
     /// Those that cannot are left out; refused if none can.

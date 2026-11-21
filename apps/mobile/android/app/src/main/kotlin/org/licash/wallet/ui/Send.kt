@@ -69,6 +69,8 @@ import org.licash.wallet.explain
 import org.licash.wallet.feeOf
 import org.licash.wallet.host
 import org.licash.wallet.noHub
+import org.licash.wallet.noPayout
+import org.licash.wallet.offeredInstead
 import org.licash.wallet.sat
 import org.licash.wallet.share
 
@@ -107,6 +109,9 @@ private sealed interface Step {
     /** A hub charging more than agreed, in the way of a payment: made `again` once approved. */
     class Approve(val raised: FeesRaised, val again: () -> Unit) : Step
     data class Failed(val why: String, val title: String = "Couldn't pay") : Step
+
+    /** No provider pays out as much as asked: about `most` is offered instead. */
+    data class TooMuch(val why: String, val address: String, val most: ULong) : Step
     /** A note the hub of a payment would not carry: paid without it if the user says. */
     data class NoNote(val code: String, val amount: ULong?, val hub: String) : Step
 
@@ -200,7 +205,11 @@ fun Send(
         step = Step.Quoting
         return engine.payoutQuote(address, amount, cashOut).fold(
             { Step.Payout(it, amount) },
-            { tooLittle(it, "Can't send on Bitcoin") },
+            { e ->
+                // Too much for any provider: the most they pay out, if less, to send instead.
+                val most = if (noPayout(e)) offeredInstead(amount, engine.payoutMost(address, cashOut).getOrNull()) else null
+                most?.let { Step.TooMuch(explain(e), address, it) } ?: tooLittle(e, "Can't send on Bitcoin")
+            },
         )
     }
 
@@ -534,6 +543,18 @@ fun Send(
                                 BigButton("Cancel", Modifier.fillMaxWidth().testTag("cancel"), quiet = true, onClick = back)
                             }
                             is Step.Adding -> Told("Adding ${sat(s.amount)}", ADDING, back)
+                            is Step.TooMuch -> Outcome(
+                                Tone.ASK,
+                                "Can't send that much on Bitcoin",
+                                "${s.why}\n\nThe providers pay out about ${sat(s.most)} now.",
+                                detailTag = "too-much",
+                            ) {
+                                BigButton("Use ${sat(s.most)}", Modifier.fillMaxWidth().testTag("use-most")) {
+                                    quote(s.address, s.most)
+                                }
+                                Spacer(Modifier.height(12.dp))
+                                BigButton("Cancel", Modifier.fillMaxWidth().testTag("cancel"), quiet = true, onClick = back)
+                            }
                             is Step.NothingYet -> Ask(
                                 "Nothing to pay with yet",
                                 "${s.why}\n\n$RECEIVE_FIRST",

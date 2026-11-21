@@ -230,13 +230,25 @@ impl Announcements {
         wallet: &Wallet<T>,
         relays: &[String],
     ) -> Result<usize, Error> {
+        Ok(self.infos(wallet, relays).await?.len())
+    }
+
+    /// What each swap provider kept from `relays` for `wallet`'s network
+    /// says of itself, as [`Announcements::warm`] asks them: those that
+    /// answered, none if none is kept.
+    pub async fn infos<T: Transport>(
+        &self,
+        wallet: &Wallet<T>,
+        relays: &[String],
+    ) -> Result<Vec<licash_api::swaps::Info>, Error> {
         let Some(found) = self.kept(relays, wallet.network().name()) else {
-            return Ok(0);
+            return Ok(Vec::new());
         };
         let found = self.chosen(found, &HashSet::new());
         let ask = |url: String| async move { wallet.provider_info(&url).await };
         let nostr: fn(&licash_api::swaps::Info) -> Option<&str> = |i| i.nostr.as_deref();
-        Ok(self.asked(found, ask, nostr, None).await?.len())
+        let answered = self.asked(found, ask, nostr, None).await?;
+        Ok(answered.into_iter().map(|(_, _, info)| info).collect())
     }
 
     /// Those of `found` to ask: each the wallet went through before (at a

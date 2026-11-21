@@ -994,6 +994,36 @@ async fn a_provider_declining_fails_the_payout_before_any_coin() {
 }
 
 #[tokio::test]
+async fn the_most_a_provider_pays_out_is_its_largest_coin_less_the_claims_fee() {
+    let eco = Eco::new().await;
+    let info = eco.client.provider_info(PROVIDER).await.unwrap();
+    let most = eco
+        .client
+        .payout_most(&info, A, PAYEE, ONE_SAT)
+        .unwrap()
+        .expect("it pays out from A");
+    assert!(most < TERMS.max, "{most}");
+    let quote = |amount| {
+        eco.client
+            .payout_quote(PROVIDER, A, PAYEE, amount, MAX_FEE, ONE_SAT)
+    };
+    assert_eq!(quote(most).await.unwrap().value(), TERMS.max);
+    match quote(most + 1).await {
+        Err(Error::Invalid(reason)) => assert!(reason.contains("pays out coins of"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    // A provider paying nothing out on Bitcoin pays out no most.
+    let none = swaps::Info {
+        chain: None,
+        ..info
+    };
+    assert_eq!(
+        eco.client.payout_most(&none, A, PAYEE, ONE_SAT).unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn a_payout_is_refused_beyond_its_terms_before_any_lock() {
     let eco = Eco::new().await;
     let quote = |to: &'static str, amount: u64, max_fee: u64| {

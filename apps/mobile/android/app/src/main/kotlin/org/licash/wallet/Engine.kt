@@ -1598,6 +1598,9 @@ class Engine(context: Context) {
     suspend fun payoutQuote(address: String, amount: ULong?, hub: String? = null): Result<PayoutQuote> =
         io { local { it.payoutQuote(address, amount, hub) } }
 
+    /** About the most [payoutQuote] pays out to `address`, by the providers' own terms: none if none does. */
+    suspend fun payoutMost(address: String, hub: String?): Result<ULong?> = io { local { it.payoutMost(address, hub) } }
+
     /** The quotes of [payoutQuote] through every provider that pays it out. */
     suspend fun payoutOffers(address: String, amount: ULong?, hub: String?): Result<List<PayoutQuote>> =
         io { local { it.payoutOffers(address, amount, hub) } }

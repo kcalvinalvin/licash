@@ -185,7 +185,9 @@ out on Bitcoin (`licash-swaps run --chain URL`) announced on a relay a hub of
 the app names (`--nostr-relay URL --announce-url URL`); a hub's page, behind
 the balance, cashes out notes there to an address that way, all of them or
 an amount chosen. A `licash:` code is paid in notes only, through a swap to
-a hub it names if the app trusts none.
+a hub it names if the app trusts none. An amount no provider pays out offers
+about the most one does instead (its largest coin less the claim's fee, and
+no more than the notes there pay), with a button to send that.
 
 Lightning invoices are paid the cheapest way found: through a trusted hub's
 gateway, or through a swap provider announced the same way that pays

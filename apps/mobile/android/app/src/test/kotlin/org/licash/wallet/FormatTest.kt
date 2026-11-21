@@ -1,7 +1,11 @@
 package org.licash.wallet
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.licash.core.LicashException
 
 class FormatTest {
     @Test
@@ -67,5 +71,17 @@ class FormatTest {
             "No one can move 1,500 sat between your hubs right now. Try less, or later.",
             plain("no swap provider found moves 1500 sat from http://a:1 to http://b:2 now"),
         )
+    }
+
+    @Test
+    fun the_most_providers_pay_out_is_offered_only_below_what_was_asked() {
+        assertTrue(noPayout(LicashException.Invalid("no swap provider found pays 20000 sat out on Bitcoin now")))
+        assertFalse(noPayout(LicashException.Invalid("not an address")))
+        assertEquals(15_000uL, offeredInstead(20_000uL, 15_000uL))
+        // Nothing asked (all of it), none found, or no less: nothing to offer.
+        assertNull(offeredInstead(null, 15_000uL))
+        assertNull(offeredInstead(20_000uL, null))
+        assertNull(offeredInstead(20_000uL, 20_000uL))
+        assertNull(offeredInstead(20_000uL, 0uL))
     }
 }

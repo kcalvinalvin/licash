@@ -1187,6 +1187,8 @@ fn a_phone_pays_out_to_bitcoin_addresses_and_codes_of_hubs_it_does_not_trust() {
     assert!(invalid(quote).contains("no swap provider"));
     let all = alice.payout_quote(address.into(), None, None);
     assert!(invalid(all).contains("no swap provider"));
+    // Nor any most to offer instead.
+    assert_eq!(alice.payout_most(address.into(), None).unwrap(), None);
     assert!(!alice.follow_payouts(light.clone()).unwrap());
     let history = alice.history().unwrap();
     assert!(

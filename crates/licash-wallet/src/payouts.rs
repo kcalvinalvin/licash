@@ -329,6 +329,32 @@ impl<T: Transport> Wallet<T> {
         terms.quote(info, Preimage::draw())
     }
 
+    /// The most the provider saying `info` of itself pays out to `to`
+    /// from a lock at hub `from`, added, by its terms as said: its largest
+    /// coin less what the coin holds for its claim's fee at `rate` at
+    /// least. None if it pays nothing out on Bitcoin, or takes no lock at
+    /// `from`. A quote may still refuse it, for its timing or its fees.
+    pub fn payout_most(
+        &self,
+        info: &swaps::Info,
+        from: &str,
+        to: &str,
+        rate: FeeRate,
+    ) -> Result<Option<u64>, Error> {
+        let from = hub_url(from)?;
+        let (script, _, _) = self.payout_payee(to)?;
+        let (_, from_info) = self.hub(&from)?;
+        let Some(chain) = info.chain else {
+            return Ok(None);
+        };
+        if info.hub(&from_info.address).is_none() || info.address == from_info.address {
+            return Ok(None);
+        }
+        let budget = claim_budget(&script, chain.max, &chain, rate)?;
+        let most = chain.max.saturating_sub(budget);
+        Ok((most > 0 && chain.max >= chain.min).then_some(most))
+    }
+
     /// Pay out as `quote` says, under its ticket: lock the coin's value and
     /// the fees to the provider at its hub, then claim the coin it locks
     /// on Bitcoin. The provider is asked again: refused as
@@ -1323,14 +1349,7 @@ impl Terms<'_> {
                 chain.margin
             ));
         }
-        let rate = chain
-            .rate
-            .max(MIN_RATE)
-            .max(self.rate.to_sat_per_kwu().saturating_mul(4));
-        let budget = claim_vsize(self.script, self.amount)?
-            .saturating_mul(rate)
-            .saturating_mul(HEADROOM)
-            .div_ceil(1000);
+        let budget = claim_budget(self.script, self.amount, &chain, self.rate)?;
         let value = self.amount.saturating_add(budget);
         if value < chain.min || value > chain.max {
             return refuse(format!(
@@ -1374,6 +1393,25 @@ impl Terms<'_> {
 
 /// The virtual size of a claim paying `amount` to `script`, refused if
 /// that is dust: the same whatever its keys and coin.
+/// What a coin of `chain`'s paying `amount` to `script` holds on top for
+/// its claim's fee: at the provider's rate or `rate`, whichever is more,
+/// with headroom.
+fn claim_budget(
+    script: &ScriptBuf,
+    amount: u64,
+    chain: &swaps::Chain,
+    rate: FeeRate,
+) -> Result<u64, Error> {
+    let rate = chain
+        .rate
+        .max(MIN_RATE)
+        .max(rate.to_sat_per_kwu().saturating_mul(4));
+    Ok(claim_vsize(script, amount)?
+        .saturating_mul(rate)
+        .saturating_mul(HEADROOM)
+        .div_ceil(1000))
+}
+
 fn claim_vsize(script: &ScriptBuf, amount: u64) -> Result<u64, Error> {
     let key = SecretKey::from_slice(&[1; 32]).expect("a secret key");
     let preimage = [0; 32];

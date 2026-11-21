@@ -128,5 +128,11 @@ fun duration(blocks: Long, blockSecs: Long = 600): String {
 fun at(seconds: Long): String =
     DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(seconds * 1000))
 
+/** Whether `e` says no swap provider pays the amount out on Bitcoin now. */
+fun noPayout(e: Throwable): Boolean = e is LicashException.Invalid && NO_PAYOUT.matches(e.reason)
+
+/** The most to offer instead of `asked`, none paying it out: `most`, if some and less. */
+fun offeredInstead(asked: ULong?, most: ULong?): ULong? = most?.takeIf { asked != null && it in 1uL until asked }
+
 /** Whether `e` says no hub the code names holds the amount and its fee: the payer holds too little there. */
 fun noHub(e: Throwable): Boolean = e is LicashException.Invalid && NO_HUB.matches(e.reason)
