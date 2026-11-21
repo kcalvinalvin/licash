@@ -365,9 +365,11 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
 /// `docs/r0.md` names. Each program contracts opened under is kept as
 /// `r0/programs/<image id>.bin`: the contracts opened under one are
 /// proven with it alone, so none named here or in [`SIGNET_BEFORE`] is
-/// ever to go. A contract keeps its program when this one changes.
+/// to go while this build reads their Bases. A contract keeps its program
+/// when this one changes. Its notes are of the note format v3 (graph id
+/// [`licash::recovery::BOUND_BASE_FROM`]).
 pub const SIGNET: [u8; 32] =
-    hex!("493d2f799f14ef9980e933837d14578643e9a51c5d5e8c8f16a9e0b7eabe52da");
+    hex!("152617b235fb8866611a01eb0abc5e6946392b098658b6b0df23ae756a4dc6b9");
 
 /// Whether [`SIGNET`] decides the compact filing: true only for a program
 /// built from a tree whose `licash::recovery` reads it, and set in the
@@ -406,40 +408,12 @@ pub const CHAIN: [u8; 32] =
 
 /// The programs signet's (and Mutinynet's) contracts opened under before [`SIGNET`], newest
 /// first: no contract opens under them, and those that did are played still
-/// if of a Base this build reads, the sixth form only: one opened on an
-/// earlier form (under `ce4d7a00…` or before) is no longer read nor played.
-/// `83642842…` reads the sixth form of a Base and every header of the exit (graph
-/// id 10): its contracts' proofs grow with their age, where those of [`SIGNET`]
-/// (graph id 11, the exit read on the hub's header chain) do not.
-/// `48b9bedf…` is the program of graph id 11 as it stood before a claim of
-/// the same contract stopped voiding her notes (graph id 12, [`SIGNET`]): the
-/// same chain program, [`CHAIN`], and the same statement for graphs up to 11.
-/// `ce4d7a00…` reads the Bases of earlier forms too (v3 to v5), and judges a
-/// lock's activation unanchored under v3: the program after it reads the
-/// sixth form of a Base only, whose default returns her reserve to a script
-/// of its own (the hub's deposit that swaps it for notes).
-/// `a2458fdb…` decides the compact filing and not the lean one (graph id
-/// 10 on): its contracts, of graph id 9, file the compact one.
-/// `531b465d…` is the statement before it moved into this repository's
-/// `licash-statement` and her dealing was bound to the contract: the same
-/// statement and journal, built from Lichen's. `7214a539…` and `817b4034…` decide no compact filing (their contracts,
-/// graph ids 8 and below, file the legacy one) and hash each header in
-/// software, more than once: 28 k cycles a header, not 9.4 k. `aa7f2d19…`
-/// reads v3 and v4 Bases, not the co-funded v5. `6bf78e60…`'s
-/// statement (of v3 Bases) checks no signature of her request, reads a
-/// request's digits above 15 as Bitcoin doesn't, and owes a lock's Refund
-/// before it expired: a trial's exposure, left to its contracts' end.
-pub const SIGNET_BEFORE: [[u8; 32]; 9] = [
-    hex!("48b9bedfefa1edf9566ee9e7b5d35482e268cdc0bdc2602a40a1d46a12886bad"),
-    hex!("836428422619ff8ad43d37899a7206396ae13115a67df459e0a4b748768d9d11"),
-    hex!("ce4d7a006e422b7e73a37b6f5d9c9290a2af7e7c0451662504ce4799bfadcf2c"),
-    hex!("a2458fdbd126c100b82bb50e8934fe4f5f4c2a5a80e981f4ca63c6f189dfab8d"),
-    hex!("531b465ddc59b1a1f2295c97b54d7e090e0ced23b443084ba9e51dad1524dc64"),
-    hex!("7214a5393e19298874c6a864efd9e0c9beb221e68440df52b5a949f4b0f87734"),
-    hex!("817b403459c7b3ed2ea6dd707f0a75b7cc8ac564a601c74da6de92d9c0b6bd52"),
-    hex!("aa7f2d19079b339b1fee1e7666f445232f012965dc7c0ab8c35fb560a4d68a73"),
-    hex!("6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c"),
-];
+/// if of a Base this build reads. None since the note format v3: every
+/// earlier Base embeds a keyset of the format before, which this build does
+/// not read, so the programs of those contracts (`493d2f79…` and the nine
+/// before it, kept in `r0/programs/` up to commit 5904ef57) are played by
+/// the release before alone, whose hubs and wallets serve them to their end.
+pub const SIGNET_BEFORE: [[u8; 32]; 0] = [];
 
 /// The programs contracts on `profile` opened under before the one they
 /// open under now ([`trust`]): played still, of a Base this build reads.
@@ -546,24 +520,12 @@ mod tests {
     fn the_hub_statement_image_is_pinned() {
         assert_eq!(
             SIGNET,
-            hex!("493d2f799f14ef9980e933837d14578643e9a51c5d5e8c8f16a9e0b7eabe52da"),
+            hex!("152617b235fb8866611a01eb0abc5e6946392b098658b6b0df23ae756a4dc6b9"),
             "keep every funded contract's pinned guest available when changing opening trust"
         );
-        assert_eq!(
-            SIGNET_BEFORE,
-            [
-                hex!("48b9bedfefa1edf9566ee9e7b5d35482e268cdc0bdc2602a40a1d46a12886bad"),
-                hex!("836428422619ff8ad43d37899a7206396ae13115a67df459e0a4b748768d9d11"),
-                hex!("ce4d7a006e422b7e73a37b6f5d9c9290a2af7e7c0451662504ce4799bfadcf2c"),
-                hex!("a2458fdbd126c100b82bb50e8934fe4f5f4c2a5a80e981f4ca63c6f189dfab8d"),
-                hex!("531b465ddc59b1a1f2295c97b54d7e090e0ced23b443084ba9e51dad1524dc64"),
-                hex!("7214a5393e19298874c6a864efd9e0c9beb221e68440df52b5a949f4b0f87734"),
-                hex!("817b403459c7b3ed2ea6dd707f0a75b7cc8ac564a601c74da6de92d9c0b6bd52"),
-                hex!("aa7f2d19079b339b1fee1e7666f445232f012965dc7c0ab8c35fb560a4d68a73"),
-                hex!("6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c"),
-            ],
-            "a program contracts opened under is never to go"
-        );
+        // Emptied at the note format v3, whose build reads no earlier Base:
+        // otherwise a program contracts opened under is never to go.
+        assert_eq!(SIGNET_BEFORE, [[0; 32]; 0]);
     }
 
     #[test]

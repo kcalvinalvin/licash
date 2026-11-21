@@ -301,8 +301,12 @@ mod tests {
         let genuine = crate::SIGNET;
         store.keep_claim_terms(&[1; 32], &kept([5; 32])).unwrap();
         store.keep_claim_terms(&[2; 32], &kept(genuine)).unwrap();
-        let before = crate::SIGNET_BEFORE[0];
-        store.keep_claim_terms(&[4; 32], &kept(before)).unwrap();
+        // The program contracts opened under before the note format v3,
+        // whose Bases this build no longer reads: not among those before.
+        let retired =
+            hex_literal::hex!("493d2f799f14ef9980e933837d14578643e9a51c5d5e8c8f16a9e0b7eabe52da");
+        assert!(!crate::SIGNET_BEFORE.contains(&retired));
+        store.keep_claim_terms(&[4; 32], &kept(retired)).unwrap();
         let all = [
             contract(1, 4_096, 360),
             contract(2, 4_096, 360),
@@ -319,12 +323,9 @@ mod tests {
             ids
         };
         // On signet, of the genuine programs alone, the one contracts
-        // open under and those they opened under before; of none whose
-        // state cannot be read, kept or not.
-        assert_eq!(
-            terms_on(ChainProfile::Core30Signet, "signet.sqlite"),
-            [2, 4]
-        );
+        // open under and those they opened under before (none since the
+        // reset); of none whose state cannot be read, kept or not.
+        assert_eq!(terms_on(ChainProfile::Core30Signet, "signet.sqlite"), [2]);
         // Under the mock authority, any program.
         let regtest = ChainProfile::Core30DefaultRegtest;
         assert_eq!(terms_on(regtest, "regtest.sqlite"), [1, 2, 4]);
