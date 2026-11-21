@@ -230,9 +230,14 @@ async fn lightning(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.tap_id("set-amount").await?;
     phone.tap_id("amount").await?;
     phone.type_text("4000").await?;
+    // A memo for the payer: hub 1 puts one in its invoices.
+    phone.fill_id("memo-field", "Pizza night").await?;
     phone.tap_id("done").await?;
     phone.tagged("way", "Lightning invoice", 10).await?;
     phone.tagged("asking", "4,000 sat", 10).await?;
+    phone
+        .tagged("memo", "\u{201c}Pizza night\u{201d}", 10)
+        .await?;
     // In upper case, as a QR code holds it best.
     let shown = phone.qr(60).await?;
     let request = shown.to_lowercase();
@@ -253,6 +258,7 @@ async fn lightning(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     );
     opened(phone, "Received over Lightning").await?;
     phone.tagged("state", "In your balance", 10).await?;
+    phone.tagged("memo", "Pizza night", 10).await?;
     phone.back().await?;
     phone.back_to("receive").await?;
     Ok(())

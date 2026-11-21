@@ -532,6 +532,7 @@ mod tests {
             fee,
             detail: "http://hub".into(),
             at: Some(at),
+            memo: None,
         }
     }
 

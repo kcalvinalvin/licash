@@ -112,6 +112,17 @@ private fun ActivityRow(activity: Activity, now: Long, coming: Boolean = false, 
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            // What it says it was for, as its payer or payee read it.
+            activity.memo?.let {
+                Text(
+                    it,
+                    modifier = Modifier.testTag("row-memo"),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = colors.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
             when {
                 failed -> Text("Failed", style = MaterialTheme.typography.bodySmall, color = colors.error)
                 under -> Text(

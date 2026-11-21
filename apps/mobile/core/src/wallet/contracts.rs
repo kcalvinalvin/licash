@@ -319,11 +319,13 @@ impl Wallet {
     /// a contract of the wallet's there would claim its lock's notes should
     /// the hub keep them, at the chain's height last seen, and a coin of the
     /// wallet's activates the lock at the rate last read
-    /// ([`holder::activation::protects`]); else trusting the hub.
+    /// ([`holder::activation::protects`]); else trusting the hub. Saying
+    /// `memo` to its payer, if given.
     pub(super) fn invoice_at(
         &self,
         url: &str,
         amount: u64,
+        memo: Option<&str>,
     ) -> Result<licash_wallet::Invoice, licash_wallet::Error> {
         let rate = super::recoveries::last_rate();
         let protects = holder::activation::protects(
@@ -340,10 +342,8 @@ impl Wallet {
         });
         // Protected only against a height the wallet knows of itself.
         let protected = protected && matches!(self.wallet.tip(), Ok(Some(_)));
-        match protected {
-            true => (self.runtime).block_on(self.wallet.invoice_protected(url, amount)),
-            false => self.runtime.block_on(self.wallet.invoice(url, amount)),
-        }
+        let asked = self.wallet.invoice_saying(url, amount, memo, protected);
+        self.runtime.block_on(asked)
     }
 
     /// `all`, each with what it protects of the notes held now.
@@ -577,6 +577,7 @@ fn activity(c: &holder::Contract) -> Option<Activity> {
         fee: 0,
         detail,
         at: Some(c.created_at),
+        memo: None,
     })
 }
 

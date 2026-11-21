@@ -540,5 +540,6 @@ fn activity(payout: &Payout, lock_fee: u64) -> Activity {
         fee,
         detail,
         at: Some(payout.created_at),
+        memo: None,
     }
 }

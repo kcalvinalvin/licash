@@ -13,9 +13,13 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -33,12 +37,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.licash.core.Code
 import org.licash.core.DonationAddress
+import org.licash.core.Hub
 import org.licash.core.LightningInvoice
 import org.licash.core.State
 import org.licash.wallet.Engine
@@ -110,6 +117,16 @@ internal fun donationWords(address: DonationAddress): String {
     }
 }
 
+/** The most characters of an invoice's memo, as the hub takes it. */
+internal const val MAX_MEMO = 100
+
+/** Whether a hub among `hubs` makes invoices saying a memo to their payer. */
+internal fun memoTaken(hubs: List<Hub>): Boolean = hubs.any { it.lightning?.memo == true }
+
+/** What is typed as a memo: its words, one space apart, none if blank. */
+internal fun memoOf(typed: String): String? =
+    typed.split(Regex("\\s+")).filter { it.isNotEmpty() }.joinToString(" ").take(MAX_MEMO).ifEmpty { null }
+
 /**
  * What the payer of an invoice asked for an amount pays, and what the
  * wallet gets of it: in words, those differing from the amount only.
@@ -140,12 +157,17 @@ fun Receive(engine: Engine, back: () -> Unit) {
     // The amount typed in, in place of the QR code: asked for once done.
     var editing by remember { mutableStateOf(false) }
     var typed by remember { mutableStateOf<Long?>(null) }
+    // Said to the payer of an invoice, at a hub that says one: typed with the amount.
+    var memo by rememberSaveable { mutableStateOf<String?>(null) }
+    var typedMemo by remember { mutableStateOf("") }
     val edit = {
         typed = amount
+        typedMemo = memo.orEmpty()
         editing = true
     }
     val done = {
         amount = typed
+        memo = memoOf(typedMemo)
         editing = false
     }
     var received by remember { mutableStateOf<String?>(null) }
@@ -202,11 +224,14 @@ fun Receive(engine: Engine, back: () -> Unit) {
     LaunchedEffect(shownDonations) {
         shownDonations?.let { engine.keepDonationAddress(it) }
     }
-    LaunchedEffect(lightning, amount) {
+    // An invoice is what an amount asks for, unless another way was.
+    val invoicing = (chosen?.takeIf { it in ways } ?: picked(1, takesLightning)) == Way.LIGHTNING
+    val memoed = memo?.takeIf { lightning }
+    LaunchedEffect(lightning, amount, memoed) {
         invoice = null
         val asked = amount?.takeIf { lightning } ?: return@LaunchedEffect
         error = null
-        engine.askInvoiceFor(asked.toULong())
+        engine.askInvoiceFor(asked.toULong(), memoed)
             .onSuccess { invoice = it }
             .onFailure { error = explain(it) }
     }
@@ -221,6 +246,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
                 State.DONE -> {
                     received = "Received ${sat(followed.amount)}"
                     amount = null
+                    memo = null
                     return@LaunchedEffect
                 }
                 State.FAILED -> {
@@ -288,6 +314,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
                     Spacer(Modifier.height(32.dp))
                     AmountField(typed, { typed = it }) { done() }
                     Spacer(Modifier.height(16.dp))
+                    if (invoicing && memoTaken(ui.hubs)) MemoField(typedMemo, { typedMemo = it }) { done() }
                 }
                 lightning && request != null -> QrCode(request.uppercase())
                 lightning -> if (amount != null && error == null) Waiting()
@@ -333,6 +360,15 @@ fun Receive(engine: Engine, back: () -> Unit) {
                     modifier = Modifier.testTag("asking"),
                     style = MaterialTheme.typography.titleMedium,
                 )
+                memoed?.let {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "\u201c$it\u201d",
+                        modifier = Modifier.testTag("memo"),
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center,
+                    )
+                }
             }
             // What the payer pays and the wallet gets, and what the hub is waiting for: nothing else.
             val made = invoice?.takeIf { request != null }
@@ -377,6 +413,35 @@ fun Receive(engine: Engine, back: () -> Unit) {
             }
         }
     }
+}
+
+/**
+ * A memo for the invoice, typed under its amount: its payer reads it, and so
+ * do the hub and its Lightning node, which the words under it say.
+ */
+@Composable
+private fun MemoField(memo: String, onMemo: (String) -> Unit, done: () -> Unit) {
+    OutlinedTextField(
+        value = memo,
+        onValueChange = { onMemo(it.take(MAX_MEMO)) },
+        modifier = Modifier.fillMaxWidth().testTag("memo-field"),
+        singleLine = true,
+        label = { Text("Memo (optional)") },
+        keyboardOptions = KeyboardOptions(
+            capitalization = KeyboardCapitalization.Sentences,
+            imeAction = ImeAction.Done,
+        ),
+        keyboardActions = KeyboardActions(onDone = { done() }),
+        shape = RoundedCornerShape(14.dp),
+    )
+    Spacer(Modifier.height(4.dp))
+    Text(
+        "The payer sees it, and so do the hub and its Lightning node.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        textAlign = TextAlign.Center,
+    )
+    Spacer(Modifier.height(16.dp))
 }
 
 /** Where a QR code shows once made. */

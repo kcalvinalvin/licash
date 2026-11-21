@@ -1,9 +1,15 @@
 package org.licash.wallet.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.licash.core.DonationAddress
+import org.licash.core.Hub
+import org.licash.core.LightningTerms
+import org.licash.core.Range
+import org.licash.core.Rate
 
 class ReceiveTest {
     @Test
@@ -36,6 +42,27 @@ class ReceiveTest {
             "The payer pays 100,001 sat\nYou get 100,000 sat, the hub's fee taken",
             invoiceWords(100_002u, 100_001u, 100_000u),
         )
+    }
+
+    @Test
+    fun a_memo_is_its_words_one_space_apart_and_none_if_blank() {
+        assertNull(memoOf(""))
+        assertNull(memoOf("  \n\t "))
+        assertEquals("Lunch on Friday", memoOf("  Lunch \n on\tFriday "))
+        assertEquals(MAX_MEMO, memoOf("x".repeat(MAX_MEMO + 5))?.length)
+    }
+
+    @Test
+    fun a_memo_is_offered_only_where_a_hub_says_one_in_its_invoices() {
+        val terms = LightningTerms(Rate(0uL, 0uL), Rate(0uL, 0uL), Range(1uL, 1_000uL))
+        fun hub(lightning: LightningTerms?) = Hub(
+            url = "https://hub.example", feeBase = 0uL, feePpm = 0uL, feeOutputMsat = 0uL, deposits = null,
+            silent = false, mailbox = false, lightningPay = null, lockFee = Rate(0uL, 0uL),
+            refundFee = Rate(0uL, 0uL), depositFee = null, lightning = lightning, contracts = null,
+        )
+        assertFalse(memoTaken(emptyList()))
+        assertFalse(memoTaken(listOf(hub(null), hub(terms))))
+        assertTrue(memoTaken(listOf(hub(terms), hub(terms.copy(memo = true)))))
     }
 
     @Test

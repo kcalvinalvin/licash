@@ -1527,9 +1527,10 @@ class Engine(context: Context) {
     /**
      * Ask the hub taking it for least for a Lightning invoice asking the
      * payer `amount`, its fee in it: the notes it pays the wallet, less.
+     * Saying `memo` to the payer, if given, which the hub reads too.
      */
-    suspend fun askInvoiceFor(amount: ULong): Result<LightningInvoice> = io {
-        val asked = locked { it.askInvoiceFor(amount) }
+    suspend fun askInvoiceFor(amount: ULong, memo: String? = null): Result<LightningInvoice> = io {
+        val asked = locked { it.askInvoiceFor(amount, memo) }
         // Perhaps paid out of sight: looked for now and then for a while.
         prefs.askedAt = System.currentTimeMillis() / 1000
         refresh()

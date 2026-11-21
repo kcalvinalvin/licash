@@ -675,6 +675,7 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
         fee: 1,
         detail: hubs[0].url.clone(),
         at: history[0].at,
+        memo: None,
     };
     assert_eq!(history[0], sent);
 
@@ -1298,13 +1299,13 @@ fn a_phone_paid_over_lightning_takes_the_notes_and_shows_the_invoice() {
     let one = Rate { base: 1, ppm: 0 };
     assert_eq!(fees, (one, one, Some(Rate { base: 100, ppm: 0 })));
     // More than its hub takes over Lightning: said before asking.
-    let refused = invalid(alice.ask_invoice(10_001));
+    let refused = invalid(alice.ask_invoice(10_001, None));
     assert!(
         refused.contains("takes 10001 sat over Lightning"),
         "{refused}"
     );
 
-    let asked = alice.ask_invoice(500).unwrap();
+    let asked = alice.ask_invoice(500, None).unwrap();
     let shown = (asked.hub.as_str(), asked.amount, asked.asks, asked.state);
     assert_eq!(shown, (hub.url.as_str(), 500, Some(503), State::Pending));
     let request = asked.request.clone().unwrap();
@@ -1342,7 +1343,7 @@ fn a_phone_paid_over_lightning_takes_the_notes_and_shows_the_invoice() {
 
     // One whose payment its hub refuses, its HTLCs expiring too soon:
     // canceled unpaid, and in the history no more.
-    let refused = alice.ask_invoice(20).unwrap();
+    let refused = alice.ask_invoice(20, None).unwrap();
     net.node.pay_held(held(&refused.hash), net.height() + 1);
     net.runtime.block_on(net.lightning.round());
     let canceled = alice.follow_invoice(refused.hash.clone()).unwrap();
@@ -1358,7 +1359,7 @@ fn a_phone_asks_for_an_invoice_of_the_amount_entered_its_fee_in_it() {
     let alice = net.wallet("alice", net.height());
     let hub = alice.hubs().unwrap().remove(0);
     // Its hub takes 3 sat on each: the payer pays 500, Alice gets 497.
-    let asked = alice.ask_invoice_for(500).unwrap();
+    let asked = alice.ask_invoice_for(500, None).unwrap();
     let shown = (asked.hub.as_str(), asked.amount, asked.asks, asked.state);
     assert_eq!(shown, (hub.url.as_str(), 497, Some(500), State::Pending));
     let hash = held(&asked.hash);
@@ -1371,11 +1372,11 @@ fn a_phone_asks_for_an_invoice_of_the_amount_entered_its_fee_in_it() {
     // Its notes at least 1 sat, at most 10,000: the fee alone is too much,
     // or more than it takes.
     for invoiced in [3, 10_004] {
-        let refused = invalid(alice.ask_invoice_for(invoiced));
+        let refused = invalid(alice.ask_invoice_for(invoiced, None));
         let said = format!("takes an invoice of {invoiced} sat over Lightning");
         assert!(refused.contains(&said), "{refused}");
     }
-    assert_eq!(alice.ask_invoice_for(10_003).unwrap().amount, 10_000);
+    assert_eq!(alice.ask_invoice_for(10_003, None).unwrap().amount, 10_000);
 }
 
 #[test]
@@ -1384,7 +1385,7 @@ fn a_phone_pays_an_invoice_of_a_phone_at_its_hub_inside_it_without_the_gateways_
     let light = Light::new(&net);
     let alice = funded(&net, &light, "alice");
     let bob = net.wallet("bob", net.height());
-    let asked = bob.ask_invoice_for(500).unwrap();
+    let asked = bob.ask_invoice_for(500, None).unwrap();
     let request = asked.request.clone().unwrap();
     let held_before = notes(&alice);
     // Quoted through its hub, without the gateway's fee of 2.
@@ -1415,6 +1416,48 @@ fn a_phone_pays_an_invoice_of_a_phone_at_its_hub_inside_it_without_the_gateways_
     assert_eq!((line.state, line.amount), (State::Done, 500), "{line:?}");
     assert_eq!(notes(&alice), held_before - 500 - quote.fee);
     assert!(net.node.sent().is_empty());
+}
+
+#[test]
+fn a_memo_asked_for_is_said_to_the_payer_and_shown_on_both_sides() {
+    let net = Net::new(false);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let bob = net.wallet("bob", net.height());
+    let hub = bob.hubs().unwrap().remove(0);
+    assert!(hub.lightning.unwrap().memo);
+    // Too long, or of a control character: refused before asking.
+    let long = "x".repeat(licash_api::MAX_MEMO + 1);
+    for memo in [long.as_str(), "a\u{7}b"] {
+        let refused = invalid(bob.ask_invoice_for(500, Some(memo.into())));
+        assert!(refused.contains("memo"), "{refused}");
+    }
+    // Blank, none.
+    let blank = bob.ask_invoice_for(20, Some("  ".into())).unwrap();
+    let blank = alice.invoice_quote(blank.request.unwrap()).unwrap();
+    assert_eq!(blank.description, None);
+
+    let asked = bob
+        .ask_invoice_for(500, Some("  Pizza\n night ".into()))
+        .unwrap();
+    let request = asked.request.clone().unwrap();
+    let quote = alice.invoice_quote(request.clone()).unwrap();
+    assert_eq!(quote.description.as_deref(), Some("Pizza night"));
+    alice.pay_invoice(request, quote.hub.clone()).unwrap();
+    let paid = bob.follow_invoice(asked.hash.clone()).unwrap();
+    assert_eq!(paid.state, State::Done);
+    net.runtime.block_on(net.lightning.round());
+    alice.resume().unwrap();
+    let memo = |wallet: &Wallet, kind: Kind| {
+        let history = wallet.history().unwrap();
+        let line = history.iter().find(|a| a.kind == kind).unwrap();
+        line.memo.clone()
+    };
+    assert_eq!(
+        memo(&alice, Kind::Lightning).as_deref(),
+        Some("Pizza night")
+    );
+    assert_eq!(memo(&bob, Kind::Invoice).as_deref(), Some("Pizza night"));
 }
 
 /// The payment hash `hash` of an invoice, in hex, as the node holds it.

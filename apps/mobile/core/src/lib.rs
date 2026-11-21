@@ -421,6 +421,10 @@ pub struct LightningTerms {
     pub receive: Rate,
     /// What an invoice it makes may pay the wallet: at least and at most.
     pub receive_range: Range,
+    /// Whether an invoice it makes says a memo of the wallet's to its
+    /// payer ([`crate::Wallet::ask_invoice`]).
+    #[uniffi(default = false)]
+    pub memo: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
@@ -985,6 +989,9 @@ pub struct Activity {
     pub detail: String,
     /// When, in seconds since 1970, if known.
     pub at: Option<i64>,
+    /// What it says it was for: the memo of an invoice paid or asked for.
+    #[uniffi(default = None)]
+    pub memo: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]

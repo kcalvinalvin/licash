@@ -233,7 +233,10 @@ their mailboxes, `--tweaks` for silent payments: the app's code holds a
 silent payment address only if a hub it uses serves tweaks, and `--lnd URL
 --lnd-macaroon FILE` for Lightning: the app pays invoices through the hub,
 and Receive, given an amount, shows an invoice the hub makes, whose
-notes the app takes once paid. Without an amount Receive shows the
+notes the app takes once paid. With the amount, a memo may be typed for the
+payer, at a hub that puts one in its invoices (it and its Lightning node
+read it too); the history shows it, as it shows the description of an
+invoice the app paid. Without an amount Receive shows the
 wallet's code (its hubs, and its silent payment address); an address on
 Bitcoin any wallet pays, the code alone and the silent payment address
 alone are under Other ways, the address handed out only once asked for.

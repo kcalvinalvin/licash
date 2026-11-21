@@ -425,6 +425,7 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?, develop
                 if (activity.kind == Kind.OPTIMIZED) Say("Smaller notes leave room for receiving and help recovery fit its note limit.")
             }
         }
+        activity.memo?.let { Line("Memo", it, tag = "memo") }
         if (developer) tx?.let { Line("Confirmations", confirmations(it, details)) }
         activity.at?.let { Line("Date", at(it), tag = "date") }
         view?.let {
