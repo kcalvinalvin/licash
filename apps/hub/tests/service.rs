@@ -804,6 +804,7 @@ async fn a_payment_kept_for_its_payee_is_taken_and_acknowledged_through_the_api(
     };
     service.app = licash_hub_service::router(service.hub.clone(), services);
     let info = service.info().await;
+    assert!(info.features.iter().any(|f| f == inbox::FEATURE_NOTE));
     let keyset = &service.keyset;
     let (alice, bob) = (owner(1), owner(2));
     let coin = service.mint(&alice, 8);
@@ -827,6 +828,15 @@ async fn a_payment_kept_for_its_payee_is_taken_and_acknowledged_through_the_api(
     );
     let shared = e.shared(&bob.address()).unwrap();
     let (keep, ack) = Keep::new(&shared, &proposal.id());
+    // A note of another size is refused, before anything is released.
+    let odd = inbox::Release {
+        release: Release::new(&signed, &notes),
+        keep: Some(keep.clone().with_note(Some(vec![9; 16]))),
+    };
+    let problem = service.problem(licash_api::RELEASE, json(&odd)).await;
+    assert_eq!(problem.code, Code::Invalid);
+    let note = vec![9; inbox::NOTE_SEALED];
+    let keep = keep.with_note(Some(note.clone()));
     let release = inbox::Release {
         release: Release::new(&signed, &notes),
         keep: Some(keep.clone()),
@@ -862,6 +872,7 @@ async fn a_payment_kept_for_its_payee_is_taken_and_acknowledged_through_the_api(
     assert!(none.payments[0].is_none());
     let taken: inbox::Taken = service.post(inbox::TAKE, &ask(inbox::key(&found))).await;
     let payment = taken.payments[0].clone().unwrap().at("http://hub.example");
+    assert_eq!(payment.note, Some(Hex(note)), "the note kept with it");
     let lookup = |id: &[u8; 32]| (id == keyset.id()).then_some(keyset);
     let (paid, paid_notes, unlock) = payment.decode(lookup).unwrap();
     paid.open_granted_output(keyset, &paid_notes, 0, &outputs[0], &unlock)
@@ -904,6 +915,7 @@ async fn a_hub_keeping_no_payments_releases_without_keeping() {
 
     let service = service(1);
     let info = service.info().await;
+    assert!(!info.features.iter().any(|f| f == inbox::FEATURE_NOTE));
     let keyset = &service.keyset;
     let (alice, bob) = (owner(1), owner(2));
     let coin = service.mint(&alice, 8);

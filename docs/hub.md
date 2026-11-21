@@ -222,6 +222,10 @@ Nostr. Anyone sees the inbox's feed, which tells how many payments were
 kept, not whom they pay or how much. Losing the inbox's rows only loses the
 payments kept: their payers send them to the payees' mailboxes on Nostr
 once no acknowledgment comes.
+A payment kept may carry a note its payer sealed for its payee: always
+528 bytes, whatever it says or if it says nothing, so the hub reads nothing
+of it; the hub names the `note` feature in `/v1/info` and refuses a note
+of any other size. Payers ask a hub not naming it to keep none.
 
 With `--deposit-sweep-address ADDRESS` (and `--chain`), the hub takes
 deposits on Bitcoin: a payment to a deposit's address, once confirmed,

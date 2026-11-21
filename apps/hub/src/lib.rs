@@ -405,6 +405,9 @@ async fn info(State((hub, services)): State<(Arc<Hub>, Services)>) -> Answer<Inf
     if info.lightning.is_some() {
         info.features.push(licash_api::FEATURE_MEMO.into());
     }
+    if services.inbox.is_some() {
+        info.features.push(licash_api::inbox::FEATURE_NOTE.into());
+    }
     info.deposits = services.deposits.map(|deposits| deposits.advertise());
     info.contracts = services.contracts.map(|openings| openings.advertise());
     info.relays = services.relays;
@@ -448,6 +451,7 @@ async fn release(
             let receipt = licash_api::inbox::Receipt {
                 release: body.release.clone(),
                 unlock: licash_api::Hex(unlock.to_vec()),
+                note: keep.note.clone(),
             };
             let kept = inbox.keep(&proposal.id(), &proposal.ephemeral().0, keep, &receipt);
             kept.inspect_err(|e| tracing::error!("keeping a payment: {e:#}"))

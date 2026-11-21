@@ -204,6 +204,7 @@ mod tests {
                 notes: Vec::new(),
             },
             unlock: Hex(vec![n; 32]),
+            note: None,
         }
     }
 
