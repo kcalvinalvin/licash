@@ -74,6 +74,26 @@ async fn history(phone: &Phone) -> anyhow::Result<Vec<View>> {
     phone.views().await
 }
 
+/// What the history came to, opened from it: the fees paid in all of it said,
+/// as a sum, and a way back to Home.
+async fn stats(phone: &Phone) -> anyhow::Result<()> {
+    history(phone).await?;
+    phone.tap_id("stats-open").await?;
+    phone.by_id("stats", 30).await?;
+    phone.tap("All").await?;
+    // Paid and received by now: something cost, and the page says what.
+    let fees = phone.by_id("stats-fees", 30).await?;
+    ensure!(
+        fees.text == "None" || fees.text.ends_with(" sat"),
+        "fees paid said as {:?}",
+        fees.text
+    );
+    // Back to the history, and Home.
+    phone.back_to("history").await?;
+    phone.back_to("receive").await?;
+    Ok(())
+}
+
 /// The newest line of the history titled `title`, opened from Home: where
 /// it stands is shown first.
 async fn opened(phone: &Phone, title: &str) -> anyhow::Result<()> {
@@ -539,6 +559,7 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     cashed_out(eco, phone).await?;
     visited(eco, phone).await?;
     contracted(eco, phone).await?;
+    stats(phone).await?;
 
     // Started again: at once, holding the same, less what keeping its
     // notes few may cost meanwhile.
