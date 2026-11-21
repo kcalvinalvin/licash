@@ -26,6 +26,7 @@
 //!
 //! [`Ledger`] reads the database beside a running hub, for monitoring.
 
+mod citable;
 mod claims;
 mod evidence;
 mod forwards;
@@ -56,6 +57,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use store::{now, setup_io, Store};
 
+pub use citable::{uncitable, Uncitable, MAX_EVIDENCE_BYTES};
 pub use forwards::{Forward, Forwarded, LOCAL};
 pub use locks::{Lock, Settled, Timing};
 pub use records::{Excess, ForwardRecord, LockRecord, Movement, Notes, Unlinks};
@@ -154,6 +156,14 @@ pub enum Refusal {
     Spent,
     #[error("an output is already issued")]
     Reissued,
+    /// More than a contract's statement reads of one spend: the hub could
+    /// never cite it against a claim of its notes ([`MAX_EVIDENCE_BYTES`]).
+    #[error(
+        "a spend larger than a dispute can cite: at most {} notes and {} bytes",
+        licash::spend::MAX_INPUTS,
+        MAX_EVIDENCE_BYTES
+    )]
+    TooLarge,
     #[error("fee {paid} below {due}")]
     Fee { due: u64, paid: u64 },
     #[error("no offer for this proposal")]
@@ -195,7 +205,7 @@ impl Refusal {
             Self::LockExpired => Code::LockExpired,
             Self::Unexpired => Code::Unexpired,
             Self::Activated => Code::Activated,
-            Self::Block(_) | Self::Exists | Self::Offered => Code::Invalid,
+            Self::Block(_) | Self::Exists | Self::Offered | Self::TooLarge => Code::Invalid,
         }
     }
 }
@@ -902,6 +912,9 @@ impl Hub {
         let (offer, salt, boot) = offered.ok_or(Refusal::UnknownOffer)?;
         let unlock = self.unlock(keyset.id(), &id, &salt);
         Grant::from_bytes(&offer)?.verify_release(keyset, notes, signed, &unlock)?;
+        // Refused once known not to be released already: one released is
+        // its unlock again, whatever this release would admit.
+        let citable = citable::Citable::check(keyset, signed, notes, Some(unlock));
         let ys = proposal
             .inputs()
             .iter()
@@ -934,7 +947,7 @@ impl Hub {
             if released.is_some() {
                 return Ok(false);
             }
-            if let Some(by) = retire(tx, &id, &ys, notes)? {
+            if let Some(by) = retire(tx, &id, &citable?)? {
                 spent_by = Some(by);
                 return Err(Refusal::Spent.into());
             }
@@ -1122,20 +1135,21 @@ fn issued(tx: &Transaction<'_>, keyset: &[u8; 32], output: &Output) -> Result<bo
         .is_some())
 }
 
-/// Retire the inputs `ys` of proposal `id`, spent by `notes`: none, or
-/// the proposal that retired one of them first. Refused if a claim on
-/// Bitcoin holds one of them.
+/// Retire the inputs of proposal `id`, a spend its contracts can cite:
+/// none, or the proposal that retired one of them first. Refused if a
+/// claim on Bitcoin holds one of them. The one way notes are retired by a
+/// spend, so that none is retired by a spend no dispute could cite.
 fn retire(
     tx: &Transaction<'_>,
     id: &ProposalId,
-    ys: &[Point],
-    notes: &[Note],
+    spend: &citable::Citable<'_>,
 ) -> Result<Option<[u8; 32]>, Error> {
+    let ys = spend.ys();
     if claims::claimed(tx, ys)? {
         tracing::warn!(proposal = %hex::encode(id.as_bytes()), "a spend of claimed notes refused");
         return Err(Refusal::Spent.into());
     }
-    for (position, (y, note)) in (0i64..).zip(ys.iter().zip(notes)) {
+    for (position, (y, note)) in (0i64..).zip(ys.iter().zip(spend.notes())) {
         let inserted = tx.execute(
             "INSERT INTO spent (y, proposal, position, note) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT DO NOTHING",

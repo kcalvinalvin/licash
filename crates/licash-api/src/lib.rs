@@ -849,8 +849,16 @@ impl Receive {
         }
     }
 
-    /// The outputs to lock, decoded.
+    /// The outputs to lock, decoded: at most
+    /// [`licash::spend::MAX_INPUTS`], since the hub locks a note of its own
+    /// to each, all of them inputs of one lock.
     pub fn outputs(&self) -> Result<Vec<Output>, Problem> {
+        if self.outputs.len() > licash::spend::MAX_INPUTS {
+            return Err(Problem::invalid(format!(
+                "more than {} outputs to lock",
+                licash::spend::MAX_INPUTS
+            )));
+        }
         self.outputs
             .iter()
             .map(|o| {

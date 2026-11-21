@@ -976,6 +976,19 @@ enum Command {
         #[arg(long)]
         details: bool,
     },
+    /// The spends the ledger retired notes for that a contract's dispute
+    /// cannot cite, read-only and of a ledger of this release or the one
+    /// before: a claim on Bitcoin of any of their notes goes unanswered and
+    /// is paid whole. Run before closing the contracts of an earlier
+    /// release. Fails if it finds any.
+    Audit {
+        #[arg(long)]
+        json: bool,
+        /// The notes of one spend the contracts' statement reads: their
+        /// Base's `max_authorizations`, as quoted.
+        #[arg(long, default_value_t = 128)]
+        max_authorizations: u64,
+    },
     /// An interactive dashboard of the hub's records, beside the running
     /// hub or without it: payments, fees, reserves, contracts, privacy and
     /// health, over a range (30 days at first) against the one before.
@@ -1408,6 +1421,10 @@ fn command(cli: Cli) -> anyhow::Result<()> {
         }
         Command::TestNotify { notify } => test_notify(&notify),
         Command::Status { json, details } => status(&db, json, details),
+        Command::Audit {
+            json,
+            max_authorizations,
+        } => audit(&db, json, max_authorizations),
         Command::ResumePayouts => resume_payouts(&cli.data),
         Command::Dashboard {
             dashboard,
@@ -1965,6 +1982,25 @@ fn show(
     let probe = licash_dashboard::Probe::new(&url, licash_hub_service::HEALTH)?;
     let data = data.to_owned();
     args.run(move || dashboard::report(&data, Some(&probe)))
+}
+
+fn audit(db: &Path, json: bool, max_authorizations: u64) -> anyhow::Result<()> {
+    let found = licash_hub::uncitable(db, max_authorizations).context("audit the ledger")?;
+    if json {
+        println!("{}", serde_json::to_string(&found)?);
+    } else if found.is_empty() {
+        println!("Every spend the ledger retired notes for can be cited.");
+    } else {
+        for spend in &found {
+            println!("{} ({} notes): {}", spend.proposal, spend.notes, spend.why);
+        }
+    }
+    anyhow::ensure!(
+        found.is_empty(),
+        "{} spends no dispute can cite: a claim of any of their notes is paid whole",
+        found.len()
+    );
+    Ok(())
 }
 
 fn status(db: &Path, json: bool, details: bool) -> anyhow::Result<()> {

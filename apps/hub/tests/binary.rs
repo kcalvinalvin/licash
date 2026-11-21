@@ -132,6 +132,8 @@ fn a_hub_is_created_run_watched_and_stopped() {
     );
     let text = stdout(&data, &["status", "--details"]);
     assert!(text.contains("0 issued, 0 spent, 0 unlinked\n"), "{text}");
+    // Nothing retired, nothing a dispute cannot cite.
+    assert_eq!(stdout(&data, &["audit", "--json"]), "[]\n");
 
     let port = free_port();
     let listen = format!("127.0.0.1:{port}");

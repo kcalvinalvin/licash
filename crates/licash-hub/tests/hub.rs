@@ -1967,3 +1967,123 @@ fn a_hub_file_of_before_claims_showed_locks_gains_none_shown_when_opened() {
     assert_eq!(hub.spent(&[y]).unwrap(), [true]);
     assert_eq!(rows(&files.db, "shown_inputs"), 1);
 }
+
+/// A spend whose evidence no dispute could cite, here larger than
+/// [`licash_hub::MAX_EVIDENCE_BYTES`] though of no more notes or outputs
+/// than a proposal may have, is refused at release: none of its notes is
+/// retired, no unlock given, and they spend in a smaller spend after.
+/// Formerly released, its notes retired by a spend the hub could never show
+/// against a claim of one (the audit's oversized spend).
+#[test]
+fn a_spend_too_large_to_cite_is_refused_and_retires_nothing() {
+    use licash::recovery::{evidence_from_bytes, evidence_to_bytes, Evidence as Against};
+    use licash::spend::{MAX_INPUTS, MAX_OUTPUTS};
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let inputs: Vec<_> = (0..MAX_INPUTS).map(|_| mint(&files, &alice, 2)).collect();
+    let ys: Vec<_> = inputs
+        .iter()
+        .map(|c| c.note.message().identifier().unwrap())
+        .collect();
+
+    let large = Spend::new(&keyset, &inputs, &[(bob.address(), 1); MAX_OUTPUTS]);
+    let grant = large.offer(&hub).unwrap();
+    let signed = large.sign(&keyset, Authorization::Granted(Box::new(grant)));
+    let notes = large.notes();
+    let size = evidence_to_bytes(&[Against::Spend {
+        signed: signed.clone(),
+        notes: notes.clone(),
+        unlock: None,
+    }])
+    .len();
+    assert!(size > licash_hub::MAX_EVIDENCE_BYTES, "{size} bytes");
+    assert!(matches!(
+        hub.release(&signed, &notes),
+        Err(Error::Refused(Refusal::TooLarge))
+    ));
+    assert_eq!(hub.spent(&ys).unwrap(), vec![false; MAX_INPUTS]);
+    assert!(hub
+        .evidence(&claim_in([7; 32], &keyset, &[&inputs[0]]))
+        .unwrap()
+        .is_empty());
+
+    // As many notes, to fewer outputs: released, and cited under any Base.
+    let small = Spend::new(&keyset, &inputs, &[(bob.address(), 64); 2]);
+    small.complete(&hub, &keyset);
+    assert_eq!(hub.spent(&ys).unwrap(), vec![true; MAX_INPUTS]);
+    let found = hub
+        .evidence(&claim_in([7; 32], &keyset, &[&inputs[0]]))
+        .unwrap();
+    let [Against::Spend { notes, .. }] = &found[..] else {
+        panic!("not the released spend alone");
+    };
+    assert_eq!(notes.len(), MAX_INPUTS);
+    let least = licash::base::MIN_AUTHORIZATIONS as usize;
+    assert!(evidence_from_bytes(&keyset, least, &evidence_to_bytes(&found)).is_ok());
+}
+
+/// The audit finds, in a ledger of the release before (schema 1), which
+/// the hub no longer opens, each spend it retired notes for that a dispute
+/// cannot cite: of more notes than a statement reads, or of a signed spend
+/// over a statement's blob, and none of those it can. Read-only.
+#[test]
+fn the_audit_finds_the_spends_an_earlier_ledger_cannot_cite() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let spends: Vec<_> = (0..3)
+        .map(|_| {
+            let coin = mint(&files, &alice, 8);
+            let spend = Spend::new(&keyset, std::slice::from_ref(&coin), &[(bob.address(), 8)]);
+            spend.complete(&hub, &keyset);
+            spend.proposal.id()
+        })
+        .collect();
+    drop(hub);
+    assert!(licash_hub::uncitable(&files.db, 128).unwrap().is_empty());
+
+    // As an earlier release kept them: one spend of 129 notes, one whose
+    // signed spend is larger than a statement reads.
+    let db = sql(&files.db);
+    db.execute(
+        "UPDATE schema_versions SET version = 1 WHERE component = 'ledger'",
+        [],
+    )
+    .unwrap();
+    let (many, large) = (spends[0].as_bytes(), spends[1].as_bytes());
+    for i in 1..129u32 {
+        let mut y = [0u8; 33];
+        y[..4].copy_from_slice(&i.to_le_bytes());
+        db.execute(
+            "INSERT INTO spent (y, proposal, position, note) VALUES (?1, ?2, ?3, x'00')",
+            rusqlite::params![&y[..], &many[..], i],
+        )
+        .unwrap();
+    }
+    db.execute(
+        "UPDATE grants SET signed = zeroblob(64001) WHERE id = ?1",
+        [&large[..]],
+    )
+    .unwrap();
+    let before = rows(&files.db, "spent");
+    drop(db);
+
+    let found = licash_hub::uncitable(&files.db, 128).unwrap();
+    let ids: Vec<_> = found.iter().map(|s| s.proposal.clone()).collect();
+    let mut expected = vec![hex::encode(many), hex::encode(large)];
+    expected.sort();
+    assert_eq!(ids, expected, "{found:?}");
+    let of_many = found
+        .iter()
+        .find(|s| s.proposal == hex::encode(many))
+        .unwrap();
+    assert_eq!(of_many.notes, 129);
+    // Under a Base reading more, the spend of many is cited.
+    assert_eq!(licash_hub::uncitable(&files.db, 129).unwrap().len(), 1);
+    // Nothing written, and the hub of this release still refuses the file.
+    assert_eq!(rows(&files.db, "spent"), before);
+    assert!(Hub::open(&files.seed, &files.db, Policy::default()).is_err());
+}

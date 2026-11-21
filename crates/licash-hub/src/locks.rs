@@ -24,6 +24,7 @@ use licash::{
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
+use crate::citable::Citable;
 use crate::{forwards, notify, now, retire, sql, Error, Hub, Notice, Refusal};
 
 /// The timing of the locks a hub admits, in blocks unless named.
@@ -360,7 +361,8 @@ impl Hub {
         if let Some(row) = self.store.read(|c| self.row(c, &id))? {
             return Ok(row.lock.certificate);
         }
-        let ys = signed.verify(keyset, notes)?;
+        // Verified as it would be cited, its owners' signatures and notes.
+        let citable = Citable::check(keyset, signed, notes, None)?;
         let charge = self.lock_charge(proposal)?;
         let fees = self.policy.fees();
         let made =
@@ -385,7 +387,7 @@ impl Hub {
             }
             let decide_by = self.admit(tx, timed.terms())?;
             self.record(tx, signed, &certificate, charge.amount, decide_by, false)?;
-            if let Some(by) = retire(tx, &id, &ys, notes)? {
+            if let Some(by) = retire(tx, &id, &citable)? {
                 spent_by = Some(by);
                 return Err(Refusal::Spent.into());
             }
@@ -464,7 +466,7 @@ impl Hub {
         let lock = TimedLock::new(terms.clone(), refund)?;
         let proposal = Proposal::new(keyset, &notes, ephemeral, pay.clone(), Some(lock))?;
         let signed = SignedProposal::sign(keyset, proposal, &notes, Authorization::Plain, &owners)?;
-        let ys = signed.verify(keyset, &notes)?;
+        let citable = Citable::check(keyset, &signed, &notes, None)?;
         let certificate = Certificate::attest(keys, &signed, &notes)?;
         let id = signed.proposal().id();
         let terms = signed.proposal().lock().expect("a lock").terms();
@@ -478,7 +480,7 @@ impl Hub {
             }
             let decide_by = self.admit(tx, terms)?;
             self.record(tx, &signed, &certificate, amount, decide_by, true)?;
-            if retire(tx, &id, &ys, &notes)?.is_some() {
+            if retire(tx, &id, &citable)?.is_some() {
                 // Fresh notes: a spent one would be a broken ledger.
                 return Err(Error::Halted);
             }

@@ -50,7 +50,9 @@ use tower_http::trace::TraceLayer;
 use tweaks::Tweaks;
 
 /// The largest request body: a spend of the most inputs and outputs the
-/// protocol allows fits well within it.
+/// protocol allows (`licash::spend::MAX_INPUTS`, `MAX_OUTPUTS`) fits well
+/// within it. What the hub retires notes for is bounded apart, by what a
+/// dispute can cite (`licash_hub::MAX_EVIDENCE_BYTES`).
 pub const BODY_LIMIT: usize = 1 << 20;
 
 /// `ok`, or 503 once the hub halted.
