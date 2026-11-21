@@ -15,7 +15,8 @@ pub use chain::{ChainError, ChainSource};
 pub use log::{set_logger, Logger};
 pub use tor::TorClient;
 pub use wallet::{
-    wallet_exists, BalancePoint, Contact, Flow, HubAmount, StatEvent, Stats, Unlink, Wallet, Way,
+    wallet_exists, BalancePoint, BalanceSample, Contact, Flow, HubAmount, StatEvent, Stats, Unlink,
+    Wallet, Way,
 };
 
 uniffi::setup_scaffolding!();

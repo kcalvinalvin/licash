@@ -767,7 +767,9 @@ impl<'a> Snapshot<'a> {
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(names);
-        tables.retain(|t| !SCANNING.contains(&t.as_str()));
+        tables.retain(|t| {
+            !SCANNING.contains(&t.as_str()) && !super::samples::TABLES.contains(&t.as_str())
+        });
         let mut all = Sha256::new();
         for table in tables {
             let mut stmt =
@@ -1072,6 +1074,57 @@ mod tests {
             find_backup(phrase, Network::Regtest, folder.display().to_string()).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn balance_samples_are_in_a_backup_and_restored_but_are_no_reason_for_one() {
+        use super::super::samples;
+        let dir = tempfile::tempdir().unwrap();
+        let (outbox, folder) = (dir.path().join("outbox"), dir.path().join("folder"));
+        fs::create_dir_all(&folder).unwrap();
+        let original = wallet(&dir.path().join("original"));
+        let phrase = original.backup_phrase().unwrap();
+        let path = wallet_file(&original.dir);
+        let held = |notes| crate::Balance {
+            notes,
+            ..crate::Balance::default()
+        };
+        let at = 1_800_000_000_000;
+        samples::record(&path, &held(10), 100).unwrap();
+        assert!(publish(&original, &outbox, &folder, at).is_some());
+        // A sample alone is no change worth a backup.
+        samples::record(&path, &held(20), 5_000).unwrap();
+        assert!(publish(&original, &outbox, &folder, at + 1).is_none());
+        // Written with the day's, it is in the snapshot.
+        let day = publish(&original, &outbox, &folder, at + DAY_MS).unwrap();
+        let found = find_backup(
+            phrase.clone(),
+            Network::Regtest,
+            folder.display().to_string(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(found.generation, day.generation);
+        let restored = Wallet::from_backup(
+            dir.path().join("restored").display().to_string(),
+            phrase,
+            Network::Regtest,
+            folder.display().to_string(),
+            found.generation,
+            None,
+        )
+        .unwrap();
+        let kept = samples::read(&wallet_file(&restored.dir)).unwrap().unwrap();
+        assert_eq!(
+            kept.iter()
+                .map(|s| (s.at, s.balance.notes))
+                .collect::<Vec<_>>(),
+            vec![(100, 10), (5_000, 20)]
+        );
+        // A wallet restored from one made before samples has none, and
+        // makes none until the app writes one.
+        let plain = wallet(&dir.path().join("plain"));
+        assert_eq!(samples::read(&wallet_file(&plain.dir)).unwrap(), None);
     }
 
     #[test]

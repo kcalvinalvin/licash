@@ -46,11 +46,13 @@ mod payouts;
 mod recoveries;
 mod refunds;
 mod safety;
+mod samples;
 mod shaping;
 mod stats;
 mod vias;
 
 pub use contacts::Contact;
+pub use samples::BalanceSample;
 pub use stats::{BalancePoint, Flow, HubAmount, StatEvent, Stats, Unlink, Way};
 
 /// A wallet, kept in a directory of its own.

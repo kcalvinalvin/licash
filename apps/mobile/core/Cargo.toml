@@ -19,6 +19,7 @@ required-features = ["bindgen"]
 licash.workspace = true
 licash-api.workspace = true
 licash-wallet.workspace = true
+licash-store.workspace = true
 # The holder's side only: the phone brings its own chain.
 licash-contracts = { path = "../../contracts", default-features = false }
 licash-nostr = { workspace = true, features = ["tor", "wallet"] }
