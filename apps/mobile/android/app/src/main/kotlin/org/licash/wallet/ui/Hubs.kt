@@ -31,6 +31,7 @@ import org.licash.core.FeesRaised
 import org.licash.core.FoundHub
 import org.licash.core.Hub
 import org.licash.core.HubsFound
+import org.licash.core.Network
 import org.licash.core.NoteOptimization
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
@@ -314,7 +315,10 @@ internal fun FoundHubs(engine: Engine, ui: Ui, auto: Boolean) {
         )
         Divider()
     }
-    if (shown?.isEmpty() == true) Entry("None found", tag = "none-found")
+    if (shown?.isEmpty() == true) {
+        Entry("None found", tag = "none-found")
+        noneFound(ui.network, ui.hubs.isEmpty())?.let { Problem(it, error = false) }
+    }
     found?.let { unanswered(it, ui.tor) }?.let { Problem(it, error = false) }
     error?.let { Problem(it) }
     TextButton(enabled = !looking, onClick = ::look, modifier = Modifier.testTag("find-hubs")) {
@@ -364,6 +368,17 @@ internal fun FoundHubs(engine: Engine, ui: Ui, auto: Boolean) {
         }
     }
 }
+
+/**
+ * Why no hub was found, on a `network` where none may run yet, for a wallet
+ * with `none` yet: null where nothing more is to be said.
+ */
+internal fun noneFound(network: Network, none: Boolean): String? =
+    if (network == Network.BITCOIN && none) NONE_ON_BITCOIN else null
+
+/** No hub on Bitcoin yet: what to do to try it. */
+internal const val NONE_ON_BITCOIN = "Licash is in testing: hubs run on test networks only for now. " +
+    "To try it, delete this wallet (Settings, Advanced mode, Advanced) and make one with \"Use a test network\"."
 
 /** Something that went wrong, or to know, in a line under what it is about. */
 @Composable

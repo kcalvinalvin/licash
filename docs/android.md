@@ -207,9 +207,11 @@ has the file can sign updates.
 
 ## Test networks
 
-The app is for Bitcoin. Tapping the "licash" wordmark on the first screen
-7 times, or the Advanced mode switch in Settings at any time, turns on
-advanced mode: signet, Mutinynet and regtest, the light client's peers and
+A wallet is made on Bitcoin unless "Use a test network", on the first
+screen, picks signet, Mutinynet or regtest first: a wallet keeps the network
+it is made on, and with no hub on Bitcoin yet, the empty list of hubs says
+so. The Advanced mode switch in Settings turns on
+advanced mode: the networks on the first screen, the light client's peers and
 its block-dn server, the block explorer transactions link to, the most the
 app pays, on its own, to renew notes a hub that restarted no longer unlinks
 (1000 parts per million of them unless set, or a spending schedule of at

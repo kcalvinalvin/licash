@@ -450,20 +450,28 @@ impl Phone {
     }
 
     /// Make a wallet on regtest, its light client reaching Bitcoin Core
-    /// only, through the developer mode the title turns on when tapped
-    /// seven times. Home then asks for a hub.
+    /// only, chosen behind "Use a test network", then turn on advanced
+    /// mode in Settings, for the views the tests read. Home then asks for
+    /// a hub.
     pub async fn onboard(&self) -> anyhow::Result<()> {
         self.by_id("create", 60).await?;
-        let title = self.wait("licash", 10).await?;
-        for _ in 0..7 {
-            self.tap_view(&title).await?;
+        // Advanced mode, kept from a wallet deleted before, shows them already.
+        if !self.has("network regtest").await? {
+            self.tap_id("test-network").await?;
         }
         // Regtest's node is 127.0.0.1:18444, Core's reversed to the phone.
         self.tap_id("network regtest").await?;
         self.tap_id("create").await?;
         // The light client of the network first chosen stops first.
         self.by_id("choose-hub", 180).await?;
-        Ok(())
+        self.tap("Settings").await?;
+        self.by_id("hubs", 30).await?;
+        if !self.has("advanced").await? {
+            let toggle = self.scroll_to_id("toggle Advanced mode").await?;
+            self.tap_view(&toggle).await?;
+            self.by_id("advanced", 30).await?;
+        }
+        self.back_to("choose-hub").await
     }
 
     /// Connect to the hub at `url`, by its address, from Home with no hub
