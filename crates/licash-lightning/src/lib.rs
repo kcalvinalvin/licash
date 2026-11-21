@@ -71,6 +71,16 @@ pub enum HeldState {
     Canceled,
 }
 
+/// What a held invoice says it pays for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Description {
+    /// A text its payer reads, such as a memo of its payee's.
+    Text(String),
+    /// The SHA-256 hash of a description given elsewhere, as LNURL-pay
+    /// asks of its metadata.
+    Hash([u8; 32]),
+}
+
 /// A Lightning node to pay and be paid through, such as LND (`lnd::Lnd`).
 pub trait Node: Send + Sync {
     fn info(&self) -> Call<'_, NodeInfo>;
@@ -84,15 +94,14 @@ pub trait Node: Send + Sync {
     fn payment(&self, hash: [u8; 32]) -> Call<'_, Option<Attempt>>;
     /// A held invoice of `msat` under `hash`, whose last HTLC expires at
     /// least `cltv_expiry` blocks after it arrives, payable for `expiry`
-    /// seconds, committing to the description of hash `description` if
-    /// given (as LNURL-pay asks): its request.
+    /// seconds, saying `description` if given, else nothing: its request.
     fn hold(
         &self,
         hash: [u8; 32],
         msat: u64,
         cltv_expiry: u32,
         expiry: u64,
-        description: Option<[u8; 32]>,
+        description: Option<Description>,
     ) -> Call<'_, String>;
     fn invoice(&self, hash: [u8; 32]) -> Call<'_, Option<Held>>;
     fn settle(&self, preimage: [u8; 32]) -> Call<'_, ()>;

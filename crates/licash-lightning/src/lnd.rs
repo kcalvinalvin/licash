@@ -17,7 +17,9 @@ use rustls::{
 };
 use serde_json::{json, Value};
 
-use crate::{Attempt, Call, Currency, Held, HeldState, Liquidity, Node, NodeInfo, Status};
+use crate::{
+    Attempt, Call, Currency, Description, Held, HeldState, Liquidity, Node, NodeInfo, Status,
+};
 
 /// How long a call waits for the node.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -285,7 +287,7 @@ impl Node for Lnd {
         msat: u64,
         cltv_expiry: u32,
         expiry: u64,
-        description: Option<[u8; 32]>,
+        description: Option<Description>,
     ) -> Call<'_, String> {
         Box::pin(async move {
             let mut body = json!({
@@ -294,8 +296,12 @@ impl Node for Lnd {
                 "cltv_expiry": cltv_expiry.to_string(),
                 "expiry": expiry.to_string(),
             });
-            if let Some(description) = description {
-                body["description_hash"] = STANDARD.encode(description).into();
+            match description {
+                Some(Description::Text(memo)) => body["memo"] = memo.into(),
+                Some(Description::Hash(hash)) => {
+                    body["description_hash"] = STANDARD.encode(hash).into();
+                }
+                None => {}
             }
             let invoice = self.post("/v2/invoices/hodl", body).await?;
             text(&invoice, "payment_request")

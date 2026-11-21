@@ -34,7 +34,7 @@ use std::{
 use bitcoin::hashes::{sha256, Hash};
 use licash::spend::lock_hash;
 use licash_api::{Fee, Problem};
-use licash_lightning::{HeldState, Node};
+use licash_lightning::{Description, HeldState, Node};
 use licash_wallet::{LicashCode, Sent, State, Transport};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension};
@@ -287,7 +287,13 @@ impl<T: Transport> Provider<T> {
         let description = sha256::Hash::hash(METADATA.as_bytes()).to_byte_array();
         let made = receiver
             .node
-            .hold(hash, msat, INVOICE_CLTV, INVOICE_EXPIRY, Some(description))
+            .hold(
+                hash,
+                msat,
+                INVOICE_CLTV,
+                INVOICE_EXPIRY,
+                Some(Description::Hash(description)),
+            )
             .await;
         let request = match made {
             Ok(request) => request,

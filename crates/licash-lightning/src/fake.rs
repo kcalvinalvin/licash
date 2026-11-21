@@ -13,7 +13,7 @@ use bitcoin::{
 };
 use lightning_invoice::{Bolt11Invoice, Currency, InvoiceBuilder, PaymentSecret};
 
-use crate::{Attempt, Call, Held, HeldState, Liquidity, Node, NodeInfo, Status};
+use crate::{Attempt, Call, Description, Held, HeldState, Liquidity, Node, NodeInfo, Status};
 
 /// How a payment the node makes ends.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,12 +184,13 @@ fn bolt11(
     hash: [u8; 32],
     cltv: u64,
     expiry: u64,
-    description: Option<[u8; 32]>,
+    description: Option<Description>,
 ) -> String {
     let secp = Secp256k1::new();
     let builder = InvoiceBuilder::new(Currency::Regtest);
     let builder = match description {
-        Some(d) => builder.description_hash(sha256::Hash::from_byte_array(d)),
+        Some(Description::Hash(d)) => builder.description_hash(sha256::Hash::from_byte_array(d)),
+        Some(Description::Text(memo)) => builder.description(memo),
         None => builder.description(String::new()),
     };
     builder
@@ -267,7 +268,7 @@ impl Node for Fake {
         msat: u64,
         cltv_expiry: u32,
         expiry: u64,
-        description: Option<[u8; 32]>,
+        description: Option<Description>,
     ) -> Call<'_, String> {
         let held = self.up().and_then(|mut state| {
             if state.held.contains_key(&hash) {
