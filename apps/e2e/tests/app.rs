@@ -840,6 +840,9 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     // Asked to, once warned: moved in, none left on Bitcoin.
     phone.tap_id("move-in").await?;
     phone.tap_id("move-in-anyway").await?;
+    // The sheet stays while it is done, and hides the page behind it: none
+    // of its rows are seen until it goes.
+    phone.gone("move-in-anyway", 60).await?;
     until("all moved back into the balance", 300, || async {
         mine(eco).await?;
         let views = phone.views().await?;
