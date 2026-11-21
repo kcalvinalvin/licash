@@ -45,6 +45,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.licash.core.Code
 import org.licash.core.DonationAddress
+import org.licash.core.ExtraCode
 import org.licash.core.Hub
 import org.licash.core.LightningInvoice
 import org.licash.core.State
@@ -171,6 +172,13 @@ fun Receive(engine: Engine, back: () -> Unit) {
         editing = false
     }
     var received by remember { mutableStateOf<String?>(null) }
+    // Which code to be paid at: 0 the wallet's own, else an extra code's
+    // number, separate from it, no one able to tell.
+    var codeIndex by rememberSaveable { mutableStateOf(0) }
+    var codes by remember { mutableStateOf<List<ExtraCode>>(emptyList()) }
+    var pickingCode by rememberSaveable { mutableStateOf(false) }
+    var naming by rememberSaveable { mutableStateOf(false) }
+    var typedLabel by rememberSaveable { mutableStateOf("") }
     var copied by remember { mutableStateOf(false) }
     var choosing by rememberSaveable { mutableStateOf(false) }
     val ui by engine.ui.collectAsState()
@@ -199,12 +207,15 @@ fun Receive(engine: Engine, back: () -> Unit) {
         Way.CODE -> code?.let { way.label to it.text }
         Way.BITCOIN -> bitcoin?.let { way.label to it.text }
     }
-    LaunchedEffect(amount, received) {
+    LaunchedEffect(received) {
+        codes = engine.codes().getOrDefault(emptyList())
+    }
+    LaunchedEffect(amount, received, codeIndex) {
         code = null
         error = null
-        engine.code(amount?.toULong())
-            .onSuccess { code = it }
-            .onFailure { error = explain(it) }
+        val asked = amount?.toULong()
+        val made = if (codeIndex == 0) engine.code(asked) else engine.extraCode(codeIndex.toUInt(), asked)
+        made.onSuccess { code = it }.onFailure { error = explain(it) }
     }
     // Only once asked for: an address handed out is watched from then on,
     // and made again once paid.
@@ -270,6 +281,65 @@ fun Receive(engine: Engine, back: () -> Unit) {
     }
     LaunchedEffect(Unit) {
         engine.events.collect { event -> if (event.received != null) received = event.text }
+    }
+    if (pickingCode) {
+        Sheet("Which code", dismiss = { pickingCode = false }) {
+            Entry("Your code", sub = "The one your contacts know", tag = "code-0") {
+                pickingCode = false
+                codeIndex = 0
+            }
+            codes.forEach { extra ->
+                Entry(extra.label, sub = codeWords(extra), tag = "code-${extra.index}") {
+                    pickingCode = false
+                    codeIndex = extra.index.toInt()
+                }
+            }
+            Entry("New separate code", sub = "No one can tell it's yours", tag = "new-code") {
+                pickingCode = false
+                typedLabel = ""
+                naming = true
+            }
+        }
+    }
+    if (naming) {
+        Sheet("New separate code", dismiss = { naming = false }) {
+            val create = {
+                labelOf(typedLabel)?.let { label ->
+                    naming = false
+                    scope.launch {
+                        engine.addCode(label)
+                            .onSuccess { made ->
+                                codes = codes + made
+                                codeIndex = made.index.toInt()
+                            }
+                            .onFailure { error = explain(it) }
+                    }
+                }
+                Unit
+            }
+            OutlinedTextField(
+                value = typedLabel,
+                onValueChange = { typedLabel = it.take(MAX_CODE_LABEL) },
+                modifier = Modifier.fillMaxWidth().testTag("code-label"),
+                singleLine = true,
+                label = { Text("Name, only you see it") },
+                keyboardOptions = KeyboardOptions(
+                    capitalization = KeyboardCapitalization.Sentences,
+                    imeAction = ImeAction.Done,
+                ),
+                keyboardActions = KeyboardActions(onDone = { create() }),
+                shape = RoundedCornerShape(14.dp),
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                SEPARATE_WORDS,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(16.dp))
+            BigButton("Create", Modifier.fillMaxWidth().testTag("create-code"), enabled = labelOf(typedLabel) != null) { create() }
+            Spacer(Modifier.height(16.dp))
+        }
     }
     if (choosing) {
         Sheet("Other ways", dismiss = { choosing = false }) {
@@ -388,6 +458,11 @@ fun Receive(engine: Engine, back: () -> Unit) {
                     textAlign = TextAlign.Center,
                 )
             }
+            if (!editing && way == Way.CODE) {
+                TextButton(onClick = { pickingCode = true }, modifier = Modifier.testTag("which-code")) {
+                    Text(codeName(codeIndex.toUInt(), codes))
+                }
+            }
             if (!editing) {
                 TextButton(onClick = { choosing = true }, modifier = Modifier.testTag("other-ways")) {
                     Text("Other ways")
@@ -442,6 +517,18 @@ private fun MemoField(memo: String, onMemo: (String) -> Unit, done: () -> Unit) 
         textAlign = TextAlign.Center,
     )
     Spacer(Modifier.height(16.dp))
+}
+
+/** What a separate code is, said where one is made. */
+internal const val SEPARATE_WORDS =
+    "A code of its own: no one can tell it's yours, or link it to your other codes. " +
+        "Payments to it move to your balance, less a hub fee."
+
+/** What an extra code took, in words. */
+internal fun codeWords(code: ExtraCode): String = when (code.payments) {
+    0u -> "A separate code, nothing received yet"
+    1u -> "A separate code, 1 payment received"
+    else -> "A separate code, ${code.payments} payments received"
 }
 
 /** Where a QR code shows once made. */

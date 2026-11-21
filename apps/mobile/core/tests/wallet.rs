@@ -639,7 +639,7 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
     // More than she holds: what is needed and held.
     let held = notes(&alice);
     let open = bob.payment_code(None).unwrap();
-    match alice.pay(open.text, Some(held + 1), None, false) {
+    match alice.pay(open.text, Some(held + 1), None, None) {
         Err(LicashError::Insufficient { needed, available }) => {
             assert_eq!((needed, available), (held + 2, held));
         }
@@ -655,7 +655,7 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
         notes: true,
     };
     assert_eq!(scanned, wanted);
-    let paid = alice.pay(asked.qr, None, None, false).unwrap();
+    let paid = alice.pay(asked.qr, None, None, None).unwrap();
     assert!(paid.delivered, "{paid:?}");
     assert_eq!((paid.amount, &paid.hub), (500, &hubs[0].url));
     assert_eq!((paid.handover, paid.undelivered), (None, None));
@@ -677,6 +677,7 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
         at: history[0].at,
         memo: None,
         from: None,
+        code: None,
     };
     assert_eq!(history[0], sent);
     // That hub keeps no payments, so no note with one: refused, nothing
@@ -685,7 +686,7 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
         bob.payment_code(Some(5)).unwrap().qr,
         None,
         Some("hi".into()),
-        false,
+        None,
     );
     assert!(
         matches!(&refused, Err(LicashError::NoteUnkept { hub }) if *hub == hubs[0].url),
@@ -697,7 +698,7 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
     // once, and someone else not at all.
     net.relay.as_ref().unwrap().shutdown();
     let code = bob.payment_code(None).unwrap();
-    let paid = alice.pay(code.text, Some(100), None, false).unwrap();
+    let paid = alice.pay(code.text, Some(100), None, None).unwrap();
     assert!(!paid.delivered && paid.undelivered.is_some(), "{paid:?}");
     let handover = paid.handover.unwrap();
     assert_eq!(bob.scanned(handover.clone()).unwrap(), Scanned::Payment);
@@ -767,19 +768,19 @@ fn a_phone_refuses_what_it_cannot_do_and_retries_an_uncertain_broadcast() {
     let elsewhere = Wallet::create(net.dir("mainnet"), Network::Bitcoin, 0, None).unwrap();
     let mainnet = elsewhere.payment_code(None).unwrap();
     assert!(invalid(alice.scanned(mainnet.text.clone())).contains("not on"));
-    assert!(invalid(alice.pay(mainnet.text, Some(10), None, false)).contains("not on"));
-    assert!(!invalid(alice.pay("garbage".into(), Some(10), None, false)).is_empty());
+    assert!(invalid(alice.pay(mainnet.text, Some(10), None, None)).contains("not on"));
+    assert!(!invalid(alice.pay("garbage".into(), Some(10), None, None)).is_empty());
     let bob = net.wallet("bob", 0);
     let asking = bob.payment_code(Some(500)).unwrap();
     assert!(
-        invalid(alice.pay(asking.text.clone(), Some(400), None, false))
+        invalid(alice.pay(asking.text.clone(), Some(400), None, None))
             .contains("asks for 500, not 400")
     );
     let open = bob.payment_code(None).unwrap();
-    assert!(invalid(alice.pay(open.text.clone(), None, None, false)).contains("does not say"));
+    assert!(invalid(alice.pay(open.text.clone(), None, None, None)).contains("does not say"));
     // No notes to pay with, and no Bitcoin address to fall back to: a
     // code pays in notes only.
-    let unfunded = invalid(alice.pay(open.text, Some(10), None, false));
+    let unfunded = invalid(alice.pay(open.text, Some(10), None, None));
     assert!(unfunded.contains("holding 10 and the fee"), "{unfunded}");
     assert!(!unfunded.contains("on Bitcoin"), "{unfunded}");
     assert!(invalid(alice.receive("{}".into(), false)).contains("not a payment"));
@@ -1521,14 +1522,14 @@ fn a_phone_pays_a_code_as_quoted() {
         trusted: true,
     };
     assert_eq!(quote, wanted);
-    let paid = alice.pay(asked.qr.clone(), None, None, false).unwrap();
+    let paid = alice.pay(asked.qr.clone(), None, None, None).unwrap();
     assert_eq!((paid.amount, &paid.hub), (500, &hub));
     assert_eq!(notes(&alice), held - 501);
 
     // Quoted for another amount than paid: paid as without a quote.
     let open = bob.payment_code(None).unwrap();
     alice.pay_quote(open.qr.clone(), Some(100)).unwrap();
-    let paid = alice.pay(open.qr, Some(200), None, false).unwrap();
+    let paid = alice.pay(open.qr, Some(200), None, None).unwrap();
     assert_eq!(paid.amount, 200);
     assert_eq!(notes(&alice), held - 501 - 201);
 }
@@ -1550,7 +1551,7 @@ fn a_phone_knows_what_paying_a_code_costs_without_the_network_and_pays_no_more()
         assert_eq!(quote.fee, fee, "paying {amount}");
         let before = notes(&alice);
         alice
-            .pay(open.qr.clone(), Some(amount), None, false)
+            .pay(open.qr.clone(), Some(amount), None, None)
             .unwrap();
         assert_eq!(notes(&alice), before - amount - fee, "paying {amount}");
     }
@@ -1570,7 +1571,7 @@ fn a_phone_paying_now_answers_once_paid_and_mails_it_and_unlinks_after() {
     let asked = bob.payment_code(Some(500)).unwrap();
 
     // Answered once paid: neither delivered yet nor to hand over.
-    let paid = alice.clone().pay_now(asked.qr, None, None, false).unwrap();
+    let paid = alice.clone().pay_now(asked.qr, None, None, None).unwrap();
     assert_eq!((paid.amount, &paid.hub), (500, &hub));
     assert!(!paid.delivered, "{paid:?}");
     assert_eq!((&paid.handover, &paid.undelivered), (&None, &None));
@@ -1614,7 +1615,7 @@ fn a_phone_collecting_now_answers_once_taken_and_unlinks_after() {
     let alice = funded(&net, &light, "alice");
     let bob = net.wallet("bob", net.height());
     let asked = bob.payment_code(Some(500)).unwrap();
-    let paid = alice.pay(asked.qr, None, None, false).unwrap();
+    let paid = alice.pay(asked.qr, None, None, None).unwrap();
     assert!(paid.delivered, "{paid:?}");
 
     let got = bob.clone().collect_now().unwrap();
@@ -1653,7 +1654,7 @@ fn a_phone_waiting_for_mail_wakes_as_its_relays_push_a_payment() {
         let bob = bob.clone();
         std::thread::spawn(move || bob.wait_for_mail(30))
     };
-    let paid = alice.pay(asked.qr, None, None, false).unwrap();
+    let paid = alice.pay(asked.qr, None, None, None).unwrap();
     assert!(paid.delivered, "{paid:?}");
     assert!(waiting.join().unwrap());
     let got = bob.clone().collect_now().unwrap();
@@ -1755,7 +1756,7 @@ fn a_phone_shows_the_notes_each_line_of_its_history_spent_and_made() {
 
     let bob = net.wallet("bob", net.height());
     let asked = bob.payment_code(Some(500)).unwrap();
-    let paid = alice.pay(asked.qr, None, None, false).unwrap();
+    let paid = alice.pay(asked.qr, None, None, None).unwrap();
     let sent = alice.notes_of(Kind::Sent, paid.id.clone()).unwrap();
     let spent: u64 = sent.spent.iter().map(|n| n.amount).sum();
     let change: u64 = sent.made.iter().map(|n| n.amount).sum();
@@ -1800,7 +1801,7 @@ fn a_phone_shows_whom_the_notes_a_payment_spent_paid_and_what_it_kept() {
 
     let bob = net.wallet("bob", net.height());
     let asked = bob.payment_code(Some(500)).unwrap();
-    let paid = alice.pay(asked.qr, None, None, false).unwrap();
+    let paid = alice.pay(asked.qr, None, None, None).unwrap();
     let sent = alice.notes_of(Kind::Sent, paid.id.clone()).unwrap();
     let spent: u64 = sent.spent.iter().map(|n| n.amount).sum();
     let parts: Vec<_> = sent.paid.iter().map(|p| (p.to, p.amount)).collect();
@@ -1874,7 +1875,7 @@ fn a_phone_paying_while_its_hub_is_down_sends_the_payment_to_the_mailbox_once_ma
 
     // Its hub down: under way, and still so when resumed.
     net.down.store(true, Ordering::SeqCst);
-    let paid = alice.pay(asked.qr.clone(), None, None, false);
+    let paid = alice.pay(asked.qr.clone(), None, None, None);
     assert!(matches!(paid, Err(LicashError::Pending { .. })), "{paid:?}");
     alice.resume().unwrap();
     assert!(notes(&alice) < held);
@@ -1892,7 +1893,7 @@ fn a_phone_paying_while_its_hub_is_down_sends_the_payment_to_the_mailbox_once_ma
     assert_eq!(alice.on_their_way().unwrap(), 0);
 
     // Paid with its hub up: sent at once, nothing kept to send later.
-    let paid = alice.pay(asked.qr, None, None, false).unwrap();
+    let paid = alice.pay(asked.qr, None, None, None).unwrap();
     assert!(paid.delivered, "{paid:?}");
     alice.resume().unwrap();
     assert_eq!(bob.collect().unwrap().len(), 1);
@@ -1910,7 +1911,7 @@ fn a_phone_paying_a_code_at_a_hub_keeping_it_is_done_once_released_and_collected
     let asked = bob.payment_code(Some(500)).unwrap();
 
     // Kept at the hub for Bob: nothing mailed, nothing to hand over.
-    let paid = alice.pay(asked.qr.clone(), None, None, false).unwrap();
+    let paid = alice.pay(asked.qr.clone(), None, None, None).unwrap();
     assert_eq!((paid.amount, &paid.hub), (500, &hub));
     assert!(paid.kept && !paid.delivered, "{paid:?}");
     assert_eq!((&paid.handover, &paid.undelivered), (&None, &None));
@@ -1927,7 +1928,7 @@ fn a_phone_paying_a_code_at_a_hub_keeping_it_is_done_once_released_and_collected
     assert_eq!(alice.on_their_way().unwrap(), 0);
 
     // Paying now: answered once released, collected as soon.
-    let paid = alice.clone().pay_now(asked.qr, None, None, false).unwrap();
+    let paid = alice.clone().pay_now(asked.qr, None, None, None).unwrap();
     assert!(paid.kept && paid.handover.is_none(), "{paid:?}");
     let got = bob.clone().collect_now().unwrap();
     assert_eq!(got.len(), 1, "{got:?}");
@@ -1943,7 +1944,7 @@ fn a_phone_tells_whom_it_pays_a_note_and_learns_who_paid_it() {
     let asked = bob.payment_code(Some(500)).unwrap();
 
     let note = Some("  for the  pizza ".into());
-    let paid = alice.pay(asked.qr.clone(), None, note, true).unwrap();
+    let paid = alice.pay(asked.qr.clone(), None, note, Some(0)).unwrap();
     assert!(paid.kept, "{paid:?}");
     let sent = alice.history().unwrap();
     let sent = sent.iter().find(|a| a.id == paid.id).unwrap();
@@ -1968,7 +1969,7 @@ fn a_phone_tells_whom_it_pays_a_note_and_learns_who_paid_it() {
 
     // A note alone, no code shared: no one named.
     let paid = alice
-        .pay(asked.qr, None, Some("rent".into()), false)
+        .pay(asked.qr, None, Some("rent".into()), None)
         .unwrap();
     let got = bob.collect().unwrap();
     assert_eq!(
@@ -1976,6 +1977,54 @@ fn a_phone_tells_whom_it_pays_a_note_and_learns_who_paid_it() {
         (Some("rent"), &None)
     );
     assert_eq!(got[0].id, paid.id);
+}
+
+#[test]
+fn a_phone_is_paid_at_an_extra_code_apart_from_its_own_and_shows_each_payment() {
+    let net = Net::keeping();
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let bob = net.wallet("bob", net.height());
+    assert!(bob.codes().unwrap().is_empty());
+    let made = bob.add_code(" Bob  online ".into()).unwrap();
+    assert_eq!((made.index, made.label.as_str()), (1, "Bob online"));
+    let shown = made.code.clone().expect("a code at its hubs");
+    let own = bob.payment_code(None).unwrap();
+    assert_ne!(shown.text, own.text);
+    let asked = bob.extra_code(1, Some(500)).unwrap();
+
+    // Alice pays it, telling who pays: an extra code of her own.
+    let alices = alice.add_code("Alice online".into()).unwrap();
+    let note = Some("for the pizza".into());
+    let paid = alice.pay(asked.qr, None, note, Some(1)).unwrap();
+    assert!(paid.kept, "{paid:?}");
+
+    // Collected at the code, paid on to Bob's own: one line, the payment
+    // taken at the code, its fee that of paying it on.
+    let got = bob.collect().unwrap();
+    assert_eq!(got.len(), 1, "{got:#?}");
+    let line = &got[0];
+    assert_eq!(
+        (line.id.as_str(), line.amount, line.kind),
+        (paid.id.as_str(), 500, Kind::Received)
+    );
+    assert_eq!(line.code.as_deref(), Some("Bob online"));
+    assert_eq!(line.memo.as_deref(), Some("for the pizza"));
+    assert_eq!(line.from, alices.code.map(|c| c.text));
+    assert!(line.fee > 0 && line.state == State::Done, "{line:?}");
+    assert_eq!(notes(&bob), 500 - line.fee);
+    let history = bob.history().unwrap();
+    assert_eq!(history, got, "the payment on not shown itself");
+    assert!(matches!(
+        bob.details(Kind::Received, paid.id.clone()),
+        Ok(Details::Notes { .. })
+    ));
+    let codes = bob.codes().unwrap();
+    assert_eq!(
+        (codes[0].received, codes[0].payments, codes[0].fees),
+        (500, 1, line.fee)
+    );
+    assert!(bob.collect().unwrap().is_empty());
 }
 
 #[test]
@@ -1988,7 +2037,7 @@ fn a_phone_paying_a_code_naming_no_mailbox_hands_it_over_though_its_hub_keeps_it
     // Bob's code, its mailbox left out.
     let mut code: PaymentCode = asked.text.parse().unwrap();
     code.licash.as_mut().unwrap().mailbox = None;
-    let paid = alice.pay(code.to_string(), None, None, false).unwrap();
+    let paid = alice.pay(code.to_string(), None, None, None).unwrap();
     assert!(paid.kept && !paid.delivered, "{paid:?}");
     let handover = paid.handover.unwrap();
     // Collected at the hub, or handed over: taken once.
@@ -2311,7 +2360,7 @@ fn a_phone_pays_a_hub_charging_more_than_its_contract_opened_under_once_approved
     }];
     assert_eq!(alice.fees_raised().unwrap(), raised);
     let asked = bob.payment_code(Some(500)).unwrap();
-    let refused = alice.pay(asked.qr.clone(), None, None, false).unwrap_err();
+    let refused = alice.pay(asked.qr.clone(), None, None, None).unwrap_err();
     assert!(
         matches!(&refused, LicashError::FeesRaised { hub: at } if *at == hub.url),
         "{refused:?}"
@@ -2322,14 +2371,14 @@ fn a_phone_pays_a_hub_charging_more_than_its_contract_opened_under_once_approved
     // Approved as shown: paid, and kept for the wallet opened again.
     alice.approve_fees(hub.url.clone(), charged).unwrap();
     assert!(alice.fees_raised().unwrap().is_empty());
-    let paid = alice.pay(asked.qr, None, None, false).unwrap();
+    let paid = alice.pay(asked.qr, None, None, None).unwrap();
     assert_eq!(paid.amount, 500);
     assert_eq!(notes(&alice), held - 501);
     drop(alice);
     let alice = Wallet::open(dir.clone(), None).unwrap();
     assert!(alice.fees_raised().unwrap().is_empty());
     let asked = bob.payment_code(Some(100)).unwrap();
-    assert_eq!(alice.pay(asked.qr, None, None, false).unwrap().amount, 100);
+    assert_eq!(alice.pay(asked.qr, None, None, None).unwrap().amount, 100);
     drop(alice);
 
     // Her contracts unreadable: what they agreed unknown, a hub charging
@@ -2364,7 +2413,7 @@ fn a_phone_pays_a_hub_charging_more_than_its_contract_opened_under_once_approved
     }];
     assert_eq!(alice.fees_raised().unwrap(), raised);
     let asked = bob.payment_code(Some(100)).unwrap();
-    let refused = alice.pay(asked.qr.clone(), None, None, false).unwrap_err();
+    let refused = alice.pay(asked.qr.clone(), None, None, None).unwrap_err();
     assert!(
         matches!(refused, LicashError::FeesRaised { .. }),
         "{refused:?}"
@@ -2373,7 +2422,7 @@ fn a_phone_pays_a_hub_charging_more_than_its_contract_opened_under_once_approved
     // Readable again: paid.
     version(kept);
     let alice = Wallet::open(dir, None).unwrap();
-    assert_eq!(alice.pay(asked.qr, None, None, false).unwrap().amount, 100);
+    assert_eq!(alice.pay(asked.qr, None, None, None).unwrap().amount, 100);
 }
 
 #[test]
@@ -2414,7 +2463,7 @@ fn a_phone_previews_and_optimizes_notes_and_shows_the_fee_in_its_history() {
     let bob = funded(&net, &light, "bob");
     let alice = net.wallet("alice", net.height());
     let code = alice.payment_code(Some(64)).unwrap();
-    let paid = bob.pay(code.qr, None, None, false).unwrap();
+    let paid = bob.pay(code.qr, None, None, None).unwrap();
     alice.receive(paid.handover.unwrap(), false).unwrap();
     alice.resume().unwrap();
     assert_eq!(notes(&alice), 64);

@@ -41,6 +41,7 @@ import org.licash.core.BalancePoint
 import org.licash.core.BalanceSample
 import org.licash.core.ChainSource
 import org.licash.core.Code
+import org.licash.core.ExtraCode
 import org.licash.core.Contact
 import org.licash.core.Contract
 import org.licash.core.ContractExit
@@ -1408,6 +1409,15 @@ class Engine(context: Context) {
 
     suspend fun code(amount: ULong?): Result<Code> = io { local { it.paymentCode(amount) } }
 
+    /** The wallet's extra codes: codes no one can tell are its, or each other's. */
+    suspend fun codes(): Result<List<ExtraCode>> = io { local { it.codes() } }
+
+    /** A new extra code, called `label`. */
+    suspend fun addCode(label: String): Result<ExtraCode> = io { local { it.addCode(label) } }
+
+    /** Extra code `index`, asking `amount` if given. */
+    suspend fun extraCode(index: UInt, amount: ULong?): Result<Code> = io { local { it.extraCode(index, amount) } }
+
     /** The code on Bitcoin: an address any wallet pays, handed out, and watched from then on. */
     suspend fun bitcoinCode(amount: ULong?): Result<Code> = io { local { it.bitcoinCode(amount) } }
 
@@ -1485,10 +1495,11 @@ class Engine(context: Context) {
     /**
      * Pay `code` `amount`, or what it asks: answered once its hub made the
      * payment, sent to the payee's mailbox right after, in the background.
-     * With `note` for the payee, and this wallet's code if `share`: refused
-     * at a hub that would not keep them ([LicashException.NoteUnkept]).
+     * With `note` for the payee, and a code of this wallet's if `share` says
+     * which (0 its own, else that extra code's number): refused at a hub
+     * that would not keep them ([LicashException.NoteUnkept]).
      */
-    suspend fun pay(code: String, amount: ULong?, note: String? = null, share: Boolean = false): Result<Paid> = io {
+    suspend fun pay(code: String, amount: ULong?, note: String? = null, share: UInt? = null): Result<Paid> = io {
         val asked = System.nanoTime()
         val paid = mutex.withLock {
             val waited = (System.nanoTime() - asked) / 1_000_000

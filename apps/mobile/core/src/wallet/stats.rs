@@ -534,6 +534,7 @@ mod tests {
             at: Some(at),
             memo: None,
             from: None,
+            code: None,
         }
     }
 

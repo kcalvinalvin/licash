@@ -433,6 +433,25 @@ keep a note with a payment refuses it, nothing paid, and the app offers
 to send it without the note. The history shows a payment's note, and its
 details who paid: a contact, or a code to save as one.
 
+Receive, showing the Licash code, lets the user pick which code: the
+wallet's own, or a separate one made there under a name only the user
+sees. A separate code has keys of its own, derived from the seed by its
+number, and names no mailbox, so no one can tell it belongs to the wallet
+or to another of its codes: two pseudonyms posted online share nothing.
+What it is paid is collected with the wallet's payments, from the inbox
+of its hub (which keeps a payment there for 14 days; after that the payer
+still holds it and must hand it over), and paid on to the wallet's own
+code at once, less the hub's fee: an amount below that fee waits for
+more. The history shows each payment at the code, named "To" it, its fee
+that of moving it to the balance. "Share my code" may share a separate
+code instead ("Share as"). Each code is kept in a wallet file of its own
+beside the wallet's (`wallet.sqlite.codes/`), deleted with it, outside
+the state bundle and the automatic backup: a wallet restored from either
+makes the files again, and one restored from the seed shows no separate
+codes until made again, numbered as before. Hubs reached for different
+codes at the same time can link them by network timing until per-operation
+Tor circuits land.
+
 Settings, About, Export logs shares the app's log and the light client's as
 one file; Storage shows what the app keeps on the phone: the wallet, the Bitcoin
 light client (each network's in advanced mode), Tor's state, logs, caches and

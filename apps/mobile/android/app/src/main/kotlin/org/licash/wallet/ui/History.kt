@@ -123,6 +123,17 @@ private fun ActivityRow(activity: Activity, now: Long, coming: Boolean = false, 
                     overflow = TextOverflow.Ellipsis,
                 )
             }
+            // The separate code it was paid at.
+            activity.code?.let {
+                Text(
+                    "To $it",
+                    modifier = Modifier.testTag("row-code"),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = colors.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
             when {
                 failed -> Text("Failed", style = MaterialTheme.typography.bodySmall, color = colors.error)
                 under -> Text(

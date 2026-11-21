@@ -429,6 +429,10 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?, develop
         }
         val noted = activity.kind == Kind.SENT || activity.kind == Kind.RECEIVED
         activity.memo?.let { Line(if (noted) "Note" else "Memo", it, tag = "memo") }
+        activity.code?.let {
+            Line("To", it, tag = "code")
+            if (activity.fee > 0uL) FeeLine("Fee to move it to your balance", activity.fee, activity.amount)
+        }
         if (developer) tx?.let { Line("Confirmations", confirmations(it, details)) }
         activity.at?.let { Line("Date", at(it), tag = "date") }
         view?.let {

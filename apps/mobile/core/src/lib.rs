@@ -1004,6 +1004,28 @@ pub struct Activity {
     /// [`Wallet::contact_of`] finds one.
     #[uniffi(default = None)]
     pub from: Option<String>,
+    /// The label of the extra code it was paid at ([`Wallet::codes`]),
+    /// whence it was paid on to the wallet, its hub's fee taken.
+    #[uniffi(default = None)]
+    pub code: Option<String>,
+}
+
+/// An extra code of the wallet ([`Wallet::add_code`]): a code of keys of
+/// its own, that no one can tell is the wallet's or another code's.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ExtraCode {
+    /// Its number, from 1: the same code again, from the same seed.
+    pub index: u32,
+    pub label: String,
+    /// When made, in seconds since 1970.
+    pub created_at: i64,
+    /// The code to show: none while the wallet trusts no hub.
+    pub code: Option<Code>,
+    /// What it was paid, in how many payments, and the fees of paying it
+    /// on to the wallet.
+    pub received: u64,
+    pub payments: u32,
+    pub fees: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]

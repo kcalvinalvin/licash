@@ -10,11 +10,16 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
+import org.licash.core.ExtraCode
 
 /** The most bytes of a payment's note, in UTF-8, as the wallet takes it. */
 internal const val MAX_NOTE_BYTES = 200
@@ -39,13 +44,48 @@ internal fun fitNote(typed: String): String {
     return kept.toString()
 }
 
+/** The most characters of an extra code's label, as the wallet takes it. */
+internal const val MAX_CODE_LABEL = 40
+
+/** What is typed as an extra code's label: its words, one space apart, none if blank. */
+internal fun labelOf(typed: String): String? =
+    typed.split(Regex("\\s+")).filter { it.isNotEmpty() }.joinToString(" ").take(MAX_CODE_LABEL).ifEmpty { null }
+
+/** The name of the code `index` among `codes`: 0 the wallet's own. */
+internal fun codeName(index: UInt, codes: List<ExtraCode>): String =
+    if (index == 0u) "Your code" else codes.firstOrNull { it.index == index }?.label ?: "Code $index"
+
 /**
- * A note for the payee, and whether to tell them this wallet's code: sealed
- * for the payee alone, neither read by the hub nor the relays. Sharing the
- * code tells them who paid, and lets them pay back or keep it as a contact.
+ * A note for the payee, and whether to tell them a code of this wallet's,
+ * `shareAs` (0 its own, else one of its extra `codes`): sealed for the
+ * payee alone, neither read by the hub nor the relays. Sharing a code tells
+ * them who paid, and lets them pay back or keep it as a contact.
  */
 @Composable
-internal fun NoteFields(note: String, onNote: (String) -> Unit, share: Boolean, onShare: (Boolean) -> Unit) {
+internal fun NoteFields(
+    note: String,
+    onNote: (String) -> Unit,
+    share: Boolean,
+    onShare: (Boolean) -> Unit,
+    codes: List<ExtraCode> = emptyList(),
+    shareAs: UInt = 0u,
+    onShareAs: (UInt) -> Unit = {},
+) {
+    var picking by remember { mutableStateOf(false) }
+    if (picking) {
+        Sheet("Share which code", dismiss = { picking = false }) {
+            Entry("Your code", sub = "The one your contacts know", tag = "share-as-0") {
+                picking = false
+                onShareAs(0u)
+            }
+            codes.forEach { code ->
+                Entry(code.label, sub = "A separate code", tag = "share-as-${code.index}") {
+                    picking = false
+                    onShareAs(code.index)
+                }
+            }
+        }
+    }
     Column(Modifier.fillMaxWidth()) {
         OutlinedTextField(
             value = note,
@@ -74,5 +114,13 @@ internal fun NoteFields(note: String, onNote: (String) -> Unit, share: Boolean, 
                 "Anyone they show it to can link it to you.",
             set = onShare,
         )
+        if (share && codes.isNotEmpty()) {
+            Entry(
+                "Share as",
+                value = codeName(shareAs, codes),
+                tag = "share-as",
+                onClick = { picking = true },
+            )
+        }
     }
 }

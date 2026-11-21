@@ -184,6 +184,46 @@ async fn silently(phone: &Phone, silent: &str) -> anyhow::Result<()> {
 }
 
 /// Bob paid again, picked by name among the contacts rather than scanned.
+/// A separate code, made on Receive under a name: not the wallet's own,
+/// paid by Bob, moved to the balance less the hub's fee, and shown in the
+/// history as paid to it.
+async fn separate_code(phone: &Phone, bob: &licash_e2e::Wallet) -> anyhow::Result<()> {
+    let own = phone.code().await?;
+    phone.tap_id("receive").await?;
+    phone.wait("QR code", 30).await?;
+    phone.tap_id("which-code").await?;
+    phone.tap_id("new-code").await?;
+    phone.fill_id("code-label", "Forum").await?;
+    phone.tap_id("create-code").await?;
+    let shown = until("the separate code", 30, || async {
+        let shown = phone.qr(30).await?;
+        Ok((shown != own).then_some(shown))
+    })
+    .await?;
+    phone.tap("Back").await?;
+    phone.home(30).await?;
+
+    let before = phone.balance().await?;
+    let code: PaymentCode = shown.parse()?;
+    let paid = wallet::pay(bob, &code, Some(2_000), &PaymentNote::default()).await?;
+    ensure!(paid.paid.kept, "not kept at the hub: {paid:?}");
+    let now = changed(phone, before, 90).await?;
+    ensure!(
+        (1_900..2_000).contains(&(now - before)),
+        "{} moved in of 2000 paid to a separate code",
+        now - before
+    );
+    let lines = history(phone).await?;
+    ensure!(
+        lines
+            .iter()
+            .any(|v| v.id == "row-code" && v.text == "To Forum"),
+        "no payment to the separate code in the history"
+    );
+    phone.back_to("receive").await?;
+    Ok(())
+}
+
 async fn contact(phone: &Phone, bob: &licash_e2e::Wallet) -> anyhow::Result<()> {
     let before = phone.balance().await?;
     phone.tap_id("send").await?;
@@ -576,6 +616,7 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     );
     phone.back_to("receive").await?;
     contact(phone, &bob).await?;
+    separate_code(phone, &bob).await?;
 
     lightning(eco, phone).await?;
     paid_through_provider(eco, phone).await?;

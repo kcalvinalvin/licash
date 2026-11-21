@@ -54,6 +54,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.licash.core.ExtraCode
 import org.licash.core.FeesRaised
 import org.licash.core.InvoiceQuote
 import org.licash.core.LicashException
@@ -155,6 +156,10 @@ fun Send(
     // A note for the payee of a code, and whether to tell them who paid.
     var note by remember { mutableStateOf("") }
     var shareCode by remember { mutableStateOf(false) }
+    // Which: 0 the wallet's own, else an extra code's number.
+    var shareAs by remember { mutableStateOf(0u) }
+    var codes by remember { mutableStateOf<List<ExtraCode>>(emptyList()) }
+    LaunchedEffect(Unit) { codes = engine.codes().getOrDefault(emptyList()) }
 
     // Too little to pay with: protection offered first, if a coin pays for
     // one, its rest joining the balance; else bitcoin held or coming, to
@@ -246,7 +251,7 @@ fun Send(
     }
 
     suspend fun paying(code: String, amount: ULong?): Step =
-        engine.pay(code, amount, noteOf(note), shareCode).fold(
+        engine.pay(code, amount, noteOf(note), shareAs.takeIf { shareCode }).fold(
             { Step.Sent(it.amount, it.handover, code, it.kept) },
             { e ->
                 when (e) {
@@ -374,7 +379,7 @@ fun Send(
                                 if (cashOut == null) Contacts(engine) { read(it.code) }
                             }
                             is Step.Paying -> Paying(engine, ui, s, {
-                                NoteFields(note, { note = it }, shareCode, { shareCode = it })
+                                NoteFields(note, { note = it }, shareCode, { shareCode = it }, codes, shareAs, { shareAs = it })
                             }) { amount, shown -> plan(s, amount, shown) }
                             Step.Busy -> Middle("One moment…")
                             Step.Planning -> Middle("One moment…")
