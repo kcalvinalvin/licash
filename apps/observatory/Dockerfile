@@ -19,7 +19,7 @@ RUN useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin lica
     && mkdir -p /data && chown licash /data && chmod 700 /data
 COPY --from=build /usr/local/bin/licash-observatory /usr/local/bin/licash-wallet /usr/local/bin/
 USER 10001
-ENV LICASH_OBSERVATORY_DATA=/data LICASH_OBSERVATORY_LISTEN=0.0.0.0:8350 LICASH_WALLET=/data/wallet.sqlite
+ENV LICASH_OBSERVATORY_DATA=/data LICASH_OBSERVATORY_LISTEN=0.0.0.0:8350
 VOLUME /data
 EXPOSE 8350
 HEALTHCHECK --interval=30s --timeout=5s \

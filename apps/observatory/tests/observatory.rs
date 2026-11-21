@@ -300,9 +300,9 @@ async fn the_pages_show_what_was_seen() {
         Duration::from_secs(60),
         Arc::new(Mutex::new(Some(budget))),
     ));
-    let router = web::router(app);
+    let router = web::router(vec![app]);
 
-    let (status, page) = get_page(router.clone(), "/").await;
+    let (status, page) = get_page(router.clone(), "/signet").await;
     assert_eq!(status, 200);
     assert!(page.contains("Test network"), "a test network is said");
     assert!(page.contains("Leaderboards"));
@@ -310,31 +310,31 @@ async fn the_pages_show_what_was_seen() {
     assert!(page.contains("1 of 1"), "the provider is up");
     assert!(page.contains("50%"), "half the moves succeeded");
 
-    let (status, page) = get_page(router.clone(), "/hubs?range=24h").await;
+    let (status, page) = get_page(router.clone(), "/signet/hubs?range=24h").await;
     assert_eq!(status, 200);
     assert!(page.contains("127.0.0.1"));
     assert!(page.contains("1 sat + 0.01%"), "the hub's fee, as terms");
     assert!(page.contains("up to 250,000 sat"));
 
-    let (status, page) = get_page(router.clone(), "/providers").await;
+    let (status, page) = get_page(router.clone(), "/signet/providers").await;
     assert_eq!(status, 200);
     assert!(page.contains("10 sat + 0.10%"));
 
-    let (status, page) = get_page(router.clone(), &format!("/service?id={HUB_KEY}")).await;
+    let (status, page) = get_page(router.clone(), &format!("/signet/service?id={HUB_KEY}")).await;
     assert_eq!(status, 200);
     assert!(page.contains("Receive on Bitcoin"));
     assert!(page.contains("the hub refused"));
     assert!(page.contains("<svg"));
 
-    let (status, _) = get_page(router.clone(), "/service?id=nobody").await;
+    let (status, _) = get_page(router.clone(), "/signet/service?id=nobody").await;
     assert_eq!(status, 404);
 
-    let (status, page) = get_page(router.clone(), "/moves").await;
+    let (status, page) = get_page(router.clone(), "/signet/moves").await;
     assert_eq!(status, 200);
     assert!(page.contains("Pay in Licash"));
     assert!(page.contains("5,000 sat"));
 
-    let (status, body) = get_page(router.clone(), "/api/v1/view?range=30d").await;
+    let (status, body) = get_page(router.clone(), "/signet/api/v1/view?range=30d").await;
     assert_eq!(status, 200);
     let json: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["range"], "30d");
@@ -407,4 +407,56 @@ async fn an_unfunded_mover_moves_nothing_and_says_so() {
     );
     let chain = budget.kinds.iter().find(|k| k.kind == Kind::Chain).unwrap();
     assert!(!chain.enabled);
+}
+
+#[tokio::test]
+async fn several_networks_are_served_each_under_its_name() {
+    let w = world().await;
+    observer::round(w.store.clone(), watching()).await;
+    let other = tempfile::tempdir().unwrap();
+    let empty = Arc::new(Store::open(&other.path().join("o.sqlite")).unwrap());
+    let app = |store: &Arc<Store>, network: &str| {
+        Arc::new(App::new(
+            store.clone(),
+            network.into(),
+            false,
+            Duration::from_secs(60),
+            Arc::new(Mutex::new(None)),
+        ))
+    };
+    let router = web::router(vec![app(&w.store, "mutinynet"), app(&empty, "bitcoin")]);
+
+    let response = router
+        .clone()
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 307);
+    assert_eq!(response.headers()["location"], "/mutinynet");
+
+    let (status, page) = get_page(router.clone(), "/mutinynet/hubs").await;
+    assert_eq!(status, 200);
+    assert!(page.contains("127.0.0.1"), "its own records");
+    assert!(
+        page.contains("href=\"/bitcoin/hubs?range=7d\""),
+        "a switch to the other"
+    );
+    assert!(
+        page.contains("href=\"/mutinynet/service?id="),
+        "links stay in its network"
+    );
+
+    let (status, page) = get_page(router.clone(), "/bitcoin/hubs/").await;
+    assert_eq!(status, 404, "no such page");
+    let (status, page_bitcoin) = get_page(router.clone(), "/bitcoin").await;
+    assert_eq!(status, 200);
+    assert!(!page_bitcoin.contains("Test network"), "{page}");
+    assert!(
+        !page_bitcoin.contains("127.0.0.1"),
+        "not the other's records"
+    );
+    let (status, _) = get_page(router.clone(), "/nowhere").await;
+    assert_eq!(status, 404);
+    let (status, _) = get_page(router, "/bitcoin/").await;
+    assert_eq!(status, 200);
 }

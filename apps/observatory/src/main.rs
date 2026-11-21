@@ -31,11 +31,12 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "licash-observatory",
     version,
-    about = "Watch the Licash hubs and swap providers of a network, and show them on a web page"
+    about = "Watch the Licash hubs and swap providers of the networks, and show them on a web page"
 )]
 struct Cli {
-    /// The observatory's directory: its records `observatory.sqlite`, its
-    /// wallet `wallet.sqlite` and Tor's state.
+    /// The observatory's directory: Tor's state, and for each network a
+    /// directory of its records `observatory.sqlite` and its wallet
+    /// `wallet.sqlite`.
     #[arg(
         long,
         global = true,
@@ -92,9 +93,21 @@ enum Command {
 
 #[derive(Args)]
 struct Run {
-    /// The network whose services are watched.
-    #[arg(long, env = "LICASH_OBSERVATORY_NETWORK", value_enum)]
-    network: Network,
+    /// The networks whose services are watched, each under its name on the
+    /// page, the first at `/`. Repeat it, or separate them with commas.
+    #[arg(
+        long = "network",
+        env = "LICASH_OBSERVATORY_NETWORK",
+        value_enum,
+        value_delimiter = ',',
+        required = true
+    )]
+    networks: Vec<Network>,
+    /// The network whose balance is moved, as `--budget` says: of those
+    /// watched, the only one with moves measured. By default the network,
+    /// if there is one.
+    #[arg(long, env = "LICASH_OBSERVATORY_FUNDED", value_enum)]
+    funded: Option<Network>,
     /// Where the page is served.
     #[arg(
         long,
@@ -102,8 +115,8 @@ struct Run {
         default_value = "127.0.0.1:8350"
     )]
     listen: SocketAddr,
-    /// Nostr relays to find services on; the usual ones if none.
-    /// Repeat it, or separate them with commas.
+    /// Nostr relays to find services on; the usual ones if none. Repeat
+    /// it, or separate them with commas. With one network only.
     #[arg(
         long = "relay",
         env = "LICASH_OBSERVATORY_RELAYS",
@@ -111,10 +124,11 @@ struct Run {
     )]
     relays: Vec<String>,
     /// A hub to watch besides those announced. Repeat it, or separate
-    /// them with commas.
+    /// them with commas. With one network only.
     #[arg(long = "hub", env = "LICASH_OBSERVATORY_HUBS", value_delimiter = ',')]
     hubs: Vec<String>,
-    /// A swap provider to watch besides those announced.
+    /// A swap provider to watch besides those announced. With one network
+    /// only.
     #[arg(
         long = "provider",
         env = "LICASH_OBSERVATORY_PROVIDERS",
@@ -185,9 +199,31 @@ fn command(cli: Cli) -> anyhow::Result<()> {
 }
 
 async fn serve(data: PathBuf, run: Run) -> anyhow::Result<()> {
+    let mut networks = Vec::new();
+    for network in &run.networks {
+        if !networks.contains(network) {
+            networks.push(*network);
+        }
+    }
+    let funded = match (run.budget, run.funded, networks.as_slice()) {
+        (0, ..) => None,
+        (_, Some(network), _) => Some(network),
+        (_, None, [only]) => Some(*only),
+        (..) => anyhow::bail!("--budget with several networks needs --funded to say which"),
+    };
+    if let Some(funded) = funded {
+        anyhow::ensure!(
+            networks.contains(&funded),
+            "--funded {} is not among the networks watched",
+            funded.name()
+        );
+    }
+    anyhow::ensure!(
+        networks.len() == 1
+            || (run.hubs.is_empty() && run.providers.is_empty() && run.relays.is_empty()),
+        "--hub, --provider and --relay name a network's services: with one network only"
+    );
     std::fs::create_dir_all(&data).with_context(|| format!("{}", data.display()))?;
-    let store = Arc::new(Store::open(&data.join("observatory.sqlite"))?);
-    let network = run.network;
     let tor = match run.direct {
         true => None,
         false => {
@@ -202,61 +238,66 @@ async fn serve(data: PathBuf, run: Run) -> anyhow::Result<()> {
             Some(tor)
         }
     };
-    let (route, dialer) = match &tor {
-        None => (Route::Direct, Dialer::direct()),
-        Some(tor) => (Route::Tor(tor.clone()), Dialer::Tor(tor.clone())),
-    };
-    let relays = if run.relays.is_empty() {
-        licash_nostr::default_relays(network.name(), !run.direct)
-    } else {
-        run.relays
-    };
     let fresh = run.probe_every * 3;
-    let watching = Watching {
-        network: network.name().to_owned(),
-        relays,
-        route,
-        dialer,
-        hubs: run.hubs,
-        providers: run.providers,
-        probe_every: Duration::from_secs(run.probe_every),
-        discover_every: Duration::from_secs(600),
-        timeout: Duration::from_secs(if run.direct { 20 } else { 90 }),
-    };
-    let budget = Arc::new(Mutex::new(None));
-    let app = Arc::new(App::new(
-        store.clone(),
-        network.name().to_owned(),
-        !run.direct,
-        Duration::from_secs(fresh),
-        budget.clone(),
-    ));
-    let mut tasks = vec![tokio::spawn(observer::run(store.clone(), watching))];
-    if run.budget > 0 {
-        let transport = match tor {
-            Some(tor) => Http::tor(tor),
-            None => Http::new(None)?,
+    let mut apps = Vec::new();
+    let mut tasks = Vec::new();
+    // The funded network first: the page `/` leads to.
+    networks.sort_by_key(|n| Some(*n) != funded);
+    for network in networks {
+        let dir = data.join(network.name());
+        std::fs::create_dir_all(&dir).with_context(|| format!("{}", dir.display()))?;
+        let store = Arc::new(Store::open(&dir.join("observatory.sqlite"))?);
+        let (route, dialer) = match &tor {
+            None => (Route::Direct, Dialer::direct()),
+            Some(tor) => (Route::Tor(tor.clone()), Dialer::Tor(tor.clone())),
         };
-        let wallet = wallet(&data.join("wallet.sqlite"), network, transport)?;
-        let moving = Moving {
-            store,
-            monthly: run.budget,
-            amount: run.amount,
-            fresh: (fresh * 1000) as i64,
-            shown: budget,
-            chain: run.chain,
+        let relays = if run.relays.is_empty() {
+            licash_nostr::default_relays(network.name(), !run.direct)
+        } else {
+            run.relays.clone()
         };
-        tasks.push(tokio::spawn(Mover::new(wallet, moving)?.run()));
+        let watching = Watching {
+            network: network.name().to_owned(),
+            relays,
+            route,
+            dialer,
+            hubs: run.hubs.clone(),
+            providers: run.providers.clone(),
+            probe_every: Duration::from_secs(run.probe_every),
+            discover_every: Duration::from_secs(600),
+            timeout: Duration::from_secs(if run.direct { 20 } else { 90 }),
+        };
+        let budget = Arc::new(Mutex::new(None));
+        apps.push(Arc::new(App::new(
+            store.clone(),
+            network.name().to_owned(),
+            !run.direct,
+            Duration::from_secs(fresh),
+            budget.clone(),
+        )));
+        tasks.push(tokio::spawn(observer::run(store.clone(), watching)));
+        if funded == Some(network) {
+            let transport = match tor.clone() {
+                Some(tor) => Http::tor(tor),
+                None => Http::new(None)?,
+            };
+            let wallet = wallet(&dir.join("wallet.sqlite"), network, transport)?;
+            let moving = Moving {
+                store,
+                monthly: run.budget,
+                amount: run.amount,
+                fresh: (fresh * 1000) as i64,
+                shown: budget,
+                chain: run.chain.clone(),
+            };
+            tasks.push(tokio::spawn(Mover::new(wallet, moving)?.run()));
+        }
     }
     let listener = tokio::net::TcpListener::bind(run.listen)
         .await
         .with_context(|| format!("listening at {}", run.listen))?;
-    tracing::info!(
-        network = network.name(),
-        "serving the observatory at http://{}",
-        run.listen
-    );
-    axum::serve(listener, web::router(app))
+    tracing::info!("serving the observatory at http://{}", run.listen);
+    axum::serve(listener, web::router(apps))
         .with_graceful_shutdown(shutdown())
         .await?;
     for task in tasks {

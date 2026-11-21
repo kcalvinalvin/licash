@@ -1,13 +1,21 @@
 # Observatory reference
 
-`licash-observatory` watches the hubs and swap providers of one network and
-serves what it sees as a web page and a JSON API. Anyone can run one: the
+`licash-observatory` watches the hubs and swap providers of one or more
+networks and serves what it sees as a web page and a JSON API. Anyone can run one: the
 page is read-only, and nothing on it can make the observatory act.
 `licash-observatory run --help` lists every flag and environment variable.
 
 ```sh
 licash-observatory --data ./observatory run --network signet --listen 0.0.0.0:8350
+licash-observatory --data ./observatory run --network bitcoin,signet,mutinynet
 ```
+
+Each network is served under its name (`/signet`, `/mutinynet/hubs`), with a
+switch between them in the header; `/` leads to the first, or to the funded
+one. Each has its own records and, if funded, its own wallet, in
+`<data>/<network>/`; Tor's state is shared in `<data>/tor`. `--hub`,
+`--provider` and `--relay` name one network's services, so they take one
+network only.
 
 ## Finding services
 
@@ -63,8 +71,10 @@ counted as up.
 ## Moving a balance
 
 With `--budget SAT`, the observatory also keeps a wallet,
-`wallet.sqlite` in its data directory, made with a seed of its own on the
-first run, and moves part of it between the services it watches. This
+`<data>/<network>/wallet.sqlite`, made with a seed of its own on the first
+run, and moves part of it between the services of one network. With several
+networks, `--funded NETWORK` says which: the others are watched, and show
+no moves. This
 measures what probes cannot: whether payments go through, how long they
 take, and what they cost.
 
@@ -105,7 +115,7 @@ Fund the wallet at any hub the observatory watches, with the `licash-wallet`
 CLI beside it, and let the observatory take the payment on:
 
 ```sh
-export LICASH_WALLET=./observatory/wallet.sqlite
+export LICASH_WALLET=./observatory/signet/wallet.sqlite
 licash-wallet invoice 20000 --hub https://hub.example   # pay it from any node
 licash-wallet balance
 ```
@@ -121,12 +131,13 @@ keep it small, as a hub that stops paying loses it. Pay it out with
 
 ## JSON API
 
-`GET /api/v1/view?range=7d` returns everything the pages show.
+`GET /signet/api/v1/view?range=7d` returns everything the pages of a network
+show.
 `GET /health` answers `ok`.
 
 ## Records
 
-`observatory.sqlite` in the data directory holds the services, probes,
+`<data>/<network>/observatory.sqlite` holds the services, probes,
 terms and moves. Its schema is versioned; an observatory refuses records
 written by a later version rather than misreading them.
 
@@ -136,8 +147,10 @@ written by a later version rather than misreading them.
 docker build -f apps/observatory/Dockerfile -t licash-observatory .
 docker run -d --name observatory -p 8350:8350 -v licash-observatory:/data \
   licash-observatory run --network signet --budget 5000
-docker exec observatory licash-wallet invoice 20000 --hub https://hub.example
+docker exec -e LICASH_WALLET=/data/signet/wallet.sqlite observatory \
+  licash-wallet invoice 20000 --hub https://hub.example
 ```
 
 The image listens on `0.0.0.0:8350` and keeps its records, wallet and
-Tor's state in `/data`; `licash-wallet` in it uses that wallet.
+Tor's state in `/data`; point `licash-wallet` in it at the wallet with
+`LICASH_WALLET`.

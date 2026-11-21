@@ -16,9 +16,9 @@ use std::{
 };
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
     Json, Router,
 };
@@ -101,16 +101,48 @@ impl App {
     }
 }
 
-pub fn router(app: Arc<App>) -> Router {
-    Router::new()
-        .route("/", get(overview))
-        .route("/hubs", get(hubs))
-        .route("/providers", get(providers))
-        .route("/service", get(service))
-        .route("/moves", get(moves))
-        .route("/api/v1/view", get(api))
-        .route("/health", get(|| async { "ok" }))
-        .with_state(app)
+/// The networks served, each under its own name: `/signet/hubs`. The
+/// first is the one `/` leads to.
+pub struct Site {
+    apps: Vec<Arc<App>>,
+    names: Vec<String>,
+}
+
+impl Site {
+    fn app(&self, network: &str) -> Result<&Arc<App>, Response> {
+        let found = self.apps.iter().find(|a| a.network == network);
+        found.ok_or_else(|| (StatusCode::NOT_FOUND, "No such network here.").into_response())
+    }
+}
+
+/// The pages of every network in `apps`, and `/health`.
+pub fn router(apps: Vec<Arc<App>>) -> Router {
+    let names = apps.iter().map(|a| a.network.clone()).collect();
+    let site = Arc::new(Site { apps, names });
+    let mut router = Router::new()
+        .route("/", get(front))
+        .route("/health", get(|| async { "ok" }));
+    for (path, handler) in [
+        ("", get(overview)),
+        ("/hubs", get(hubs)),
+        ("/providers", get(providers)),
+        ("/service", get(service)),
+        ("/moves", get(moves)),
+        ("/api/v1/view", get(api)),
+    ] {
+        router = router.route(&format!("/{{network}}{path}"), handler.clone());
+        if path.is_empty() {
+            router = router.route("/{network}/", handler);
+        }
+    }
+    router.with_state(site)
+}
+
+async fn front(State(site): State<Arc<Site>>) -> Response {
+    match site.names.first() {
+        Some(first) => Redirect::temporary(&format!("/{first}")).into_response(),
+        None => (StatusCode::NOT_FOUND, "No network is watched.").into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -131,10 +163,12 @@ impl Asked {
 /// A page, or the page that says why not.
 type Page = Result<Response, Response>;
 
-async fn read(app: &Arc<App>, asked: &Asked) -> Result<Arc<View>, Response> {
+async fn read(site: &Site, network: &str, asked: &Asked) -> Result<Arc<View>, Response> {
+    let app = site.app(network)?;
     app.view(asked.range()).await.map_err(|e| {
         tracing::warn!("computing the view: {e}");
         let body = shell(
+            &site.names,
             &app.network,
             "Couldn't read the records",
             "",
@@ -145,8 +179,12 @@ async fn read(app: &Arc<App>, asked: &Asked) -> Result<Arc<View>, Response> {
     })
 }
 
-async fn api(State(app): State<Arc<App>>, Query(asked): Query<Asked>) -> Page {
-    let view = app.view(asked.range()).await.map_err(|e| {
+async fn api(
+    State(site): State<Arc<Site>>,
+    Path(network): Path<String>,
+    Query(asked): Query<Asked>,
+) -> Page {
+    let view = site.app(&network)?.view(asked.range()).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e })),
@@ -156,19 +194,32 @@ async fn api(State(app): State<Arc<App>>, Query(asked): Query<Asked>) -> Page {
     Ok(Json(view.as_ref().clone()).into_response())
 }
 
-async fn overview(State(app): State<Arc<App>>, Query(asked): Query<Asked>) -> Page {
-    let view = read(&app, &asked).await?;
-    Ok(html(&view, "Overview", "/", &overview_body(&view)))
+async fn overview(
+    State(site): State<Arc<Site>>,
+    Path(network): Path<String>,
+    Query(asked): Query<Asked>,
+) -> Page {
+    let view = read(&site, &network, &asked).await?;
+    Ok(html(&site, &view, "Overview", "/", &overview_body(&view)))
 }
 
-async fn hubs(State(app): State<Arc<App>>, Query(asked): Query<Asked>) -> Page {
-    let view = read(&app, &asked).await?;
-    Ok(html(&view, "Hubs", "/hubs", &hubs_body(&view)))
+async fn hubs(
+    State(site): State<Arc<Site>>,
+    Path(network): Path<String>,
+    Query(asked): Query<Asked>,
+) -> Page {
+    let view = read(&site, &network, &asked).await?;
+    Ok(html(&site, &view, "Hubs", "/hubs", &hubs_body(&view)))
 }
 
-async fn providers(State(app): State<Arc<App>>, Query(asked): Query<Asked>) -> Page {
-    let view = read(&app, &asked).await?;
+async fn providers(
+    State(site): State<Arc<Site>>,
+    Path(network): Path<String>,
+    Query(asked): Query<Asked>,
+) -> Page {
+    let view = read(&site, &network, &asked).await?;
     Ok(html(
+        &site,
         &view,
         "Swap providers",
         "/providers",
@@ -176,13 +227,27 @@ async fn providers(State(app): State<Arc<App>>, Query(asked): Query<Asked>) -> P
     ))
 }
 
-async fn moves(State(app): State<Arc<App>>, Query(asked): Query<Asked>) -> Page {
-    let view = read(&app, &asked).await?;
-    Ok(html(&view, "Measured moves", "/moves", &moves_body(&view)))
+async fn moves(
+    State(site): State<Arc<Site>>,
+    Path(network): Path<String>,
+    Query(asked): Query<Asked>,
+) -> Page {
+    let view = read(&site, &network, &asked).await?;
+    Ok(html(
+        &site,
+        &view,
+        "Measured moves",
+        "/moves",
+        &moves_body(&view),
+    ))
 }
 
-async fn service(State(app): State<Arc<App>>, Query(asked): Query<Asked>) -> Page {
-    let view = read(&app, &asked).await?;
+async fn service(
+    State(site): State<Arc<Site>>,
+    Path(network): Path<String>,
+    Query(asked): Query<Asked>,
+) -> Page {
+    let view = read(&site, &network, &asked).await?;
     let id = asked.id.as_deref().unwrap_or_default();
     let body = if let Some(hub) = view.hubs.iter().find(|h| h.id == id) {
         Some((title(&hub.name, &hub.host), hub_body(&view, hub)))
@@ -193,9 +258,10 @@ async fn service(State(app): State<Arc<App>>, Query(asked): Query<Asked>) -> Pag
             .map(|p| (title(&p.name, &p.host), provider_body(&view, p)))
     };
     match body {
-        Some((title, body)) => Ok(html(&view, &title, "", &body)),
+        Some((title, body)) => Ok(html(&site, &view, &title, "", &body)),
         None => {
             let body = shell(
+                &site.names,
                 &view.network,
                 "Not found",
                 "",
@@ -207,8 +273,8 @@ async fn service(State(app): State<Arc<App>>, Query(asked): Query<Asked>) -> Pag
     }
 }
 
-fn html(view: &View, title: &str, active: &str, body: &str) -> Response {
-    let page = shell(&view.network, title, active, view.range, body);
+fn html(site: &Site, view: &View, title: &str, active: &str, body: &str) -> Response {
+    let page = shell(&site.names, &view.network, title, active, view.range, body);
     ([(header::CACHE_CONTROL, "no-cache")], Html(page)).into_response()
 }
 
@@ -224,8 +290,17 @@ fn failed(why: &str) -> String {
     )
 }
 
-/// The page around `body`: its header, navigation and range.
-fn shell(network: &str, title: &str, active: &str, range: Range, body: &str) -> String {
+/// The page around `body`: its header, the networks to switch to,
+/// navigation and range. `active` is the page's path within its network.
+fn shell(
+    networks: &[String],
+    network: &str,
+    title: &str,
+    active: &str,
+    range: Range,
+    body: &str,
+) -> String {
+    let base = format!("/{network}");
     let mut nav = String::new();
     for (href, label) in [
         ("/", "Overview"),
@@ -240,7 +315,7 @@ fn shell(network: &str, title: &str, active: &str, range: Range, body: &str) -> 
         };
         let _ = write!(
             nav,
-            "<a href=\"{href}?range={}\"{current}>{label}</a>",
+            "<a href=\"{base}{href}?range={}\"{current}>{label}</a>",
             range.key()
         );
     }
@@ -254,9 +329,36 @@ fn shell(network: &str, title: &str, active: &str, range: Range, body: &str) -> 
         };
         let _ = write!(
             ranges,
-            "<a href=\"{here}?range={}\"{current}>{}</a>",
+            "<a href=\"{base}{here}?range={}\"{current}>{}</a>",
             r.key(),
             r.label()
+        );
+    }
+    let mut badges = String::new();
+    for other in networks.iter().filter(|_| networks.len() > 1) {
+        let current = if other == network {
+            " aria-current=\"true\""
+        } else {
+            ""
+        };
+        let _ = write!(
+            badges,
+            "<a class=\"badge\" href=\"/{}{}?range={}\"{current}>{}</a>",
+            esc(other),
+            if active == "/" || active.is_empty() {
+                ""
+            } else {
+                active
+            },
+            range.key(),
+            esc(&network_name(other))
+        );
+    }
+    if networks.len() <= 1 {
+        let _ = write!(
+            badges,
+            "<span class=\"badge\">{}</span>",
+            esc(&network_name(network))
         );
     }
     let test = if network == "bitcoin" {
@@ -271,14 +373,13 @@ fn shell(network: &str, title: &str, active: &str, range: Range, body: &str) -> 
          <meta http-equiv=\"refresh\" content=\"120\">\
          <title>{title} · Licash observatory</title><style>{STYLE}</style></head><body>\
          <header><div class=\"bar\"><a class=\"brand\" href=\"/\">licash <span>observatory</span></a>\
-         <span class=\"badge\">{network}</span>{test}</div>\
+         <span class=\"badges\">{badges}</span>{test}</div>\
          <nav>{nav}</nav></header>\
          <main><div class=\"heading\"><h1>{title}</h1><div class=\"ranges\">{ranges}</div></div>\
          {body}</main>\
-         <footer>A self-hosted Licash observatory. <a href=\"/api/v1/view?range={key}\">JSON</a></footer>\
+         <footer>A self-hosted Licash observatory. <a href=\"{base}/api/v1/view?range={key}\">JSON</a></footer>\
          </body></html>",
         title = esc(title),
-        network = esc(&network_name(network)),
         key = range.key(),
     )
 }
@@ -304,7 +405,8 @@ fn state(health: &Health) -> &'static str {
 
 fn link(view: &View, id: &str, label: &str) -> String {
     format!(
-        "<a href=\"/service?id={}&amp;range={}\">{}</a>",
+        "<a href=\"/{}/service?id={}&amp;range={}\">{}</a>",
+        view.network,
         format::query(id),
         view.range.key(),
         esc(label)
@@ -1046,7 +1148,10 @@ header .bar,header nav,main,footer{max-width:1120px;margin:0 auto;padding:0 20px
 header .bar{display:flex;align-items:center;gap:10px;padding-top:16px}
 .brand{font-weight:700;font-size:18px;text-decoration:none;letter-spacing:-.01em}
 .brand span{font-weight:400;color:var(--dim)}
-.badge{font-size:12px;padding:2px 8px;border-radius:999px;background:var(--tint);color:var(--accent);font-weight:600}
+.badge{font-size:12px;padding:2px 8px;border-radius:999px;color:var(--dim);font-weight:600;text-decoration:none}
+a.badge:hover{color:var(--fg)}
+.badge[aria-current],span.badge{background:var(--tint);color:var(--accent)}
+.badges{display:inline-flex;gap:4px;flex-wrap:wrap}
 .badge.warn{background:transparent;border:1px solid var(--warn);color:var(--warn)}
 nav{display:flex;gap:22px;padding-top:10px}
 nav a{text-decoration:none;color:var(--dim);padding:8px 0 10px;border-bottom:2px solid transparent}
