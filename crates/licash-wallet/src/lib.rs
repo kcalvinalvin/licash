@@ -35,6 +35,7 @@ mod backup;
 mod claims;
 mod closes;
 mod code;
+mod codes;
 mod coins;
 mod cold;
 mod delivery;
@@ -83,6 +84,7 @@ pub use closes::ClosePayment;
 pub use code::{
     ContractSecrets, DonationAddress, HubId, LicashCode, PaymentCode, CODE_HUBS, MAX_HUBS,
 };
+pub use codes::{CodeActivity, CodesCollected, ExtraCode, MAX_LABEL};
 pub use coins::MAX_INPUTS;
 pub use cold::{Cold, ColdRules, ColdScript, ColdWithdrawal, GAP as COLD_GAP};
 pub use delivery::{Delivery, Due, Inboxed, ACK_WITHIN, PAGES_AT_ONCE};
@@ -538,6 +540,9 @@ pub struct Wallet<T> {
     /// The chain's height as its application told it since opened, the
     /// highest ([`Wallet::saw_tip`]): 0 if never.
     told_tip: AtomicU32,
+    /// Whether the wallet's extra codes are being collected
+    /// ([`Wallet::collect_codes`]): once at a time.
+    collecting_codes: std::sync::atomic::AtomicBool,
 }
 
 /// The height by which a lock at the hub reached at any of the URLs given,
@@ -608,6 +613,7 @@ impl<T: Transport> Wallet<T> {
             ceilings: Mutex::default(),
             horizon: Mutex::default(),
             told_tip: AtomicU32::new(0),
+            collecting_codes: Default::default(),
         })
     }
 
@@ -647,6 +653,7 @@ impl<T: Transport> Wallet<T> {
             ceilings: Mutex::default(),
             horizon: Mutex::default(),
             told_tip: AtomicU32::new(0),
+            collecting_codes: Default::default(),
         })
     }
 

@@ -502,6 +502,9 @@ pub(crate) struct CodeKeys {
     /// What the secrets of the deposits asked derive from, with their hub
     /// and number ([`crate::deposits`]).
     pub(crate) deposit: [u8; 32],
+    /// What the seeds of the wallet's extra codes derive from, with their
+    /// number ([`crate::codes`]).
+    pub(crate) codes: [u8; 32],
 }
 
 /// What a wallet brings to opening a recovery contract with a hub, as its
@@ -530,12 +533,14 @@ impl CodeKeys {
         let contract = tagged_hash("licash/contract/seed", &[seed]);
         let shaping = tagged_hash("licash/shaping/key", &[seed]);
         let deposit = tagged_hash("licash/deposit/seed", &[seed]);
+        let codes = tagged_hash("licash/codes/seed", &[seed]);
         Ok(Self {
             silent,
             mailbox,
             contract,
             shaping,
             deposit,
+            codes,
         })
     }
 }
@@ -546,6 +551,18 @@ impl<T: Transport> Wallet<T> {
     /// once, reached at those URLs, and its mailbox if one of them names
     /// relays.
     pub fn payment_code(&self, hubs: &[String]) -> Result<PaymentCode, Error> {
+        self.code_of(self.address(), true, hubs)
+    }
+
+    /// The code of the owner at `address` at the first [`CODE_HUBS`] of
+    /// `hubs`, as [`Wallet::payment_code`] says, naming this wallet's
+    /// mailbox only if `mailbox`.
+    pub(crate) fn code_of(
+        &self,
+        address: Address,
+        mailbox: bool,
+        hubs: &[String],
+    ) -> Result<PaymentCode, Error> {
         let trusted = self.hubs()?;
         let (mut ids, mut locations) = (Vec::new(), Vec::new());
         let mut relays = false;
@@ -565,14 +582,15 @@ impl<T: Transport> Wallet<T> {
             }
             relays |= !info.relays.is_empty();
         }
-        let mailbox = relays.then(|| self.keys.mailbox.x_only_public_key(&Secp256k1::new()).0);
+        let mailbox =
+            (mailbox && relays).then(|| self.keys.mailbox.x_only_public_key(&Secp256k1::new()).0);
         Ok(PaymentCode {
             address: None,
             amount: None,
             silent: None,
             licash: Some(LicashCode {
                 network: self.network,
-                address: self.address(),
+                address,
                 mailbox: mailbox.map(|key| key.serialize()),
                 hubs: ids,
                 locations,

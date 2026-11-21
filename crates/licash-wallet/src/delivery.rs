@@ -102,6 +102,9 @@ pub struct Inboxed {
     /// How many hubs answered that they keep payments, their inboxes
     /// looked through to the end or not.
     pub served: usize,
+    /// What the wallet's extra codes were paid, and paid on to it, first
+    /// ([`Wallet::collect_codes`]).
+    pub codes: crate::CodesCollected,
 }
 
 /// Record that send `id`, to the payee sharing receipt secret `shared`,
@@ -456,8 +459,24 @@ impl<T: Transport> Wallet<T> {
     /// once, and tell their payers, through the hubs, that it has them.
     /// Each hub's inbox is looked through from where it was last, to the
     /// end; a hub that keeps no payments is skipped, and one that fails is
-    /// looked through again from there next time.
+    /// looked through again from there next time. The wallet's extra
+    /// codes are collected first ([`Wallet::collect_codes`]), what they
+    /// pay on to the wallet taken with the rest.
     pub async fn collect_inbox(&self) -> Result<Inboxed, Error> {
+        let codes = match self.collect_codes().await {
+            Ok(codes) => codes,
+            Err(e) => {
+                tracing::warn!("extra codes not collected: {e}");
+                crate::CodesCollected::default()
+            }
+        };
+        let mut inboxed = self.collect_own_inbox().await?;
+        inboxed.codes = codes;
+        Ok(inboxed)
+    }
+
+    /// [`Wallet::collect_inbox`] of the wallet's own code alone.
+    pub(crate) async fn collect_own_inbox(&self) -> Result<Inboxed, Error> {
         let hubs: Vec<(i64, String, i64)> = self.store.read(|c| {
             let mut stmt = c.prepare(
                 "SELECT h.id, r.url, COALESCE(h.inbox_after, 0)

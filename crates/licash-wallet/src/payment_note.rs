@@ -14,7 +14,7 @@
 //!
 //! A note opened is the payee's to keep; one that does not open, or says
 //! what no note says, is no note: the payment stands without it. Notes are
-//! kept in their own tables of the wallet's file (`notes`, version
+//! kept in their own tables of the wallet's file (`payment_notes`, version
 //! [`VERSION`]), made as the first is written: a file of another version of
 //! them sends and takes payments without notes.
 
@@ -332,7 +332,8 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// `note`, of payment `id` to `to` with receipt secret `shared`,
-    /// sealed: its code one of this wallet's.
+    /// sealed: its code this wallet's own or one of its extra codes, proved
+    /// by that code's keys.
     pub(crate) fn seal_note(
         &self,
         shared: &[u8; 32],
@@ -340,14 +341,15 @@ impl<T: Transport> Wallet<T> {
         to: &Address,
         note: &PaymentNote,
     ) -> Result<Vec<u8>, Error> {
-        if let Some(from) = &note.from {
-            if from.address != self.address() || from.network != self.network {
-                return Err(Error::Invalid(
-                    "a note sharing another wallet's code".into(),
-                ));
+        match &note.from {
+            Some(from) if from.address != self.address() => {
+                let owner = self.code_owner(&from.address)?;
+                let owner = owner
+                    .ok_or_else(|| Error::Invalid("a note sharing another wallet's code".into()))?;
+                seal(shared, id, to, note, owner.scan_key())
             }
+            _ => seal(shared, id, to, note, self.owner.scan_key()),
         }
-        seal(shared, id, to, note, self.owner.scan_key())
     }
 
     /// Keep what the note `sealed` of the payment of `proposal` to this
@@ -415,12 +417,13 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// `note` as sent: its text as [`note_text`] says it, none if blank,
-    /// and its code one of this wallet's.
+    /// and its code this wallet's own or one of its extra codes.
     pub(crate) fn own_note(&self, note: &PaymentNote) -> Result<PaymentNote, Error> {
         let text = note.text.as_deref().filter(|t| !t.trim().is_empty());
         let text = text.map(note_text).transpose()?;
         if let Some(from) = &note.from {
-            if from.address != self.address() || from.network != self.network {
+            let ours = from.address == self.address() || self.code_owner(&from.address)?.is_some();
+            if !ours || from.network != self.network {
                 return Err(Error::Invalid(
                     "a note sharing another wallet's code".into(),
                 ));
