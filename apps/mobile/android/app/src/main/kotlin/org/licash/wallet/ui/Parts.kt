@@ -96,6 +96,9 @@ fun Wordmark(modifier: Modifier = Modifier, size: Int = 22) {
  */
 val LocalBlockSeconds = compositionLocalOf { BITCOIN_BLOCK_SECONDS }
 
+/** A network's name as said to a user: "Bitcoin", "Mutinynet". */
+internal fun named(network: Network): String = network.name.lowercase().replaceFirstChar { it.uppercase() }
+
 /** The network, unless it is Bitcoin's own. */
 @Composable
 fun NetworkChip(network: Network) {

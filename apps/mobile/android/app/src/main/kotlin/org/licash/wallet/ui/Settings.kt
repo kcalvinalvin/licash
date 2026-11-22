@@ -288,7 +288,7 @@ private fun BitcoinPage(engine: Engine, ui: Ui) {
     Group("") { SyncStages(engine, ui) }
     ui.problem?.let { Problem(it) }
     Group("") {
-        Line("Network", ui.network.name.lowercase())
+        Line("Network", named(ui.network))
         Divider()
         Line("Wallet birthday", birthday?.let { "Block ${digits(it.toULong())}" } ?: "Not known yet", tag = "birthday")
         ui.scan?.let {

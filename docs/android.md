@@ -119,7 +119,8 @@ client's settings, resetting its chain state and deleting the wallet.
 The app runs one Tor client and starts the light client
 through it at launch, wallet or not: catching up starts before a wallet is
 made. A wallet made before it caught up is born at the block the release
-pins for its network (regtest: the first), never scanned from the start. Its state lives in `files/tor`; an earlier version's, in the wallet's
+pins for its network (regtest: the first), never scanned from the start.
+Its state lives in `files/tor`; an earlier version's, in the wallet's
 directory, moves there once (left where it is if it cannot).
 
 Cold storage, in advanced mode (or once set up), is a page of its own in
@@ -537,8 +538,9 @@ hubs.
 
 A wallet of the release before note format v3 (wallet schema 3) holds notes
 whose issuance proofs this version does not verify. It is refused when the
-app starts ("a wallet of an earlier version"), shown as the wallet's
-problem, and its file is left as it is; a backup of one is refused on
+app starts ("a wallet of an earlier version"), said on the first screen
+in place of creating or restoring a wallet (with clearing the app's
+storage as the way to start over), and its file is left as it is; a backup of one is refused on
 restore. Before updating, spend or pay out its notes, and let its contracts
 close, with the release before. Its APK installs over this one with the
 wallet's files kept (the version code does not change), so keep a copy.

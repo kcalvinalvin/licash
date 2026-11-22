@@ -60,7 +60,18 @@ fun Onboarding(engine: Engine, ui: Ui) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
             )
-            if (networksShown(testing, ui)) {
+            ui.unopened?.let {
+                Spacer(Modifier.height(32.dp))
+                Text(UNOPENED, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
+                Text(
+                    unopenedWords(it),
+                    modifier = Modifier.padding(top = 8.dp).testTag("unopened"),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
+            if (ui.unopened == null && networksShown(testing, ui)) {
                 Spacer(Modifier.height(32.dp))
                 Text("Network", style = MaterialTheme.typography.labelLarge)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)) {
@@ -68,7 +79,7 @@ fun Onboarding(engine: Engine, ui: Ui) {
                         FilterChip(
                             selected = ui.network == network,
                             onClick = { scope.launch { engine.setNetwork(network) } },
-                            label = { Text(network.name.lowercase()) },
+                            label = { Text(named(network)) },
                             modifier = Modifier.testTag("network ${network.name.lowercase()}"),
                         )
                     }
@@ -83,6 +94,11 @@ fun Onboarding(engine: Engine, ui: Ui) {
             }
         }
         Spacer(Modifier.height(16.dp))
+        // A wallet is here: none is made or restored over it.
+        if (ui.unopened != null) {
+            Spacer(Modifier.height(24.dp))
+            return@Column
+        }
         error?.let { Text(it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center) }
         Waited(rememberWait(busy), Modifier.padding(bottom = 8.dp), center = true)
         BigButton(
@@ -128,6 +144,14 @@ fun Onboarding(engine: Engine, ui: Ui) {
  */
 internal fun networksShown(asked: Boolean, ui: Ui): Boolean =
     asked || ui.developer || ui.network != Network.BITCOIN
+
+/** Said where the wallet on the device could not be opened. */
+internal const val UNOPENED = "This wallet can't be opened"
+
+/** Why the wallet on the device could not be opened, `reason`, and the way to start over instead. */
+internal fun unopenedWords(reason: String): String =
+    "${reason.trimEnd('.')}. To start over instead, clear this app's storage in Android's settings: what the wallet holds is then lost, " +
+        "unless you saved a backup file."
 
 /** What a test network is, said beside them. */
 internal const val TEST_NETWORKS = "Test networks use coins of no value: Mutinynet's are free from its faucet. " +

@@ -19,6 +19,19 @@ class OnboardingTest {
     }
 
     @Test
+    fun a_wallet_that_cannot_be_opened_says_why_and_how_to_start_over() {
+        val said = unopenedWords("A wallet of an earlier version, left as it is.")
+        assertTrue(said.startsWith("A wallet of an earlier version, left as it is. To start over"))
+        assertTrue(said.contains("clear this app's storage"))
+        assertTrue(said.contains("lost"))
+    }
+
+    @Test
+    fun networks_are_named_as_proper_nouns() {
+        assertEquals(listOf("Bitcoin", "Signet", "Mutinynet", "Regtest"), Network.entries.map(::named))
+    }
+
+    @Test
     fun no_hub_on_bitcoin_says_how_to_try_it_and_nothing_elsewhere() {
         assertEquals(NONE_ON_BITCOIN, noneFound(Network.BITCOIN, none = true))
         // A wallet with a hub already, or on a test network: only "None found".

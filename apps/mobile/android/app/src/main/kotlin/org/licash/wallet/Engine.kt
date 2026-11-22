@@ -114,6 +114,8 @@ data class Ui(
     val incoming: List<Activity> = emptyList(),
     /** Why the last round of syncing fell short, if it did. */
     val problem: String? = null,
+    /** Why the wallet on this device could not be opened, if it could not: none made over it. */
+    val unopened: String? = null,
     /** Whether each hub answered when last asked, by URL: none before it is asked. In memory only. */
     val hubsReached: Map<String, Boolean> = emptyMap(),
     /** How fast each hub reached answers, in milliseconds, by URL: its fastest answer of the last minutes. */
@@ -443,7 +445,7 @@ class Engine(context: Context) {
                     .onSuccess { wallet = it }
                     .onFailure { e ->
                         AppLog.warn("opening the wallet", e)
-                        state.update { it.copy(problem = explain(e)) }
+                        state.update { it.copy(problem = explain(e), unopened = explain(e)) }
                     }
             }
         }
