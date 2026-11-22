@@ -218,6 +218,18 @@ struct Chain {
         requires = "contracts_max_cap"
     )]
     contracts_rate_funded: u32,
+    /// The hub's fee for opening a contract, in sat, of its fixed terms
+    /// and those chosen alike, besides the holder's reserve and the rate
+    /// on its part: what it charges for what it brings. Past half its
+    /// most contracts live, it doubles at each eighth more.
+    #[arg(
+        long = "contracts-fee",
+        value_name = "SAT",
+        env = "LICASH_HUB_CONTRACTS_FEE",
+        default_value_t = licash_contracts::hub::terms::OPENING_FEE,
+        requires = "contracts"
+    )]
+    contracts_fee: u64,
     /// The most contracts live at once, signed and not ended or under
     /// way: as many as the hub proves the exits of, all at once, within
     /// an assertion window, twice over. Past half of them its fee doubles
@@ -1087,6 +1099,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             let max_live = chain.contracts_max_live;
             let proof_scale = chain.contracts_proof_scale;
             let work_depth = chain.contracts_work_depth;
+            let opening_fee = chain.contracts_fee;
             let wallet = match (&chain.contracts_wallet, &chain.url) {
                 (Some(url), _) => Some(url.parse::<Source>().context("--contracts-wallet")?),
                 (None, Some(url)) if contracting && url.starts_with("esplora+") => anyhow::bail!(
@@ -1226,6 +1239,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                             .context("--contracts-payout-wallet")?;
                     }
                     openings.limit_live(max_live);
+                    openings.charge_opening(opening_fee);
                     if let Some(depth) = work_depth {
                         openings.ask_work(depth).context("--contracts-work-depth")?;
                     }

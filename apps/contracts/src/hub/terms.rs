@@ -33,7 +33,8 @@ pub const CAP: u32 = 131_071;
 /// The holder's reserve, from her deposit.
 pub const RESERVE_ALICE: u64 = 20_000;
 
-/// The hub's fee for an opening, from her deposit.
+/// The hub's fee for an opening, from her deposit, unless its operator
+/// sets another ([`Timing::with_opening_fee`]).
 pub const OPENING_FEE: u64 = 3_000;
 
 /// The hub's reserve in F, from its wallet.
@@ -130,6 +131,8 @@ pub struct Timing {
     /// Blocks of work its statement reads on top of her request's
     /// response, at least the network's floor ([`Timing::with_work_depth`]).
     work_depth: u32,
+    /// The hub's own fee for an opening, before its surcharge.
+    opening_fee: u64,
 }
 
 /// The most blocks of work a hub may ask for beyond its network's floor:
@@ -195,7 +198,18 @@ impl Timing {
             range,
             step: 0,
             work_depth: Floors::of(profile).work_depth,
+            opening_fee: OPENING_FEE,
         })
+    }
+
+    /// These terms, the hub's own fee for an opening `fee` sat, of the
+    /// fixed terms and those chosen alike: what it charges for what it
+    /// brings, its part of the cap priced by its rate besides.
+    pub fn with_opening_fee(self, fee: u64) -> Self {
+        Self {
+            opening_fee: fee,
+            ..self
+        }
     }
 
     /// These terms, its statement reading `depth` blocks of work on top
@@ -250,6 +264,11 @@ impl Timing {
         1 << self.step
     }
 
+    /// The hub's fee for an opening, surcharged at its step.
+    fn opening_fee(&self) -> u64 {
+        self.opening_fee.saturating_mul(u64::from(self.surcharge()))
+    }
+
     /// The terms holders may choose, if any, as the hub's info says them.
     pub fn range(&self) -> Option<licash_api::ContractRange> {
         self.range.map(|r| licash_api::ContractRange {
@@ -261,7 +280,7 @@ impl Timing {
             // part. Announced as none for wallets that read it as a bound.
             per_coin: u32::MAX,
             reserve: RESERVE_ALICE,
-            fee: OPENING_FEE * u64::from(self.surcharge()),
+            fee: self.opening_fee(),
             ppm_year: r.ppm_year.saturating_mul(self.surcharge()),
             ppm_year_funded: r.ppm_year_funded.saturating_mul(self.surcharge()),
             year_blocks: self.profile.blocks_a_year(),
@@ -278,7 +297,7 @@ impl Timing {
             max_blocks: self.lock,
             per_coin: 1,
             reserve: RESERVE_ALICE,
-            fee: OPENING_FEE * u64::from(self.surcharge()),
+            fee: self.opening_fee(),
             ppm_year: 0,
             ppm_year_funded: 0,
             year_blocks: self.profile.blocks_a_year(),
@@ -719,6 +738,31 @@ mod tests {
         let quote = |t: Timing| digest(&t.quote(keyset.clone(), checkpoint.clone()));
         assert_eq!(quote(timing.at_step(0)), quote(timing));
         assert_ne!(quote(timing.at_step(1)), quote(timing));
+    }
+
+    /// The operator's fee for an opening is the one quoted, announced and
+    /// surcharged, of the fixed terms and those chosen alike; by default,
+    /// the quote as it always was.
+    #[test]
+    fn the_operators_opening_fee_is_the_one_quoted_and_announced() {
+        let parts = Hub::peek(funded()).unwrap().base.parts().clone();
+        let (keyset, checkpoint) = (parts.keyset, parts.chain.checkpoint);
+        let quote = |t: Timing| digest(&t.quote(keyset.clone(), checkpoint.clone()));
+        for range in [None, Some(RANGE)] {
+            let timing = Timing::of(ChainProfile::Core30Signet, range).unwrap();
+            assert_eq!(quote(timing.with_opening_fee(OPENING_FEE)), quote(timing));
+            for (fee, step) in [(0, 0), (50_000, 0), (50_000, 2), (u64::MAX, MAX_STEP)] {
+                let at = timing.with_opening_fee(fee).at_step(step);
+                let fee = fee.saturating_mul(1 << step);
+                let fixed = at.quote_for(keyset.clone(), checkpoint.clone(), CAP, LOCK, 0);
+                let interest = fixed.fees.opening_fee_quote.checked_sub(fee).unwrap();
+                assert_eq!(
+                    at.price(CAP, LOCK, 0),
+                    RESERVE_ALICE.saturating_add(fee + interest)
+                );
+                assert_eq!(at.range().map(|r| r.fee), range.map(|_| fee));
+            }
+        }
     }
 
     /// Work asked beyond the floor lengthens the assertion window and the

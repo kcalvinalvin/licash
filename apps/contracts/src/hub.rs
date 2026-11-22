@@ -484,6 +484,14 @@ impl Openings {
         Ok(())
     }
 
+    /// Charge `fee` sat for an opening, before its surcharge, in the
+    /// contracts quoted from now on ([`Timing::with_opening_fee`]),
+    /// [`terms::OPENING_FEE`] unless told.
+    pub fn charge_opening(&self, fee: u64) {
+        let mut timing = self.timing.write().unwrap_or_else(|e| e.into_inner());
+        *timing = timing.with_opening_fee(fee);
+    }
+
     /// Ask `depth` blocks of work on top of a request's response in the
     /// contracts quoted from now on ([`Timing::with_work_depth`]), the
     /// network's floor unless told: those open already keep theirs.

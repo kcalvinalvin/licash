@@ -319,7 +319,9 @@ another node's wallet instead, by its JSON-RPC as `--chain` takes it
 may then follow the chain through an Esplora API. A wallet of its own,
 funded with what the hub may lock, bounds the collateral at stake.
 `/v1/info` names its fixed terms: the cap (131,071 sat), the price a wallet
-pays to open one and the blocks to its close (1,000); the openings take
+pays to open one (the holder's 20,000 sat reserve and the hub's opening fee,
+`--contracts-fee`, 3,000 sat by default, what it charges for what it brings)
+and the blocks to its close (1,000); the openings take
 `/v1/contracts`. With `--contracts-max-cap SAT`, wallets may also choose a
 contract's cap up to that and how long it lasts up to
 `--contracts-max-blocks` (`/v1/contracts/quote?cap=SAT&blocks=N`), its cap
