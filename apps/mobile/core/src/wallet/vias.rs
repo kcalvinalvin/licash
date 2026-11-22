@@ -4,8 +4,14 @@
 //! The app compares them with the gateways of the hubs it trusts and pays
 //! the cheapest. A payment through a provider that fails returns its notes
 //! only once its lock expires, which the quote tells.
+//!
+//! And invoices the wallet is paid with through providers taking them, at
+//! a hub trusted, where no hub's gateway makes them: the provider's node
+//! makes the invoice, and once paid locks its notes to the wallet.
 
-use licash_nostr::wallet::{hub_relays, invoice_providers_with};
+use licash_nostr::wallet::{
+    hub_relays, invoice_providers_with, receive_providers_with, ReceiveProvider,
+};
 use licash_wallet::{Payable, SwapLimits};
 
 use super::Wallet;
@@ -134,5 +140,73 @@ impl Wallet {
             }));
         }
         Ok(offers)
+    }
+}
+
+/// Getting paid through providers.
+#[uniffi::export]
+impl Wallet {
+    /// Whether a swap provider announced has the wallet paid over Lightning
+    /// at a hub trusted now ([`Wallet::ask_invoice`], where no hub's gateway
+    /// does): asked of the relays the hubs name, and each provider.
+    pub fn provider_takes_lightning(&self) -> Result<bool, LicashError> {
+        let _timed = crate::log::timed("provider_takes_lightning");
+        Ok(!self.receive_offers()?.is_empty())
+    }
+}
+
+impl Wallet {
+    /// Each swap provider announced that has the wallet paid over Lightning
+    /// now, at each hub trusted: none if no hub names relays.
+    fn receive_offers(&self) -> Result<Vec<(String, ReceiveProvider)>, LicashError> {
+        let relays = hub_relays(&self.wallet)?;
+        let mut offers = Vec::new();
+        if relays.is_empty() {
+            return Ok(offers);
+        }
+        for (hub, _) in self.wallet.hubs()? {
+            let found =
+                receive_providers_with(&self.wallet, &self.announced, (&relays, &self.route), &hub);
+            match self.operation(found) {
+                Ok(found) => offers.extend(found.into_iter().map(|p| (hub.clone(), p))),
+                Err(e) => {
+                    tracing::info!(%hub, "no provider takes payments over Lightning: {e:#}");
+                }
+            }
+        }
+        Ok(offers)
+    }
+
+    /// Ask the swap provider announced that has the wallet paid over
+    /// Lightning at a hub trusted for least for an invoice paying the wallet
+    /// `amount`, or, `invoiced`, asking the payer `amount`, its fee in it:
+    /// for when no hub's gateway makes it. None if no provider takes it.
+    pub(super) fn provider_invoice(
+        &self,
+        amount: u64,
+        invoiced: bool,
+        memo: Option<&str>,
+    ) -> Result<Option<Result<licash_wallet::Invoice, licash_wallet::Error>>, LicashError> {
+        // Its fee, what it pays the wallet, at which hub, through which.
+        let mut best: Option<(u64, u64, String, String)> = None;
+        for (hub, provider) in self.receive_offers()? {
+            let (terms, max) = (&provider.offer.terms, provider.offer.max);
+            let paid = match invoiced {
+                true => super::before_fee(&terms.fee, amount),
+                false => amount,
+            };
+            if paid == 0 || !(terms.min..=max).contains(&paid) {
+                continue;
+            }
+            let fee = terms.fee.due(paid);
+            if best.as_ref().is_none_or(|(least, ..)| fee < *least) {
+                best = Some((fee, paid, hub, provider.url));
+            }
+        }
+        let Some((_, paid, hub, provider)) = best else {
+            return Ok(None);
+        };
+        let asked = self.wallet.invoice_through(&provider, &hub, paid, memo);
+        Ok(Some(self.operation(asked)))
     }
 }

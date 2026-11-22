@@ -282,7 +282,7 @@ struct Swaps {
 
 impl Swaps {
     fn start(hubs: &Hubs, seed: u8, terms: Config) -> Self {
-        Self::start_with(hubs, seed, terms, None, None)
+        Self::start_with(hubs, seed, terms, None, None, None)
     }
 
     /// [`Swaps::start`], taking donations on `donating` through its node
@@ -294,7 +294,7 @@ impl Swaps {
         terms: Config,
         donating: (Arc<Fake>, licash_swaps::DonationTerms),
     ) -> Self {
-        Self::start_with(hubs, seed, terms, None, Some(donating))
+        Self::start_with(hubs, seed, terms, None, Some(donating), None)
     }
 
     /// [`Swaps::start`], paying Lightning invoices from `node` too, on
@@ -305,7 +305,19 @@ impl Swaps {
         terms: Config,
         (node, lightning): (Arc<Fake>, swaps::Lightning),
     ) -> Self {
-        Self::start_with(hubs, seed, terms, Some((node, lightning)), None)
+        Self::start_with(hubs, seed, terms, Some((node, lightning)), None, None)
+    }
+
+    /// [`Swaps::start`], taking payments over Lightning for wallets through
+    /// `node` too, on `receiving`'s terms, as the service does with
+    /// `--receive`.
+    fn start_receiving(
+        hubs: &Hubs,
+        seed: u8,
+        terms: Config,
+        receiving: (Arc<Fake>, licash_swaps::ReceiveTerms),
+    ) -> Self {
+        Self::start_with(hubs, seed, terms, None, None, Some(receiving))
     }
 
     fn start_with(
@@ -314,6 +326,7 @@ impl Swaps {
         terms: Config,
         lightning: Option<(Arc<Fake>, swaps::Lightning)>,
         donating: Option<(Arc<Fake>, licash_swaps::DonationTerms)>,
+        receiving: Option<(Arc<Fake>, licash_swaps::ReceiveTerms)>,
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let wallet = licash_wallet::Wallet::create(
@@ -353,6 +366,11 @@ impl Swaps {
                     Some((node, terms)) => provider.take_donations(node, terms, DONATIONS).unwrap(),
                     None => provider,
                 };
+                let receives = receiving.is_some();
+                let provider = match receiving {
+                    Some((node, terms)) => provider.take_receives(node, terms).unwrap(),
+                    None => provider,
+                };
                 let provider = Arc::new(provider);
                 let nostr = licash_nostr::public_key(&provider.nostr_secret().unwrap()).unwrap();
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -362,6 +380,9 @@ impl Swaps {
                 let stepping = tokio::spawn(licash_swaps_service::step(provider.clone(), every));
                 let paying = paying.then(|| {
                     tokio::spawn(licash_swaps_service::pay_invoices(provider.clone(), every))
+                });
+                let receiving = receives.then(|| {
+                    tokio::spawn(licash_swaps_service::take_receives(provider.clone(), every))
                 });
                 let announcing = tokio::spawn(licash_swaps_service::announce(
                     provider.clone(),
@@ -395,8 +416,8 @@ impl Swaps {
                     .unwrap();
                 stepping.abort();
                 announcing.abort();
-                if let Some(paying) = paying {
-                    paying.abort();
+                for task in [paying, receiving].into_iter().flatten() {
+                    task.abort();
                 }
             });
         });
@@ -869,6 +890,74 @@ fn a_phone_pays_an_invoice_through_a_provider_when_no_hub_pays_it() {
     // Paid through the provider: not again through it, nor anyone else.
     let again = phone.pay_invoice_via(request, quote.hub, provider.url, provider.fee);
     assert_eq!(again.unwrap().id, paid.id);
+}
+
+#[test]
+fn a_phone_is_paid_over_lightning_through_a_provider_when_no_hub_takes_it() {
+    let hubs = Hubs::start();
+    let phone = hubs.phone(1_000);
+    // No hub of the phone's has a gateway, nor a provider: none made.
+    assert!(!phone.provider_takes_lightning().unwrap());
+    assert!(phone.ask_invoice_for(500, None).is_err());
+    let node = Arc::new(Fake::new());
+    node.tip(3, [0; 32]);
+    let terms = licash_swaps::ReceiveTerms::default();
+    let swaps = Swaps::start_receiving(&hubs, 0x55, TERMS, (node.clone(), terms));
+    let mut takes = false;
+    for _ in 0..50 {
+        phone.refresh_providers().unwrap();
+        takes = phone.provider_takes_lightning().unwrap();
+        if takes {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(takes);
+    // At the second hub, where it holds 3,000: the payer asked 500, the
+    // provider's 2 and 0.5% in it.
+    let before = held(&hubs, &phone, 1);
+    let invoice = phone.ask_invoice_for(500, Some("Lunch".into())).unwrap();
+    assert_eq!(invoice.hub, hubs.url(1));
+    assert_eq!(
+        (invoice.amount, invoice.asks),
+        (495, Some(500)),
+        "{invoice:?}"
+    );
+    assert_eq!(invoice.state, State::Pending);
+    let hash: [u8; 32] = hex::decode(&invoice.hash).unwrap().try_into().unwrap();
+    let cltv = node.held_cltv(hash).unwrap() as u32;
+    node.pay_held(hash, 3 + cltv);
+    // Locked to the phone once paid, claimed, and settled.
+    let mut followed = None;
+    for _ in 0..50 {
+        let now = phone.follow_invoice(invoice.hash.clone()).unwrap();
+        let done = now.state == State::Done;
+        followed = Some(now);
+        if done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let followed = followed.unwrap();
+    assert_eq!(followed.state, State::Done, "{followed:?}");
+    assert_eq!(held(&hubs, &phone, 1), before + 495);
+    for _ in 0..50 {
+        if node.held(hash).unwrap().0 == licash_lightning::HeldState::Settled {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        node.held(hash),
+        Some((licash_lightning::HeldState::Settled, 500_000))
+    );
+    let history = phone.history().unwrap();
+    let line = history.iter().find(|a| a.id == invoice.hash).unwrap();
+    assert_eq!(
+        (line.kind, line.memo.as_deref()),
+        (Kind::Invoice, Some("Lunch"))
+    );
+    drop(swaps);
 }
 
 /// Bitcoin as no light client tells it: the wallets here have no coins.

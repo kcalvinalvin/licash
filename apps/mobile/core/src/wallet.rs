@@ -753,13 +753,19 @@ impl Wallet {
                 best = Some((fee, url));
             }
         }
-        let (_, url) = best.ok_or_else(|| {
-            LicashError::invalid(match any {
-                true => format!("no hub you trust takes {amount} sat over Lightning"),
-                false => no_invoices(memo.is_some()),
-            })
-        })?;
-        self.invoice_now(self.invoice_at(&url, amount, memo.as_deref()))
+        if let Some((_, url)) = best {
+            return self.invoice_now(self.invoice_at(&url, amount, memo.as_deref()));
+        }
+        // No hub's gateway makes it: a provider's node, then.
+        if !any {
+            if let Some(asked) = self.provider_invoice(amount, false, memo.as_deref())? {
+                return self.invoice_now(asked);
+            }
+        }
+        Err(LicashError::invalid(match any {
+            true => format!("no hub you trust takes {amount} sat over Lightning"),
+            false => no_invoices(memo.is_some()),
+        }))
     }
 
     /// [`Wallet::ask_invoice`], for an invoice asking the payer `invoiced`,
@@ -787,15 +793,19 @@ impl Wallet {
                 best = Some((amount, url));
             }
         }
-        let (amount, url) = best.ok_or_else(|| {
-            LicashError::invalid(match any {
-                true => {
-                    format!("no hub you trust takes an invoice of {invoiced} sat over Lightning")
-                }
-                false => no_invoices(memo.is_some()),
-            })
-        })?;
-        self.invoice_now(self.invoice_at(&url, amount, memo.as_deref()))
+        if let Some((amount, url)) = best {
+            return self.invoice_now(self.invoice_at(&url, amount, memo.as_deref()));
+        }
+        // No hub's gateway makes it: a provider's node, then.
+        if !any {
+            if let Some(asked) = self.provider_invoice(invoiced, true, memo.as_deref())? {
+                return self.invoice_now(asked);
+            }
+        }
+        Err(LicashError::invalid(match any {
+            true => format!("no hub you trust takes an invoice of {invoiced} sat over Lightning"),
+            false => no_invoices(memo.is_some()),
+        }))
     }
 
     /// Take on the invoice of `hash`, as [`Wallet::ask_invoice`] asked for

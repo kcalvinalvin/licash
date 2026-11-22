@@ -19,7 +19,8 @@ use futures_util::{
 use licash_api::{Info, Payment};
 use licash_wallet::{
     DonationAddress, Error, HubId, LicashCode, Paid, PaymentCode, PaymentNote, PayoutQuote,
-    PayoutState, Received, SwapLimits, SwapQuote, SwapState, Transport, ViaQuote, Wallet,
+    PayoutState, ReceiveOffer, Received, SwapLimits, SwapQuote, SwapState, Transport, ViaQuote,
+    Wallet,
 };
 
 use crate::{mailbox, watch::Watch, Found, Role, Route, LIFETIME};
@@ -1259,6 +1260,49 @@ pub async fn invoice_providers_with<T: Transport>(
         .collect();
     // Stable: the newest announced first among equals.
     providers.sort_by_key(|p| p.quote.costs());
+    Ok(providers)
+}
+
+/// A swap provider announced on Nostr that has the wallet paid over
+/// Lightning at a hub of its ([`Wallet::invoice_through`]).
+#[derive(Clone, Debug)]
+pub struct ReceiveProvider {
+    /// The URL that answered as the provider: the first announced that
+    /// does, or where it last answered ([`Announcements`]).
+    pub url: String,
+    /// The key that announced it, x-only in hex.
+    pub key: String,
+    pub name: Option<String>,
+    pub offer: ReceiveOffer,
+}
+
+/// The swap providers announced on `relays` for `wallet`'s network, as
+/// `announced` keeps them, asked through `route`, that have the wallet paid
+/// over Lightning at hub `at` now ([`Wallet::receive_offer`]), the newest
+/// announced first.
+pub async fn receive_providers_with<T: Transport>(
+    wallet: &Wallet<T>,
+    announced: &Announcements,
+    (relays, route): (&[String], &Route),
+    at: &str,
+) -> anyhow::Result<Vec<ReceiveProvider>> {
+    let network = wallet.network().name();
+    // Asked while the wallet waits for an invoice: a provider not
+    // answering lately is passed over.
+    let ask = |url: String| async move {
+        licash_wallet::in_background(wallet.receive_offer(&url, at)).await
+    };
+    let on = (relays, route, network);
+    let none = HashSet::new();
+    let answering = announced.answering(on, &none, ask, |o: &ReceiveOffer| o.info.nostr.as_deref());
+    let providers = (answering.await?.into_iter())
+        .map(|(service, url, offer)| ReceiveProvider {
+            url,
+            key: service.key,
+            name: service.announcement.name,
+            offer,
+        })
+        .collect();
     Ok(providers)
 }
 

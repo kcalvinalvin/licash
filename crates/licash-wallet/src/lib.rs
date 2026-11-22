@@ -95,7 +95,9 @@ pub use deposits::{
 pub use inquiry::Checked;
 pub use journal::{CoinSpan, Journal, NoteSpan};
 pub use lane::{current_lane, in_background, in_background_now, in_lane, Background, Lane};
-pub use lightning::{refund_blocks, Invoice, InvoiceState, Payable, ViaQuote, ROUTE_BLOCKS};
+pub use lightning::{
+    refund_blocks, Invoice, InvoiceState, Payable, ReceiveOffer, ViaQuote, ROUTE_BLOCKS,
+};
 pub use locks::{Incoming, Lock, LockState, Via, CLAIM_MARGIN, PROTECTED_MARGIN};
 pub use payment_note::{note_text, PaymentNote, MAX_NOTE};
 pub use payouts::{
