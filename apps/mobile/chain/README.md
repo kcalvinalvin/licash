@@ -10,8 +10,10 @@ for `bitcoin`, `signet`, `mutinynet` and `regtest`.
   lets peers relay transactions (`Config.MempoolEnabled`); another
   validates a headers import without asking the store for, or reading
   again, headers it cannot have or has just read (the same checks, about
-  a third faster); the third tells how many headers an import has stored
-  (`HeadersImportConfig.Progress`), most of its time on a phone.
+  a third faster); a third tells how far an import has stored its headers
+  (`HeadersImportConfig.Progress`), most of its time on a phone; the
+  fourth lets an import resume into stores whose block headers are ahead
+  of their filter headers, as one killed mid-batch leaves them.
 - `node/`: the light client. Given a [block-dn](https://github.com/guggero/block-dn)
   server, filters come from it by the file, each checked against filter
   headers fetched independently from peers before any of the file is
@@ -28,8 +30,12 @@ for `bitcoin`, `signet`, `mutinynet` and `regtest`.
   Bitcoin Core, or from peers with the pinned hash checked against an
   Esplora server) and pins nothing unless the CDN's are the same bytes, so
   the CDN is only a transport. A store holding headers, as on any upgrade,
-  never imports; files other than the pinned, none served, or three starts
-  in a row downloading nothing mark the pin tried on that store; peers
+  never imports, unless the import's state marks it as being filled from
+  files downloaded and checked (written before storing starts): a start
+  killed while storing, minutes on a phone, leaves the next to check the
+  files again and store the rest, three starts in a row at most. Files
+  other than the pinned, none served, three starts in a row downloading
+  nothing, or three resuming, mark the pin tried on that store; peers
   serve whatever the import does not. No pin, no request for header
   files. Bitcoin, signet and mutinynet are pinned (blocks 975000,
   330000 and 3605000).

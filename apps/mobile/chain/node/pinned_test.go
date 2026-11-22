@@ -22,6 +22,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/lightninglabs/neutrino"
 )
 
 // pinnedServer serves files of headers of a made-up chain of height
@@ -420,6 +421,157 @@ func TestAStoreHoldingHeadersNeverAsks(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "import-40.tried")); !os.IsNotExist(err) {
 		t.Fatalf("marked tried: %v", err)
+	}
+}
+
+// downloadedThenStoring is a store in dir whose start downloaded p's
+// files, then was killed while storing them: some headers in, the block
+// file's last cut short.
+func downloadedThenStoring(t *testing.T, p *pinnedServer, server string) (dir string, imp *neutrino.HeadersImportConfig) {
+	t.Helper()
+	dir = t.TempDir()
+	imp = pinnedImport(context.Background(), dir, server, wire.TestNet, &p.pin, nil, nil, quiet())
+	if imp == nil {
+		t.Fatal("nothing to import")
+	}
+	if state, ok := readState(filepath.Join(dir, "import"), &p.pin); !ok || !state.Storing || state.Idle != 0 {
+		t.Fatalf("not marked storing: %+v", state)
+	}
+	p.taken()
+	_ = os.WriteFile(filepath.Join(dir, "block_headers.bin"), make([]byte, 80*7+16), 0o600)
+	_ = os.WriteFile(filepath.Join(dir, "reg_filter_headers.bin"), make([]byte, 32*3), 0o600)
+	return dir, imp
+}
+
+// A start killed while storing the pinned headers leaves the next to
+// store them again, from the files kept, as many starts in a row as
+// allowed: peers sync once that many failed.
+func TestAStartKilledWhileStoringResumes(t *testing.T) {
+	smallFiles(t)
+	p, server := newPinnedServer(t, 40)
+	dir, imp := downloadedThenStoring(t, p, server.URL)
+	for start := 1; start <= importStarts; start++ {
+		if !importDue(dir, server.URL, &p.pin) {
+			t.Fatalf("start %d: not due", start)
+		}
+		var told [2]int64
+		again := pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil,
+			func(done, total int64) { told = [2]int64{done, total} }, quiet())
+		if again == nil || !reflect.DeepEqual(again, imp) {
+			t.Fatalf("start %d: not resumed: %v", start, again)
+		}
+		if all := p.pin.Bytes(); told != [2]int64{all, all} {
+			t.Fatalf("start %d: told %v", start, told)
+		}
+		if info, _ := os.Stat(filepath.Join(dir, "block_headers.bin")); info.Size() != 80*7 {
+			t.Fatalf("start %d: a header cut short kept: %d bytes", start, info.Size())
+		}
+	}
+	if asked := p.taken(); len(asked) != 0 {
+		t.Fatalf("asked again %v", asked)
+	}
+	if importDue(dir, server.URL, &p.pin) {
+		t.Fatal("due once resumed as many times as allowed")
+	}
+	if pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
+		t.Fatal("resumed once more")
+	}
+	if _, err := os.Stat(triedMark(dir, &p.pin)); err != nil {
+		t.Fatalf("not marked tried: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "import")); !os.IsNotExist(err) {
+		t.Fatalf("files kept: %v", err)
+	}
+}
+
+// A start killed before storing any header, its store still empty, as
+// neutrino checks the files whole first: the next imports them again,
+// nothing downloaded, as many starts in a row as allowed, then peers.
+func TestAStartKilledBeforeStoringAnyIsNotTriedForever(t *testing.T) {
+	smallFiles(t)
+	p, server := newPinnedServer(t, 40)
+	dir := t.TempDir()
+	if pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) == nil {
+		t.Fatal("nothing to import")
+	}
+	p.taken()
+	for start := 1; start <= importStarts; start++ {
+		if pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) == nil {
+			t.Fatalf("start %d: not imported", start)
+		}
+	}
+	if pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
+		t.Fatal("imported once more")
+	}
+	if _, err := os.Stat(triedMark(dir, &p.pin)); err != nil {
+		t.Fatalf("not marked tried: %v", err)
+	}
+	if asked := p.taken(); len(asked) != 0 {
+		t.Fatalf("asked again %v", asked)
+	}
+}
+
+// Only a store marked as being stored in, its files still the pinned and
+// never tried, resumes: anything else is a store peers fill, the files
+// left deleted.
+func TestOnlyAStoreMarkedAsStoringResumes(t *testing.T) {
+	smallFiles(t)
+	cases := map[string]func(dir string, p *pinnedServer){
+		// As an older release leaves it, killed while storing.
+		"unmarked": func(dir string, p *pinnedServer) {
+			files := filepath.Join(dir, "import")
+			state, _ := readState(files, &p.pin)
+			state.Storing = false
+			_ = writeState(files, state)
+		},
+		"a byte of a file changed": func(dir string, _ *pinnedServer) {
+			path := filepath.Join(dir, "import", "filter_headers.bin")
+			data, _ := os.ReadFile(path)
+			data[100] ^= 1
+			_ = os.WriteFile(path, data, 0o600)
+		},
+		"a file gone": func(dir string, _ *pinnedServer) {
+			_ = os.Remove(filepath.Join(dir, "import", "block_headers.bin"))
+		},
+		"of another pin": func(dir string, p *pinnedServer) {
+			p.pin.Height++
+		},
+		"tried": func(dir string, p *pinnedServer) {
+			_ = os.WriteFile(triedMark(dir, &p.pin), nil, 0o600)
+		},
+	}
+	for name, change := range cases {
+		t.Run(name, func(t *testing.T) {
+			p, server := newPinnedServer(t, 40)
+			dir, _ := downloadedThenStoring(t, p, server.URL)
+			change(dir, p)
+			if pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
+				t.Fatal("resumed")
+			}
+			if asked := p.taken(); len(asked) != 0 {
+				t.Fatalf("asked %v", asked)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "import")); !os.IsNotExist(err) {
+				t.Fatalf("files kept: %v", err)
+			}
+			if info, _ := os.Stat(filepath.Join(dir, "block_headers.bin")); info.Size() != 80*7+16 {
+				t.Fatalf("the store touched: %d bytes", info.Size())
+			}
+		})
+	}
+}
+
+// With no pin or no CDN, peers fill the store: files an import left are
+// deleted, never resumed into what peers wrote.
+func TestNoPinOrNoServerDeletesAnImportLeft(t *testing.T) {
+	smallFiles(t)
+	p, server := newPinnedServer(t, 40)
+	dir, _ := downloadedThenStoring(t, p, server.URL)
+	if pinnedImport(context.Background(), dir, "", wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
+		t.Fatal("imported with no server")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "import")); !os.IsNotExist(err) {
+		t.Fatalf("files kept: %v", err)
 	}
 }
 

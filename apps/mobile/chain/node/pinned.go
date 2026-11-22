@@ -9,11 +9,19 @@ package node
 // peers: the server is only a transport then. Anything else syncs from
 // peers, as without a pin:
 //
-//	no pin, or no CDN           never asked for
+//	no pin, or no CDN           never asked for, files of an import deleted
 //	store holding headers       never asked for: nothing touched
+//	  marked storing, files     the import resumed, its files checked again
+//	  marked storing, 3 starts  marked tried: peers
 //	store empty, marked tried   not again: peers
 //	store empty, 3 idle starts  marked tried: peers
-//	store empty                 downloaded, checked, imported
+//	store empty                 downloaded, checked, marked storing, imported
+//
+// Storing the headers takes minutes on a phone: a start killed meanwhile
+// leaves a store holding some, which only the mark in the import's state,
+// written before storing starts, tells from one peers filled. With it,
+// the next start imports the same files again, neutrino going on from
+// where the store is; without it, as from an older release, peers sync.
 //
 // Several of the server's files download at once, each on circuits of
 // its own through a proxy, each kept once whole: a start killed or given
@@ -117,11 +125,17 @@ var (
 func pinnedImport(ctx context.Context, dir, server string, magic wire.BitcoinNet, pin *Pin,
 	proxy *Proxy, progress func(done, total int64), log *slog.Logger) *neutrino.HeadersImportConfig {
 
+	files := filepath.Join(dir, "import")
 	if pin == nil || server == "" {
+		// Peers fill the store from here on: an import left in it is
+		// never resumed into what they wrote.
+		_ = os.RemoveAll(files)
 		return nil
 	}
-	files := filepath.Join(dir, "import")
 	if !emptyStore(dir) {
+		if imp := resumed(dir, files, pin, progress, log); imp != nil {
+			return imp
+		}
 		_ = os.RemoveAll(files)
 		return nil
 	}
@@ -165,6 +179,14 @@ func pinnedImport(ctx context.Context, dir, server string, magic wire.BitcoinNet
 	case err == nil:
 		log.Info("phase: pinned headers downloaded and checked", "height", pin.Height,
 			"took", time.Since(began).Round(time.Millisecond))
+		// Marked before storing starts: a start killed meanwhile resumes.
+		// Unmarked, should this fail, peers sync the rest instead. Idle
+		// is not reset: a start killed before storing any header, its
+		// store still empty, counts as downloading none.
+		state.Storing = true
+		if err := writeState(files, state); err != nil {
+			log.Warn("pinned headers stored unmarked: not resumed if interrupted", "err", err)
+		}
 		return imp
 	case errors.Is(err, errDigest) || errors.Is(err, errNotServed):
 		_ = os.WriteFile(tried, nil, 0o600)
@@ -191,10 +213,11 @@ func pinnedImport(ctx context.Context, dir, server string, magic wire.BitcoinNet
 	return nil
 }
 
-// ImportDue is whether Start would download cfg.Pin's files before
-// starting: a pin and a CDN given, and a store holding nothing, never
-// tried, nor idle as many starts as allowed. A store refused for legacy
-// files is not due.
+// ImportDue is whether Start would download cfg.Pin's files, or store
+// them, before starting: a pin and a CDN given, never tried, and a store
+// holding nothing, not idle as many starts as allowed, or one an
+// interrupted start was storing them in, as resumed. A store refused for
+// legacy files is not due.
 func ImportDue(cfg Config) bool {
 	if _, err := os.Stat(filepath.Join(cfg.DataDir, "block_headers.bin")); err == nil {
 		return false
@@ -203,14 +226,120 @@ func ImportDue(cfg Config) bool {
 }
 
 func importDue(dir, server string, pin *Pin) bool {
-	if pin == nil || server == "" || !emptyStore(dir) {
+	if pin == nil || server == "" {
 		return false
 	}
 	if _, err := os.Stat(triedMark(dir, pin)); !errors.Is(err, os.ErrNotExist) {
 		return false
 	}
 	state, ok := readState(filepath.Join(dir, "import"), pin)
+	if !emptyStore(dir) {
+		return resumable(state, ok)
+	}
 	return !ok || state.Idle < importStarts
+}
+
+// resumable is whether an import of state, read if ok, is resumed into a
+// store holding headers: one marked as storing them, not resumed as many
+// starts in a row as allowed. Its tried mark is checked apart.
+func resumable(state importState, ok bool) bool {
+	return ok && state.Storing && state.Idle < importStarts
+}
+
+// resumed is the import of pin's files, in files, into the store in dir
+// holding headers, if resumable: its files checked against pin again, the
+// store's flat files cut to whole headers. Nothing if the store is filled
+// by peers instead, pin marked tried once resumed as many starts in a row
+// as allowed. progress, if set, is told all of the files downloaded.
+func resumed(dir, files string, pin *Pin, progress func(done, total int64), log *slog.Logger) *neutrino.HeadersImportConfig {
+	state, ok := readState(files, pin)
+	if !ok || !state.Storing {
+		return nil
+	}
+	tried := triedMark(dir, pin)
+	if _, err := os.Stat(tried); !errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if !resumable(state, ok) {
+		_ = os.WriteFile(tried, nil, 0o600)
+		log.Warn("pinned headers not stored, syncing them from peers", "starts", state.Idle)
+		return nil
+	}
+	// Counted before storing: a start killed mid-way counts too.
+	state.Idle++
+	if err := writeState(files, state); err != nil {
+		log.Warn("pinned headers not resumed, syncing them from peers", "err", err)
+		return nil
+	}
+	began := time.Now()
+	imp := importOf(files)
+	for _, f := range []struct {
+		path   string
+		size   int64
+		digest [32]byte
+	}{
+		{imp.BlockHeadersSource, pin.size(80), pin.Headers},
+		{imp.FilterHeadersSource, pin.size(32), pin.FilterHeaders},
+	} {
+		if !whole(f.path, f.size) || digestOf(f.path) != f.digest {
+			log.Warn("pinned headers changed since downloaded, syncing them from peers", "file", filepath.Base(f.path))
+			return nil
+		}
+	}
+	// Written by the import only, so a header there cut short by the kill
+	// is the import's: dropped, neutrino dropping whole ones past its index
+	// as it opens the store.
+	for name, entry := range map[string]int64{"block_headers.bin": 80, "reg_filter_headers.bin": 32} {
+		if err := wholeEntries(filepath.Join(dir, name), entry); err != nil {
+			log.Warn("pinned headers not resumed, syncing them from peers", "err", err)
+			return nil
+		}
+	}
+	if progress != nil {
+		progress(pin.Bytes(), pin.Bytes())
+	}
+	log.Info("phase: pinned headers checked again, resuming storing them", "height", pin.Height,
+		"start", state.Idle, "took", time.Since(began).Round(time.Millisecond))
+	return imp
+}
+
+// digestOf is the SHA-256 of the file at path: zero if unreadable.
+func digestOf(path string) [32]byte {
+	f, err := os.Open(path)
+	if err != nil {
+		return [32]byte{}
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return [32]byte{}
+	}
+	return [32]byte(h.Sum(nil))
+}
+
+// wholeEntries cuts the file at path, if any, to whole entries of size
+// bytes, synced.
+func wholeEntries(path string, size int64) error {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || info.Size()%size == 0 {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	return errors.Join(f.Truncate(info.Size()-info.Size()%size), f.Sync(), f.Close())
+}
+
+// importOf is the import of the files in files.
+func importOf(files string) *neutrino.HeadersImportConfig {
+	return &neutrino.HeadersImportConfig{
+		BlockHeadersSource:  filepath.Join(files, "block_headers.bin"),
+		FilterHeadersSource: filepath.Join(files, "filter_headers.bin"),
+	}
 }
 
 // triedMark is the file marking pin's import tried in the store in dir:
@@ -242,8 +371,12 @@ type importState struct {
 	Entries       uint32 `json:"entries"`
 	Headers       string `json:"headers"`
 	FilterHeaders string `json:"filter_headers"`
-	// Idle is how many starts in a row downloaded no file.
+	// Idle is how many starts in a row downloaded no file, or, once
+	// Storing, resumed storing them.
 	Idle int `json:"idle"`
+	// Storing marks the files downloaded and checked, being stored: an
+	// interrupted start resumes, none other does.
+	Storing bool `json:"storing,omitempty"`
 }
 
 func stateOf(pin *Pin) importState {
@@ -258,12 +391,12 @@ func readState(files string, pin *Pin) (importState, bool) {
 	if err != nil || json.Unmarshal(data, &state) != nil {
 		return importState{}, false
 	}
-	idle := state.Idle
-	state.Idle = 0
+	idle, storing := state.Idle, state.Storing
+	state.Idle, state.Storing = 0, false
 	if state != stateOf(pin) || idle < 0 {
 		return importState{}, false
 	}
-	state.Idle = idle
+	state.Idle, state.Storing = idle, storing
 	return state, true
 }
 
@@ -290,10 +423,7 @@ func writeState(files string, state importState) error {
 func downloadPinned(ctx context.Context, files, server string, magic wire.BitcoinNet, pin *Pin,
 	proxy *Proxy, progress func(done, total int64), kept func()) (*neutrino.HeadersImportConfig, error) {
 
-	imp := &neutrino.HeadersImportConfig{
-		BlockHeadersSource:  filepath.Join(files, "block_headers.bin"),
-		FilterHeadersSource: filepath.Join(files, "filter_headers.bin"),
-	}
+	imp := importOf(files)
 	kinds := []struct {
 		final, path, name string
 		entry             int64

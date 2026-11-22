@@ -3,9 +3,10 @@ Tell the progress of appending imported headers
 Appending a headers import to the target stores takes most of an import:
 on a phone, about 17 minutes of 20 for Mutinynet's 3.6 million headers,
 with nothing told until it ends. ImportOptions.Progress, if set, is now
-told how many of the headers to append are appended, as appending starts
-and after each batch, and so is HeadersImportConfig.Progress. Nothing
-else changes.
+told the height up to which headers are appended, of the height to
+reach, as each region starts and after each batch: rising from one
+region to the next, an import resumed into stores at different heights
+included. So is HeadersImportConfig.Progress. Nothing else changes.
 
 Applies to github.com/lightninglabs/neutrino v0.18.0.
 
@@ -17,7 +18,7 @@ Applies to github.com/lightninglabs/neutrino v0.18.0.
  
 +	progress := h.options.Progress
 +	if progress != nil {
-+		progress(0, totalHeaders)
++		progress(startHeight-1, endHeight)
 +	}
 +
  	batchStart := startHeight
@@ -28,7 +29,7 @@ Applies to github.com/lightninglabs/neutrino v0.18.0.
  			return err
  		}
 +		if progress != nil {
-+			progress(batchEnd-startHeight+1, totalHeaders)
++			progress(batchEnd, endHeight)
 +		}
  
  		// Move to next batch.
@@ -38,9 +39,9 @@ Applies to github.com/lightninglabs/neutrino v0.18.0.
  	// validation. It defaults to BFNone.
  	ValidationFlags blockchain.BehaviorFlags
 +
-+	// Progress, if set, is told how many of the headers to append to the
-+	// target stores are appended, as they start and after each batch.
-+	Progress func(appended, total uint32)
++	// Progress, if set, is told the height up to which headers are appended
++	// of the height to reach, as each region starts and after each batch.
++	Progress func(height, end uint32)
  }
  
  // validate checks that all required fields in import options are properly set
@@ -99,9 +100,9 @@ Applies to github.com/lightninglabs/neutrino v0.18.0.
  	// validation. It defaults to BFNone.
  	ValidationFlags blockchain.BehaviorFlags
 +
-+	// Progress, if set, is told how many of the headers to append to the
-+	// stores are appended, as they start and after each batch.
-+	Progress func(appended, total uint32)
++	// Progress, if set, is told the height up to which headers are appended
++	// of the height to reach, as each region starts and after each batch.
++	Progress func(height, end uint32)
  }
  
  // peerSubscription holds a peer subscription which we'll notify about any

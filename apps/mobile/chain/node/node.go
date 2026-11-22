@@ -115,9 +115,9 @@ func StartContext(ctx context.Context, cfg Config) (*Node, error) {
 	cfg.DataDir = dir
 	imp := pinnedImport(ctx, dir, cfg.CDN, cfg.Params.Net, cfg.Pin, cfg.Proxy, cfg.Progress, log)
 	if imp != nil && cfg.Stored != nil {
-		imp.Progress = func(appended, total uint32) {
-			cfg.Stored(int64(appended), int64(total))
-		}
+		// The height stored up to: the headers stored above genesis.
+		all := int64(cfg.Pin.Height)
+		imp.Progress = func(height, _ uint32) { cfg.Stored(int64(height), all) }
 	}
 	if err := ctx.Err(); err != nil {
 		// Given up on rather than failed: resumed on the next start.

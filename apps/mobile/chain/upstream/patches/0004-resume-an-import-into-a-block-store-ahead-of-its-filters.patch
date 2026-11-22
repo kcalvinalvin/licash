@@ -1,0 +1,242 @@
+Resume an import into a block store ahead of its filter store
+
+An import killed between writing a batch's block headers and its filter
+headers leaves the block store ahead. Importing the same files again
+then fails: past the overlap, which ends at the lower tip, the first
+header to import is checked to connect to the block store's tip instead
+of to the overlap's end ("header chain broken"). It is checked against
+the overlap's end now, the header before it, so the import resumes and
+the filter headers catch up through the divergence region, as upstream
+intends.
+
+Applies to github.com/lightninglabs/neutrino v0.18.0.
+
+--- a/chainimport/headers_import.go
++++ b/chainimport/headers_import.go
+@@ -372,7 +372,7 @@
+ 			// the overlap range properly connects to the existing
+ 			// chain.
+ 			if err := h.validateHeaderConnection(
+-				overlapEnd+1, blockTipHeight, sourceMetadata,
++				overlapEnd+1, overlapEnd, sourceMetadata,
+ 			); err != nil {
+ 				return fmt.Errorf("failed to validate header "+
+ 					"connection: %v", err)
+--- /dev/null
++++ b/chainimport/licash_resume_test.go
+@@ -0,0 +1,215 @@
++package chainimport
++
++// Licash: an import resumed into the stores an interrupted one left
++// (patch 0004), on a chain of simnet headers.
++
++import (
++	"context"
++	"encoding/binary"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/btcsuite/btcd/blockchain"
++	"github.com/btcsuite/btcd/chaincfg/v2"
++	"github.com/btcsuite/btcd/chainhash/v2"
++	"github.com/btcsuite/btcd/wire/v2"
++	"github.com/btcsuite/btcwallet/walletdb"
++	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
++	"github.com/lightninglabs/neutrino/headerfs"
++	"github.com/stretchr/testify/require"
++)
++
++func resumeChain(n int) []*wire.BlockHeader {
++	headers := make([]*wire.BlockHeader, n)
++	g := chaincfg.SimNetParams.GenesisBlock.Header
++	headers[0] = &g
++	base := time.Unix(1700000000, 0)
++	for i := 1; i < n; i++ {
++		hdr := &wire.BlockHeader{Version: 0x20000000, Bits: chaincfg.SimNetParams.PowLimitBits,
++			Timestamp: base.Add(time.Duration(i) * 30 * time.Minute)}
++		hdr.PrevBlock = headers[i-1].BlockHash()
++		for {
++			hash := hdr.BlockHash()
++			if blockchain.HashToBig(&hash).Cmp(chaincfg.SimNetParams.PowLimit) <= 0 {
++				break
++			}
++			hdr.Nonce++
++		}
++		headers[i] = hdr
++	}
++	return headers
++}
++
++type resumeStores struct {
++	dir     string
++	db      walletdb.DB
++	b       headerfs.BlockHeaderStore
++	f       headerfs.FilterHeaderStore
++	headers []*wire.BlockHeader
++	filters []chainhash.Hash
++	bsrc    string
++	fsrc    string
++}
++
++func (s *resumeStores) open(t *testing.T) {
++	var err error
++	s.db, err = walletdb.Create("bdb", filepath.Join(s.dir, "neutrino.db"), true, time.Minute, false)
++	require.NoError(t, err)
++	p := chaincfg.SimNetParams
++	s.b, err = headerfs.NewBlockHeaderStore(s.dir, s.db, &p)
++	require.NoError(t, err)
++	s.f, err = headerfs.NewFilterHeaderStore(s.dir, s.db, headerfs.RegularFilter, &p, nil)
++	require.NoError(t, err)
++}
++
++func (s *resumeStores) close(t *testing.T) { require.NoError(t, s.db.Close()) }
++
++func newResumeStores(t *testing.T, n int) *resumeStores {
++	s := &resumeStores{dir: t.TempDir(), headers: resumeChain(n)}
++	s.open(t)
++	g, err := s.f.FetchHeaderByHeight(0)
++	require.NoError(t, err)
++	s.filters = make([]chainhash.Hash, n)
++	s.filters[0] = *g
++	for i := 1; i < n; i++ {
++		s.filters[i] = chainhash.DoubleHashH([]byte{byte(i), byte(i >> 8)})
++	}
++	meta := func(typ byte) []byte {
++		m := binary.LittleEndian.AppendUint32(nil, uint32(chaincfg.SimNetParams.Net))
++		m = append(m, 0, typ)
++		return binary.LittleEndian.AppendUint32(m, 0)
++	}
++	bb, fb := meta(0), meta(1)
++	for i := 0; i < n; i++ {
++		w := &bytesW{}
++		require.NoError(t, s.headers[i].Serialize(w))
++		bb = append(bb, w.b...)
++		fb = append(fb, s.filters[i][:]...)
++	}
++	s.bsrc = filepath.Join(s.dir, "imp_block.bin")
++	s.fsrc = filepath.Join(s.dir, "imp_filter.bin")
++	require.NoError(t, os.WriteFile(s.bsrc, bb, 0o600))
++	require.NoError(t, os.WriteFile(s.fsrc, fb, 0o600))
++	return s
++}
++
++type bytesW struct{ b []byte }
++
++func (w *bytesW) Write(p []byte) (int, error) {
++	w.b = append(w.b, p...)
++	return len(p), nil
++}
++
++func (s *resumeStores) writeB(t *testing.T, from, to int) {
++	var hs []headerfs.BlockHeader
++	for i := from; i <= to; i++ {
++		hs = append(hs, headerfs.BlockHeader{BlockHeader: s.headers[i], Height: uint32(i)})
++	}
++	require.NoError(t, s.b.WriteHeaders(hs...))
++}
++
++func (s *resumeStores) writeF(t *testing.T, from, to int) {
++	var hs []headerfs.FilterHeader
++	for i := from; i <= to; i++ {
++		hs = append(hs, headerfs.FilterHeader{FilterHash: s.filters[i], Height: uint32(i)})
++	}
++	hs[len(hs)-1].HeaderHash = s.headers[to].BlockHash()
++	require.NoError(t, s.f.WriteHeaders(hs...))
++}
++
++func (s *resumeStores) imp(t *testing.T, batch int) error {
++	imp, err := NewHeadersImport(&ImportOptions{
++		TargetChainParams: chaincfg.SimNetParams, TargetBlockHeaderStore: s.b, TargetFilterHeaderStore: s.f,
++		BlockHeadersSource: s.bsrc, FilterHeadersSource: s.fsrc, WriteBatchSizePerRegion: batch,
++	})
++	require.NoError(t, err)
++	_, err = imp.Import(context.Background())
++	return err
++}
++
++func (s *resumeStores) tips(t *testing.T) (uint32, uint32) {
++	_, bh, err := s.b.ChainTip()
++	require.NoError(t, err)
++	_, fh, err := s.f.ChainTip()
++	require.NoError(t, err)
++	return bh, fh
++}
++
++func (s *resumeStores) whole(t *testing.T) {
++	bh, fh := s.tips(t)
++	require.Equal(t, uint32(len(s.headers)-1), bh)
++	require.Equal(t, uint32(len(s.headers)-1), fh)
++	for i := range s.headers {
++		h, err := s.b.FetchHeaderByHeight(uint32(i))
++		require.NoError(t, err)
++		require.Equal(t, s.headers[i].BlockHash(), h.BlockHash(), "block %d", i)
++		f, err := s.f.FetchHeaderByHeight(uint32(i))
++		require.NoError(t, err)
++		require.Equal(t, s.filters[i], *f, "filter %d", i)
++		hh := s.headers[i].BlockHash()
++		got, err := s.b.HeightFromHash(&hh)
++		require.NoError(t, err)
++		require.Equal(t, uint32(i), got)
++	}
++}
++
++// Killed between batches: both stores at the same height.
++func TestLicashResumeWithStoresAtTheSameHeight(t *testing.T) {
++	s := newResumeStores(t, 40)
++	s.writeB(t, 1, 10)
++	s.writeF(t, 1, 10)
++	s.close(t)
++	s.open(t)
++	require.NoError(t, s.imp(t, 5))
++	s.whole(t)
++}
++
++// Killed between a batch's block and filter headers: the block store
++// ahead, by one batch or several, connected at the filter store's tip.
++func TestLicashResumeWithTheBlockStoreAhead(t *testing.T) {
++	for _, c := range []struct{ blocks, filters, batch int }{
++		{10, 5, 5},
++		{38, 35, 5},
++		{39, 35, 5},
++		{10, 4, 3},
++		{30, 4, 5},
++	} {
++		s := newResumeStores(t, 40)
++		s.writeB(t, 1, c.blocks)
++		s.writeF(t, 1, c.filters)
++		s.close(t)
++		s.open(t)
++		require.NoError(t, s.imp(t, c.batch), "%+v", c)
++		s.whole(t)
++		s.close(t)
++	}
++}
++
++// Killed after appending to the block file, before its index was
++// committed: the file's whole headers past the index are dropped on open.
++func TestLicashResumeWithTheBlockFileAheadOfItsIndex(t *testing.T) {
++	s := newResumeStores(t, 40)
++	s.writeB(t, 1, 10)
++	s.writeF(t, 1, 10)
++	s.close(t)
++	f, err := os.OpenFile(filepath.Join(s.dir, "block_headers.bin"), os.O_WRONLY|os.O_APPEND, 0)
++	require.NoError(t, err)
++	for i := 11; i <= 15; i++ {
++		require.NoError(t, s.headers[i].Serialize(f))
++	}
++	require.NoError(t, f.Close())
++	s.open(t)
++	require.NoError(t, s.imp(t, 5))
++	s.whole(t)
++}
++
++// Done already: nothing written again.
++func TestLicashResumeWhenDone(t *testing.T) {
++	s := newResumeStores(t, 40)
++	s.writeB(t, 1, 39)
++	s.writeF(t, 1, 39)
++	require.NoError(t, s.imp(t, 5))
++	s.whole(t)
++}
