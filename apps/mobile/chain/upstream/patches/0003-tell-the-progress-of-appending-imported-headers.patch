@@ -1,0 +1,115 @@
+Tell the progress of appending imported headers
+
+Appending a headers import to the target stores takes most of an import:
+on a phone, about 17 minutes of 20 for Mutinynet's 3.6 million headers,
+with nothing told until it ends. ImportOptions.Progress, if set, is now
+told how many of the headers to append are appended, as appending starts
+and after each batch, and so is HeadersImportConfig.Progress. Nothing
+else changes.
+
+Applies to github.com/lightninglabs/neutrino v0.18.0.
+
+--- a/chainimport/headers_import.go
++++ b/chainimport/headers_import.go
+@@ -742,6 +742,11 @@
+ 		uint32(h.options.WriteBatchSizePerRegion),
+ 	)
+ 
++	progress := h.options.Progress
++	if progress != nil {
++		progress(0, totalHeaders)
++	}
++
+ 	batchStart := startHeight
+ 	for {
+ 		if err := ctxCancelled(ctx); err != nil {
+@@ -757,6 +762,9 @@
+ 		if err != nil {
+ 			return err
+ 		}
++		if progress != nil {
++			progress(batchEnd-startHeight+1, totalHeaders)
++		}
+ 
+ 		// Move to next batch.
+ 		batchStart = batchEnd + 1
+@@ -1124,6 +1132,10 @@
+ 	// ValidationFlags specifies the behavior flags used during header
+ 	// validation. It defaults to BFNone.
+ 	ValidationFlags blockchain.BehaviorFlags
++
++	// Progress, if set, is told how many of the headers to append to the
++	// target stores are appended, as they start and after each batch.
++	Progress func(appended, total uint32)
+ }
+ 
+ // validate checks that all required fields in import options are properly set
+--- a/chainimport/headers_import_test.go
++++ b/chainimport/headers_import_test.go
+@@ -122,6 +122,8 @@
+ 		importOptions *ImportOptions
+ 		importResult  *ImportResult
+ 	}
++	// What the import tells of its progress, as it appends.
++	var progressed [][2]uint32
+ 	testCases := []struct {
+ 		name         string
+ 		prep         func() prep
+@@ -223,6 +225,12 @@
+ 					TargetChainParams:       tCP,
+ 					WriteBatchSizePerRegion: 128,
+ 					ValidationFlags:         flags,
++					Progress: func(appended, total uint32) {
++						progressed = append(
++							progressed,
++							[2]uint32{appended, total},
++						)
++					},
+ 				}
+ 
+ 				return prep{
+@@ -231,6 +239,23 @@
+ 				}
+ 			},
+ 			verify: func(v verify) {
++				// Progress is told from none to all
++				// appended, one batch at a time.
++				all := uint32(len(blockHdrs) - 1)
++				require.Equal(
++					v.tc, [2]uint32{0, all}, progressed[0],
++				)
++				require.Equal(
++					v.tc, [2]uint32{all, all},
++					progressed[len(progressed)-1],
++				)
++				for i := 1; i < len(progressed); i++ {
++					require.Greater(
++						v.tc, progressed[i][0],
++						progressed[i-1][0],
++					)
++				}
++
+ 				// Verify the user write batch size is used
+ 				// instead of the default one.
+ 				ops := v.importOptions
+--- a/neutrino.go
++++ b/neutrino.go
+@@ -676,6 +676,10 @@
+ 	// ValidationFlags specifies the behavior flags used during header
+ 	// validation. It defaults to BFNone.
+ 	ValidationFlags blockchain.BehaviorFlags
++
++	// Progress, if set, is told how many of the headers to append to the
++	// stores are appended, as they start and after each batch.
++	Progress func(appended, total uint32)
+ }
+ 
+ // peerSubscription holds a peer subscription which we'll notify about any
+@@ -1691,6 +1695,7 @@
+ 			TargetFilterHeaderStore: s.RegFilterHeaders,
+ 			ValidationFlags:         s.headersImport.ValidationFlags,
+ 			WriteBatchSizePerRegion: s.headersImport.WriteBatchSizePerRegion,
++			Progress:                s.headersImport.Progress,
+ 		}
+ 		importer, err := chainimport.NewHeadersImport(&options)
+ 		if err != nil {

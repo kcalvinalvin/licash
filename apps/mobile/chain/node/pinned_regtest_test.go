@@ -47,6 +47,7 @@ func TestRegtestPinnedHeadersAreImportedThenPeersTakeOver(t *testing.T) {
 	defer server.Close()
 	pin := pinOf(fake, tip-25)
 	var logged bytes.Buffer
+	var stored [2]int64
 	n, err := Start(Config{
 		DataDir:      t.TempDir(),
 		Params:       chaincfg.RegressionNetParams,
@@ -54,6 +55,7 @@ func TestRegtestPinnedHeadersAreImportedThenPeersTakeOver(t *testing.T) {
 		CDN:          server.URL,
 		Pin:          &pin,
 		Log:          slog.New(slog.NewTextHandler(&logged, nil)),
+		Stored:       func(done, total int64) { stored = [2]int64{done, total} },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -63,6 +65,10 @@ func TestRegtestPinnedHeadersAreImportedThenPeersTakeOver(t *testing.T) {
 			t.Errorf("stop: %v", err)
 		}
 	}()
+	// Told as stored, all of them in the end: those above genesis.
+	if all := int64(pin.Height); stored != [2]int64{all, all} {
+		t.Fatalf("stored %v of %d", stored, all)
+	}
 	asked := fake.taken()
 	if !slices.Contains(asked, "/headers/0") || !slices.Contains(asked, "/filter-headers/200") {
 		t.Fatalf("asked %v", asked)

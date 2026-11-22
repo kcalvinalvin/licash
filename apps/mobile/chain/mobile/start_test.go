@@ -45,6 +45,10 @@ func TestAClientDownloadingPinnedHeadersIsHandedOverAtOnce(t *testing.T) {
 	if p := c.Importing(); p < 0 || p > 100 {
 		t.Fatalf("importing %d", p)
 	}
+	// Not storing them before they are downloaded.
+	if p := c.Storing(); p != -1 {
+		t.Fatalf("storing %d", p)
+	}
 	if h, err := c.Height(); h != 0 || err != nil {
 		t.Fatalf("height %d, %v", h, err)
 	}
@@ -83,8 +87,11 @@ func TestAClientWithNothingToDownloadIsStarted(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Stop()
-	if c.Importing() != -1 {
+	if c.Importing() != -1 || c.Storing() != -1 {
 		t.Fatal("importing")
+	}
+	if c.PingMs() != -1 {
+		t.Fatal("pinged a peer never reached")
 	}
 	if _, err := c.Hash(0); err != nil {
 		t.Fatalf("genesis: %v", err)

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -171,7 +172,7 @@ func TestAnEmptyStoreGetsThePinnedFilesChecked(t *testing.T) {
 	// Downloaded and checked, though not imported yet, as a start killed
 	// before importing them leaves them: never asked for again.
 	again := pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet())
-	if again == nil || *again != *imp {
+	if again == nil || !reflect.DeepEqual(again, imp) {
 		t.Fatalf("imported again %v", again)
 	}
 	if asked := p.taken(); len(asked) != 0 {

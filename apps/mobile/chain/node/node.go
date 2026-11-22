@@ -51,6 +51,9 @@ type Config struct {
 	Pin *Pin
 	// Progress, if set, is told the bytes of Pin's files downloaded.
 	Progress func(done, total int64)
+	// Stored, if set, is told the headers of Pin's files stored, of all,
+	// as they are once downloaded and checked: most of an import's time.
+	Stored func(done, total int64)
 	// Proxy, if set, is the SOCKS5 proxy everything is reached through:
 	// the peers, the names resolved and the CDN.
 	Proxy *Proxy
@@ -111,6 +114,11 @@ func StartContext(ctx context.Context, cfg Config) (*Node, error) {
 	}
 	cfg.DataDir = dir
 	imp := pinnedImport(ctx, dir, cfg.CDN, cfg.Params.Net, cfg.Pin, cfg.Proxy, cfg.Progress, log)
+	if imp != nil && cfg.Stored != nil {
+		imp.Progress = func(appended, total uint32) {
+			cfg.Stored(int64(appended), int64(total))
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		// Given up on rather than failed: resumed on the next start.
 		return nil, err
@@ -344,6 +352,21 @@ func (n *Node) PeerHeight() int32 {
 // Synced reports whether the node believes it has caught up with its peers.
 func (n *Node) Synced() bool {
 	return n.cs.IsCurrent()
+}
+
+// PingMs is the shortest last ping, in milliseconds, of the connected
+// peers that answered one: -1 if none did.
+func (n *Node) PingMs() int32 {
+	best := int64(-1)
+	for _, sp := range n.cs.Peers() {
+		if us := sp.LastPingMicros(); us > 0 && (best < 0 || us < best) {
+			best = us
+		}
+	}
+	if best < 0 {
+		return -1
+	}
+	return int32(max(best/1000, 1))
 }
 
 // Peers is the number of connected peers.

@@ -69,6 +69,9 @@ type Chain struct {
 	done   chan struct{}
 	// The bytes of pinned headers downloaded, of all, while downloading.
 	downloaded, total atomic.Int64
+	// The pinned headers stored, of all, once downloaded: none told yet
+	// while toStore is 0.
+	stored, toStore atomic.Int64
 }
 
 // errImporting is what is asked of a client still downloading headers.
@@ -123,6 +126,10 @@ func start(cfg node.Config) (*Chain, error) {
 		c.total.Store(total)
 		c.downloaded.Store(done)
 	}
+	cfg.Stored = func(done, total int64) {
+		c.toStore.Store(total)
+		c.stored.Store(done)
+	}
 	if !node.ImportDue(cfg) {
 		defer close(c.done)
 		n, err := node.Start(cfg)
@@ -143,6 +150,7 @@ func start(cfg node.Config) (*Chain, error) {
 		c.node, c.err = n, err
 		c.mu.Unlock()
 		c.total.Store(0)
+		c.toStore.Store(0)
 	}()
 	return c, nil
 }
@@ -169,6 +177,17 @@ func (c *Chain) Importing() int32 {
 		return -1
 	}
 	return int32(c.downloaded.Load() * 100 / total)
+}
+
+// Storing is how far storing the headers this release pins is, in
+// percent, once they are downloaded and checked, before the client starts:
+// -1 if not storing them, or not yet told how far.
+func (c *Chain) Storing() int32 {
+	total := c.toStore.Load()
+	if total <= 0 || c.Importing() < 0 {
+		return -1
+	}
+	return int32(c.stored.Load() * 100 / total)
 }
 
 // proxyOf is the SOCKS5 proxy of proxy, a URL with a username and
@@ -358,6 +377,15 @@ func (c *Chain) PeerHeight() int32 {
 func (c *Chain) Synced() bool {
 	n, err := c.running()
 	return err == nil && n.Synced()
+}
+
+// PingMs is the shortest last ping of a connected peer, in milliseconds:
+// -1 if none answered one.
+func (c *Chain) PingMs() int32 {
+	if n, err := c.running(); err == nil {
+		return n.PingMs()
+	}
+	return -1
 }
 
 // Peers is the number of peers connected.
