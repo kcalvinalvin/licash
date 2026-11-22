@@ -668,7 +668,11 @@ async fn optimized(phone: &Phone) -> anyhow::Result<()> {
     })
     .await?;
     if offered {
-        phone.tap_id("confirm-optimize").await?;
+        // Its words in sight, not only its tag: the button, cut off at the
+        // bottom, has the center of its bounds on the navigation bar, and
+        // a tap there goes Home. Its words are those of the text in it.
+        let confirm = phone.scroll_to_text("Optimize for").await?;
+        phone.tap_view(&confirm).await?;
         phone
             .wait("Optimized. Its fee is recorded in History.", 60)
             .await?;
