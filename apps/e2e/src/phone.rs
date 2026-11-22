@@ -373,12 +373,24 @@ impl Phone {
 
     /// Scroll down until a view tagged `id` shows: it.
     pub async fn scroll_to_id(&self, id: &str) -> anyhow::Result<View> {
+        self.scroll_to(&format!("view {id:?}"), |v| v.id == id)
+            .await
+    }
+
+    /// Scroll down until a view whose text starts with `start` shows: it.
+    /// A view partly in sight may show no text yet, only its tag.
+    pub async fn scroll_to_text(&self, start: &str) -> anyhow::Result<View> {
+        self.scroll_to(&format!("text {start:?}"), |v| v.text.starts_with(start))
+            .await
+    }
+
+    async fn scroll_to(&self, what: &str, wanted: impl Fn(&View) -> bool) -> anyhow::Result<View> {
         let size = self.shell("wm size").await?;
         let size = size.rsplit(' ').next().context("no screen size")?.trim();
         let (width, height) = size.split_once('x').context("no screen size")?;
         let (x, height): (i32, i32) = (width.parse::<i32>()? / 2, height.parse()?);
         for _ in 0..8 {
-            if let Some(view) = self.views().await?.into_iter().find(|v| v.id == id) {
+            if let Some(view) = self.views().await?.into_iter().find(&wanted) {
                 return Ok(view);
             }
             let (from, to) = (height * 7 / 10, height * 3 / 10);
@@ -386,7 +398,7 @@ impl Phone {
                 .await?;
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        anyhow::bail!("no view {id:?} however far scrolled")
+        anyhow::bail!("no {what} however far scrolled")
     }
 
     pub async fn back(&self) -> anyhow::Result<()> {
