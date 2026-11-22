@@ -20,7 +20,7 @@ for day-to-day spending, as a checking account.
 | Back on Bitcoin without the operator | Yes                  | No              | Yes, if renewed in time | Yes, up to your cap |
 | Channels or inbound liquidity        | Needed               | Not needed      | Not needed              | Not needed          |
 | Receive while offline                | No                   | Yes             | Yes                     | Yes, within a hub   |
-| The operator can link your payments  | Partly               | No              | Yes                     | No                  |
+| The operator can follow your money   | Partly               | No              | Yes                     | No                  |
 
 ## Why
 
