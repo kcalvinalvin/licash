@@ -93,6 +93,14 @@ const (
 	importFailures = 8
 )
 
+// importBatch is how many headers an import stores per commit. Most of
+// storing is committing the header index, keyed by hash so each commit
+// rewrites most of it: fewer commits are faster, each holding more in
+// memory. Storing 1M Mutinynet headers on a Pixel 8a took 38 s 65,536 at a
+// time (neutrino's default), 17 s 262,144 at a time (Go heap 402 and 512
+// MB), and Mutinynet's 3.6M 2.9 times faster on a desktop (heap +270 MB).
+const importBatch = 262_144
+
 // ImportEntries is how many headers each of block-dn's files holds, of
 // block or of filter headers, the first at a multiple of it.
 const ImportEntries = 100_000
@@ -334,11 +342,13 @@ func wholeEntries(path string, size int64) error {
 	return errors.Join(f.Truncate(info.Size()-info.Size()%size), f.Sync(), f.Close())
 }
 
-// importOf is the import of the files in files.
+// importOf is the import of the files in files, importBatch headers
+// stored at a time.
 func importOf(files string) *neutrino.HeadersImportConfig {
 	return &neutrino.HeadersImportConfig{
-		BlockHeadersSource:  filepath.Join(files, "block_headers.bin"),
-		FilterHeadersSource: filepath.Join(files, "filter_headers.bin"),
+		BlockHeadersSource:      filepath.Join(files, "block_headers.bin"),
+		FilterHeadersSource:     filepath.Join(files, "filter_headers.bin"),
+		WriteBatchSizePerRegion: importBatch,
 	}
 }
 
