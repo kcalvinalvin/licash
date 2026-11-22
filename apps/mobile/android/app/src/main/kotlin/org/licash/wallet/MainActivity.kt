@@ -149,18 +149,19 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(Unit) { engine.events.collect { snackbar.showSnackbar(it.text) } }
-    // Asked as a payment goes under way, to tell of it out of sight: Android
-    // asks at most twice, then no more once refused.
+    // Asked once there is a wallet, before its first catching up, to tell of
+    // it and of payments out of sight: Android asks at most twice, then no
+    // more once refused.
     val context = LocalContext.current
     val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         AppLog.info(if (granted) "notifications allowed" else "notifications not allowed")
     }
     val watching = ui.watch != Watch.NONE
-    LaunchedEffect(watching) {
+    LaunchedEffect(ui.wallet, watching) {
         val missing = Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
-        if (watching && missing) ask.launch(Manifest.permission.POST_NOTIFICATIONS)
+        if ((ui.wallet || watching) && missing) ask.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
     LaunchedEffect(ui.wallet) { if (!ui.wallet) screen = Screen.Home }
     LaunchedEffect(link, ui.wallet) {

@@ -662,6 +662,9 @@ async fn restored(phone: &Phone, hub: &str, silent: &str) -> anyhow::Result<()> 
             Ok(word.with_context(|| format!("no word {i}"))?.text.clone())
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    // Copied too, to keep them elsewhere.
+    phone.tap_id("copy-words").await?;
+    phone.wait("Copied", 10).await?;
     phone.tap_id("words-done").await?;
     phone.tap_id("backup-file").await?;
     phone.tap_id("save-backup").await?;

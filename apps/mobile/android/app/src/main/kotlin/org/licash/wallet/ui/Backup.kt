@@ -1,6 +1,8 @@
 package org.licash.wallet.ui
 
+import android.content.ClipData
 import android.net.Uri
+import android.os.PersistableBundle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -23,6 +25,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
@@ -122,6 +126,8 @@ private fun Phrase(engine: Engine, dismiss: () -> Unit) {
     var words by remember { mutableStateOf<List<String>?>(null) }
     var birthday by remember { mutableStateOf<UInt?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
+    var copied by remember { mutableStateOf(false) }
+    val clipboard = LocalClipboard.current
     Sheet("Recovery words", dismiss, secure = true) {
         val shown = words
         if (shown == null) {
@@ -143,9 +149,23 @@ private fun Phrase(engine: Engine, dismiss: () -> Unit) {
                 Say("Write it down with the words: restoring looks for your coins from there, much faster.")
             }
             Spacer(Modifier.height(4.dp))
+            BigButton(
+                if (copied) "Copied" else "Copy words",
+                Modifier.fillMaxWidth().testTag("copy-words"),
+                quiet = true,
+            ) {
+                scope.launch { clipboard.setClipEntry(ClipEntry(secret("Recovery words", shown.joinToString(" ")))) }
+                copied = true
+            }
+            if (copied) Say("Paste them where you keep them safe, then copy something else over them.")
             BigButton("Done", Modifier.fillMaxWidth().testTag("words-done"), onClick = dismiss)
         }
     }
+}
+
+/** `text` to copy, marked sensitive: Android shows no preview of it. */
+private fun secret(label: String, text: String): ClipData = ClipData.newPlainText(label, text).apply {
+    description.extras = PersistableBundle().apply { putBoolean("android.content.extra.IS_SENSITIVE", true) }
 }
 
 /** The words numbered, in two columns read down the first then the second. */
