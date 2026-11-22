@@ -850,13 +850,17 @@ class Engine(context: Context) {
      * Take the payments in the mailbox, each told of at once, their notes
      * unlinked after: whether there were any.
      */
-    /** How long the last look in the mailbox took, its relays asked and what they held taken, in milliseconds. */
+    /**
+     * How long the last look in the mailbox finding nothing took, its relays
+     * asked, in milliseconds: one finding payments also redeems them at the
+     * hub, seconds over Tor that are not the relays'.
+     */
     @Volatile private var collectedMs: Long? = null
 
     private suspend fun collect(): Boolean {
         val got = locked {
             val asked = SystemClock.elapsedRealtime()
-            it.collectNow().also { collectedMs = SystemClock.elapsedRealtime() - asked }
+            it.collectNow().also { got -> if (got.isEmpty()) collectedMs = SystemClock.elapsedRealtime() - asked }
         }
         for (one in got) {
             AppLog.info("received ${one.amount} sat in the mailbox")

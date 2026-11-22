@@ -25,7 +25,7 @@ the connections stand (Tor if on, Bitcoin, each hub as it answered when
 last asked, every 5 minutes, and the mailbox's relays as last looked in,
 kept in memory only); tapped, it says each with how long it took to
 answer (Bitcoin's nodes' shortest ping, a hub's info, a look in the
-mailbox), lists Bitcoin's steps under it while catching up in advanced
+mailbox finding nothing to redeem), lists Bitcoin's steps under it while catching up in advanced
 mode, and offers turning Tor off once Tor keeps the app from Bitcoin for
 3 minutes (not connected, or no node answering through it, not counting
 the minutes importing pinned headers before any node is asked), or says
