@@ -1356,6 +1356,7 @@ impl<T: Transport> Wallet<T> {
     /// saying `note` if any, unless the wallet's file keeps another
     /// version of notes: kept by its hub with it too if the hub says it
     /// does.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_once(
         &self,
         url: &str,
