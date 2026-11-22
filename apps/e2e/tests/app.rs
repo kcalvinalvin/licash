@@ -1118,10 +1118,19 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     // Below what was unfolded: scrolled to.
     let protect = phone.scroll_to_id("protect").await?;
     phone.tagged("worth", MOCK, 10).await?;
+    // The button's words are those of the text in it: the button itself,
+    // tagged, has none for uiautomator.
+    let words = until("the words of the protect button", 10, || async {
+        let views = phone.views().await?;
+        Ok(views
+            .into_iter()
+            .find(|v| v.text.starts_with("Protect for")))
+    })
+    .await?;
     ensure!(
-        amount(&protect.text) == paid,
+        amount(&words.text) == paid,
         "{:?} for a cost of {paid}",
-        protect.text
+        words.text
     );
     phone.tap_view(&protect).await?;
     // Being set up: said at once, then the step it is at.
