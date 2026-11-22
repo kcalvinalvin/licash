@@ -102,8 +102,11 @@ The coin's claim script checks that the preimage is 32 bytes
 (`OP_SIZE 32 OP_EQUALVERIFY`), as every lock's preimage is. Without that
 check a client, who chose the hash, could claim the coin with a longer
 preimage of it that no lock takes, keeping both the coin and its notes.
-Wallets and providers from before the check do not pay out with those
-after it: upgrade both, a provider with no payouts open.
+A wallet from before the check does not claim the coin of a provider after
+it. A wallet after it claims the unsized coin of a provider before it, as
+the coin on chain pays, and a provider upgraded with payouts open reads
+the claims of the coins it made unsized, or takes them back, by the script
+it recorded each paying.
 
 A client who never claims its coin costs the provider the fees of that coin
 and of its refund, and holds the coin until it times out, while its own
