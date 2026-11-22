@@ -46,7 +46,10 @@ the observatory's address. One probe makes three timings on one connection:
 
 Onion URLs are reached the same way. `--direct` reaches services without
 Tor, for regtest or a VPN of one's own: onion URLs are then skipped, and
-services see the observatory's address.
+services see the observatory's address. Anyone may announce a URL, so
+outside regtest a direct probe connects only to public addresses, as the
+host resolves: none on the observatory's own machine or network, unless
+given with `--hub` or `--provider`.
 
 ## What the page shows
 

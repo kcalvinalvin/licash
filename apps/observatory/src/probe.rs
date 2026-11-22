@@ -37,12 +37,22 @@ const MAX_BODY: usize = 1 << 20;
 pub enum Dialer {
     /// Through Tor, a new circuit for each probe.
     Tor(Tor),
-    /// Directly: for regtest and tests. Onion services are skipped.
-    Direct(TlsConnector),
+    /// Directly: for regtest and tests, or a VPN of one's own. Onion
+    /// services are skipped, and unless `local`, so is any host resolving
+    /// to no public address: a URL anyone may announce reaches nothing on
+    /// the observatory's own machine or network.
+    Direct { tls: TlsConnector, local: bool },
 }
 
 impl Dialer {
+    /// [`Dialer::Direct`] to public addresses only.
     pub fn direct() -> Self {
+        Self::direct_reaching(false)
+    }
+
+    /// [`Dialer::Direct`], to local and private addresses too if `local`:
+    /// for regtest, whose services run there.
+    pub fn direct_reaching(local: bool) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let roots = rustls::RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
@@ -50,7 +60,20 @@ impl Dialer {
         let tls = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        Self::Direct(TlsConnector::from(Arc::new(tls)))
+        let tls = TlsConnector::from(Arc::new(tls));
+        Self::Direct { tls, local }
+    }
+
+    /// This dialer, reaching local and private addresses too if direct:
+    /// for a URL its operator gave, not one anyone may announce.
+    pub fn trusting(&self) -> Self {
+        match self {
+            Self::Tor(tor) => Self::Tor(tor.clone()),
+            Self::Direct { tls, .. } => Self::Direct {
+                tls: tls.clone(),
+                local: true,
+            },
+        }
     }
 
     /// Whether it reaches `url`: onion services only over Tor.
@@ -62,12 +85,24 @@ impl Dialer {
         match self {
             // Apart: on circuits of its own, none kept from another probe.
             Self::Tor(tor) => tor.apart().connect(url).await,
-            Self::Direct(tls) => {
+            Self::Direct { tls, local } => {
                 let uri: Uri = url.parse().map_err(|e| format!("not a URL: {e}"))?;
-                let host = uri.host().ok_or("no host")?.to_owned();
+                let host = uri.host().ok_or("no host")?;
+                let host = host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_owned();
                 let https = uri.scheme_str() == Some("https");
                 let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
-                let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+                // Resolved once, and connected to only as vetted.
+                let resolved = tokio::net::lookup_host((host.as_str(), port))
+                    .await
+                    .map_err(|e| format!("{host}: {e}"))?;
+                let vetted: Vec<_> = resolved.filter(|a| *local || public(a.ip())).collect();
+                if vetted.is_empty() {
+                    return Err(format!("{host} has no public address"));
+                }
+                let tcp = tokio::net::TcpStream::connect(&vetted[..])
                     .await
                     .map_err(|e| e.to_string())?;
                 if !https {
@@ -81,6 +116,49 @@ impl Dialer {
                     .map_err(|e| format!("TLS: {e}"))?;
                 Ok(Box::new(tls))
             }
+        }
+    }
+}
+
+/// Whether `ip` is reachable on the internet at large: none of loopback,
+/// private, shared (CGNAT), link-local, unspecified, documentation,
+/// benchmarking, multicast or reserved addresses, nor an IPv6 one mapping
+/// such an IPv4 one.
+pub fn public(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || a == 0
+                || a >= 240
+                || (a == 100 && (64..128).contains(&b))
+                || (a == 198 && (18..20).contains(&b))
+                || (a == 192 && b == 0 && v4.octets()[2] == 0))
+        }
+        IpAddr::V6(v6) => {
+            // Mapped, or translated by NAT64 (64:ff9b::/96): as its IPv4.
+            let [a, b, c, d, e, f, ..] = v6.segments();
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return public(IpAddr::V4(v4));
+            }
+            if (a, b, c, d, e, f) == (0x64, 0xff9b, 0, 0, 0, 0) {
+                let [.., w, x, y, z] = v6.octets();
+                return public(IpAddr::V4([w, x, y, z].into()));
+            }
+            let first = a;
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+                || (first, b) == (0x2001, 0x0db8))
         }
     }
 }
@@ -176,4 +254,72 @@ async fn get(
 
 fn ms(started: Instant) -> u32 {
     u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_addresses_of_the_internet_at_large_are_public() {
+        let public = |ip: &str| public(ip.parse().unwrap());
+        for ip in [
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:4700::1111",
+            "64:ff9b::101:101",
+        ] {
+            assert!(public(ip), "{ip}");
+        }
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "198.18.0.1",
+            "192.0.2.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fc00::1",
+            "fd12::1",
+            "fe80::1",
+            "ff02::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::a00:1",
+        ] {
+            assert!(!public(ip), "{ip}");
+        }
+    }
+
+    /// A URL anyone may announce reaches nothing local over a direct
+    /// dialer, whatever answers there; a local dialer, for regtest, does.
+    #[tokio::test]
+    async fn a_direct_dialer_reaches_no_local_service_unless_local() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        for host in ["127.0.0.1", "localhost", "[::ffff:127.0.0.1]"] {
+            let url = format!("http://{host}:{port}");
+            let refused = Dialer::direct().open(&url).await.err();
+            assert!(
+                refused.is_some_and(|e| e.contains("no public address")),
+                "{url}"
+            );
+        }
+        let url = format!("http://127.0.0.1:{port}");
+        assert!(Dialer::direct_reaching(true).open(&url).await.is_ok());
+        assert!(Dialer::direct().trusting().open(&url).await.is_ok());
+    }
 }

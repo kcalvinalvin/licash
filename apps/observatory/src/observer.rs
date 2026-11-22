@@ -154,7 +154,8 @@ pub async fn round(store: Arc<Store>, watching: Watching) {
 }
 
 /// Probe `url` of `service`: the probe, and the info it answered,
-/// normalized, if it is that of the service that announced the URL.
+/// normalized, if it is that of the service that announced the URL. A
+/// service configured, announced by no key, may be local.
 pub async fn check(
     dialer: &Dialer,
     service: &Service,
@@ -166,7 +167,11 @@ pub async fn check(
         Role::Hub => licash_api::INFO,
         Role::Provider => licash_api::swaps::SWAPS_INFO,
     };
-    let probed = probe::probe(dialer, url, path, timeout).await;
+    let dialer = match service.key {
+        None => dialer.trusting(),
+        Some(_) => dialer.clone(),
+    };
+    let probed = probe::probe(&dialer, url, path, timeout).await;
     let info = probed
         .info
         .and_then(|body| verified(service, &body).map_err(|e| format!("info: {e}")));

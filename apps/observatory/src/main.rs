@@ -256,7 +256,11 @@ async fn serve(data: PathBuf, run: Run) -> anyhow::Result<()> {
         std::fs::create_dir_all(&dir).with_context(|| format!("{}", dir.display()))?;
         let store = Arc::new(Store::open(&dir.join("observatory.sqlite"))?);
         let (route, dialer) = match &tor {
-            None => (Route::Direct, Dialer::direct()),
+            // Regtest's services run on the observatory's own network.
+            None => (
+                Route::Direct,
+                Dialer::direct_reaching(network == Network::Regtest),
+            ),
             Some(tor) => (Route::Tor(tor.clone()), Dialer::Tor(tor.clone())),
         };
         let relays = if run.relays.is_empty() {

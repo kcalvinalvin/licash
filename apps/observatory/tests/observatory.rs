@@ -136,7 +136,7 @@ fn watching() -> Watching {
         network: "regtest".into(),
         relays: Vec::new(),
         route: Route::Direct,
-        dialer: Dialer::direct(),
+        dialer: Dialer::direct_reaching(true),
         hubs: Vec::new(),
         providers: Vec::new(),
         probe_every: Duration::from_millis(20),
@@ -215,8 +215,13 @@ async fn a_url_answering_for_another_key_is_not_the_service() {
         Role::Hub,
         vec![w.hub.clone()],
     );
-    let (probe, info) =
-        observer::check(&Dialer::direct(), &impostor, &w.hub, Duration::from_secs(5)).await;
+    let (probe, info) = observer::check(
+        &Dialer::direct_reaching(true),
+        &impostor,
+        &w.hub,
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(!probe.ok);
     assert!(info.is_none());
     assert_eq!(

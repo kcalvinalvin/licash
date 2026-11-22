@@ -59,7 +59,7 @@ async fn the_observatory_moves_its_balance_between_hubs_and_records_each_move() 
         network: "regtest".into(),
         relays: Vec::new(),
         route: Route::Direct,
-        dialer: Dialer::direct(),
+        dialer: Dialer::direct_reaching(true),
         hubs: vec![hub1.clone(), hub2.clone()],
         providers: vec![eco.swaps().to_owned()],
         probe_every: Duration::from_secs(5),
