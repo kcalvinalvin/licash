@@ -979,10 +979,11 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
 }
 
 /// Protection at its hub, a recovery contract, set up as its user would:
-/// with no coin on Bitcoin to pay its price, told to cash out to itself
-/// first; then, a coin cashed out, of the length it chooses, the smallest
-/// cover that takes the coin whole: its price itemized, the rest of the
-/// coin its own part, issued back as notes. Signed, confirmed and
+/// with no coin on Bitcoin to pay its price, offered a cover for what it
+/// holds there and the coin to cash out to itself first, the price and a
+/// small part of its own, the hub funding the rest; then, that coin cashed
+/// out, of the length it chooses, that cover, taking the coin whole: its
+/// price itemized, the rest of the coin its own part, issued back as notes. Signed, confirmed and
 /// protecting the notes there, on credit no longer, nothing left on
 /// Bitcoin. Ending it, it is told to cash out instead.
 async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
@@ -993,9 +994,8 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     const RESERVE: u64 = 20_000;
     // Its sizes, 2^n - 1 sat: the least.
     const LEAST: u64 = 131_071;
-    // The coin cashed out for it: the price, and a few hundred sat of its
-    // own part.
-    const COIN: u64 = 23_300;
+    // Her own part of the coin she is told to cash out for it.
+    const PART: u64 = 1_000;
     // What a coin spent whole may leave unpaid: less than an output is
     // worth.
     const DUST: u64 = 330;
@@ -1028,36 +1028,47 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     })
     .await?;
 
-    // No coin on Bitcoin pays its price: told to cash out to itself first,
-    // its cover the least of hub1's, nothing to pay or choose.
+    // No coin on Bitcoin pays its price: offered a cover for what it holds
+    // at hub1, half again what is not protected there, a size; its cost
+    // and reserve, and the coin to cash out to itself first: the price and
+    // its own small part, the hub funding the rest. Nothing to pay or
+    // choose yet.
     at_hub(phone, eco.hub(1)).await?;
     phone.tap_id("open-contract").await?;
-    let least = amount(&phone.by_id("quote-cap", 60).await?.text);
-    ensure!(least == LEAST, "a cap of {least} offered with no coin");
-    phone
-        .wait("Paid from Bitcoin you hold, and you hold none yet", 10)
-        .await?;
+    let wanted = amount(&phone.by_id("quote-cap", 60).await?.text);
+    ensure!(
+        (wanted + 1).is_power_of_two() && wanted >= LEAST,
+        "a cover of {wanted} offered with no coin"
+    );
+    let first = amount(&phone.by_id("quote-price", 10).await?.text);
+    ensure!(
+        first == cost(wanted, PART, 1_000),
+        "{first} for {wanted} with {PART} of hers"
+    );
+    phone.tagged("contract-reserve", "20,000 sat", 10).await?;
+    let cash_out = phone.by_id("cash-out-first", 10).await?;
+    let asked = first + RESERVE + PART;
+    let words = phone.scroll_to_text("Cash out ").await?;
+    ensure!(
+        words.text.ends_with(" to yourself") && amount(&words.text) == asked,
+        "{:?} for {asked}",
+        words.text
+    );
     phone.tagged("worth", MOCK, 10).await?;
     for gone in [
         "protect",
-        "quote-price",
         "contract-funded",
         "contract-cap",
-        "contract-funding",
-        "cash-out-first",
+        "contract-problem",
     ] {
         ensure!(!phone.has(gone).await?, "{gone:?} with no coin");
     }
-    phone.back().await?;
-    phone.gone("quote-cap", 10).await?;
 
-    // Cashed out to itself, as anyone does.
-    phone.tap_id("cash-out").await?;
-    phone.tap_id("to-own").await?;
-    phone.tagged("to", "To this wallet", 30).await?;
-    phone.fill_id("amount", &COIN.to_string()).await?;
-    phone.tap_id("continue").await?;
+    // Cashed out to itself from there, that much.
+    phone.tap_view(&cash_out).await?;
     phone.tagged("to", "This wallet", 120).await?;
+    let paying = amount(&phone.by_id("paying", 10).await?.text);
+    ensure!(paying == asked, "{paying} cashed out for {asked}");
     reviewed(phone, 10).await?;
     phone.tap_id("confirm").await?;
     phone.tagged("result", "Sending", 60).await?;
@@ -1071,8 +1082,8 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     .await?;
     let coin = amount(&coin.text);
     ensure!(
-        (COIN..COIN + 1_000).contains(&coin),
-        "a coin of {coin} cashed out for {COIN}"
+        (asked..asked + 1_000).contains(&coin),
+        "a coin of {coin} cashed out for {asked}"
     );
     phone.back_to("onchain").await?;
     let credit = amount(&phone.by_id("credit", 10).await?.text);
@@ -1080,14 +1091,18 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let before = phone.balance().await?;
     eprintln!("a coin of {coin} kept, {before} held, {credit} on credit");
 
-    // Paid from it now: the least cover that takes it whole, its price as
-    // hub1 prices it, all the rest of the coin her part, less than dust
-    // left. Neither the cover nor her part is hers to choose.
+    // Paid from it now: the cover offered for it, its price as hub1
+    // prices it, all the rest of the coin her part, less than dust left.
+    // Smaller covers take it whole too: the cover is hers to choose.
     at_hub(phone, eco.hub(1)).await?;
     phone.tap_id("open-contract").await?;
     let cap = amount(&phone.by_id("quote-cap", 60).await?.text);
-    ensure!(cap == LEAST, "a cap of {cap} offered on {coin}");
-    for gone in ["contract-cap", "contract-funding", "cash-out-first"] {
+    ensure!(
+        cap == wanted,
+        "a cap of {cap} offered on {coin}, cashed out for {wanted}"
+    );
+    phone.by_id("contract-cap", 10).await?;
+    for gone in ["contract-funding", "cash-out-first"] {
         ensure!(!phone.has(gone).await?, "{gone:?} on {coin}");
     }
     // Its reserve apart from its cost, hers, and her part, in sight with
