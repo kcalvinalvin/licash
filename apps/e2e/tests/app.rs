@@ -1057,9 +1057,13 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     for gone in ["contract-cap", "contract-funding", "cash-out-first"] {
         ensure!(!phone.has(gone).await?, "{gone:?} on {coin}");
     }
-    // Its reserve apart from its cost, hers; how long and her part folded.
+    // Its reserve apart from its cost, hers, and her part, in sight with
+    // the coin paying it and what the hub protects then; how long folded.
     phone.tagged("contract-reserve", "20,000 sat", 10).await?;
-    ensure!(!phone.has("contract-funded").await?, "her part unfolded");
+    for shown in ["contract-funded", "contract-paid-with", "contract-after"] {
+        phone.by_id(shown, 10).await?;
+    }
+    ensure!(!phone.has("contract-blocks").await?, "how long unfolded");
     phone.tap_id("contract-more").await?;
     // Its fit over `blocks`, as shown: her part and its cost, the reserve
     // paid beside them.

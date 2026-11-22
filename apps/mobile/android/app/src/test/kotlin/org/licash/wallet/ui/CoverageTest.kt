@@ -78,4 +78,15 @@ class CoverageTest {
         assertFalse(suggestProtecting(cover(4_500uL), fixed, 5_000uL))
         assertTrue(suggestProtecting(cover(5_001uL), fixed, 5_000uL))
     }
+
+    @Test
+    fun a_contract_opening_adds_its_cover_and_her_part() {
+        // Nothing held: her part joins, all of it covered, the rest room.
+        val none = HubCover(0uL, 0uL, 0uL, 0uL)
+        assertEquals(HubCover(2_094_006uL, 2_094_006uL, 4_194_303uL, 0uL), coverAfter(none, 4_194_303uL, 2_094_006uL))
+        assertEquals("All protected, room for 2,100,297 sat more", coverAfter(none, 4_194_303uL, 2_094_006uL).says)
+        // More held than it covers: the rest still not.
+        val held = HubCover(10_000_000uL, 1_000_000uL, 1_048_575uL, 9uL)
+        assertEquals(HubCover(10_500_000uL, 3_097_151uL, 3_145_726uL, 9uL), coverAfter(held, 2_097_151uL, 500_000uL))
+    }
 }

@@ -207,6 +207,7 @@ internal fun HubPage(
                 range,
                 q.coins,
                 !behind(ui),
+                cover,
                 open = { chosen, price ->
                     quote = null
                     engine.openContract(q.hub, price, chosen)

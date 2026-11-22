@@ -1,7 +1,6 @@
 package org.licash.wallet.ui
 
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -13,6 +12,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -26,6 +27,7 @@ import org.licash.core.ContractFit
 import org.licash.core.ContractQuote
 import org.licash.core.ContractRange
 import org.licash.core.DepositCoin
+import org.licash.core.Holding
 import org.licash.core.contractFee
 import org.licash.core.contractFit
 import org.licash.core.contractPrice
@@ -39,20 +41,28 @@ import kotlin.math.roundToLong
 
 /**
  * The protection offered for what was paid on Bitcoin ([org.licash.wallet.Ui.offer]),
- * as [ChooseSheet]: opened once accepted, or declined so it is not offered
- * unasked again. None if no coin is taken whole by a contract within its
- * hub's range.
+ * as [ChooseSheet]: a coin on Bitcoin added to the balance, protected,
+ * once accepted, or declined so it is not offered unasked again. None if
+ * no coin is taken whole by a contract within its hub's range.
  */
 @Composable
 internal fun OfferSheet(engine: Engine, q: ContractQuote, ready: Boolean, dismiss: () -> Unit) {
     val range = q.range ?: return
     val fitting = q.coins.filter { fitOf(q, range, q.suggestedBlocks, it) != null }
     if (fitting.isEmpty()) return
+    val ui by engine.ui.collectAsState()
+    var holding by remember(q.hub) { mutableStateOf<Holding?>(null) }
+    LaunchedEffect(q.hub, ui.balance) {
+        engine.holdings().onSuccess { all -> holding = all.find { sameHub(it.hub, q.hub) } }
+    }
     ChooseSheet(
         q,
         range,
         fitting,
         ready,
+        hubCover(q.hub, holding, ui.contracts, emptyList()),
+        title = "Add to balance, protected",
+        verb = "Add",
         open = { chosen, price ->
             dismiss()
             engine.openContract(q.hub, price, chosen)
@@ -100,15 +110,30 @@ internal fun fitOf(q: ContractQuote, range: ContractRange, blocks: UInt, coin: D
     suggestedFit(fitsOf(q, range, blocks, coin), coin.value)
 
 /**
- * Protection of terms chosen within what its hub allows: what it covers,
- * for how long, what it costs (its opening fee and interest) and the
- * reserve, hers and refundable, apart. How long, which of `coins` pays and
- * the itemized cost are under More: at first as `q` suggests, paid from the
- * smallest coin a contract takes whole. A coin is spent whole: it pays the
- * price, and all the rest of it is her part of the contract, which joins
- * her balance once its funding confirms. Offered unasked, it can be
- * declined. Not paid for until the app is caught up with Bitcoin (`ready`),
- * as opening it needs.
+ * Each cover some coin of `fits` (each coin's contracts, as [fitsOf])
+ * opens whole, smallest first, with the coins paying it, smallest first:
+ * the cover is chosen, then a coin that pays it.
+ */
+internal fun coversOf(fits: List<Pair<DepositCoin, List<ContractFit>>>): List<Pair<ULong, List<DepositCoin>>> =
+    fits.flatMap { (coin, its) -> its.map { it.cap to coin } }
+        .groupBy({ it.first }, { it.second })
+        .toSortedMap()
+        .map { (cap, coins) -> cap to coins.sortedBy { it.value } }
+
+/** The cover offered at first: the one suggested for the smallest coin a contract takes whole. */
+internal fun suggestedCover(fits: List<Pair<DepositCoin, List<ContractFit>>>): ULong? =
+    fits.filter { it.second.isNotEmpty() }.minByOrNull { it.first.value }
+        ?.let { (coin, its) -> suggestedFit(its, coin.value)?.cap }
+
+/**
+ * Protection of terms chosen within what its hub allows. First what is
+ * protected at the hub once it opens (`cover`, the hub's now, with it), then
+ * what it covers, chosen first, which decides the coins on Bitcoin that pay
+ * it whole: the smallest at first. Then what it costs, the reserve, hers and
+ * refundable, and what of the coin joins her balance once its funding
+ * confirms: the coin is spent whole. How long, and the cost itemized, under
+ * More. Offered unasked, it can be declined. Not paid for until the app is
+ * caught up with Bitcoin (`ready`), as opening it needs.
  *
  * With no coin to pay it, she is told to cash out to herself first.
  */
@@ -118,24 +143,27 @@ internal fun ChooseSheet(
     range: ContractRange,
     coins: List<DepositCoin>,
     ready: Boolean,
+    cover: HubCover,
     open: (Chosen, price: ULong) -> Unit,
     dismiss: () -> Unit,
+    title: String = "Protect at ${name(q.hub)}",
+    verb: String = "Protect",
     decline: (() -> Unit)? = null,
 ) {
     val colors = MaterialTheme.colorScheme
     val download = android.text.format.Formatter.formatShortFileSize(LocalContext.current, q.download.toLong())
+    val blockSecs = LocalBlockSeconds.current
     var blocks by remember(q) { mutableStateOf(q.suggestedBlocks.coerceIn(range.minBlocks, range.maxBlocks)) }
-    // At first the smallest coin that a contract takes whole; the smallest
-    // of them all, to say why none does, if none.
-    var coin by remember(q) {
-        val sorted = coins.sortedBy { it.value }
-        mutableStateOf(sorted.firstOrNull { fitOf(q, range, blocks, it) != null } ?: sorted.firstOrNull())
-    }
-    // The cap chosen, kept while the coin and how long take it; at first, or
-    // once they do not, the one suggested for the coin.
-    var chosenCap by remember(q, coin) { mutableStateOf<ULong?>(null) }
-    val fits = coin?.let { fitsOf(q, range, blocks, it) }.orEmpty()
-    val fit = fits.firstOrNull { it.cap == chosenCap } ?: coin?.let { suggestedFit(fits, it.value) }
+    val fits = coins.map { it to fitsOf(q, range, blocks, it) }
+    val covers = coversOf(fits)
+    // The cover chosen, kept while some coin opens it; at first, or once
+    // none does, the one suggested.
+    var chosenCap by remember(q) { mutableStateOf<ULong?>(null) }
+    var chosenCoin by remember(q) { mutableStateOf<DepositCoin?>(null) }
+    val cap = chosenCap?.takeIf { c -> covers.any { it.first == c } } ?: suggestedCover(fits)
+    val payers = covers.firstOrNull { it.first == cap }?.second.orEmpty()
+    val coin = chosenCoin?.takeIf { it in payers } ?: payers.firstOrNull()
+    val fit = coin?.let { c -> fits.first { it.first == c }.second.firstOrNull { it.cap == cap } }
     val capped = fit?.cap ?: range.minCap
     val funded = fit?.funded ?: 0uL
     // What the hub is paid: its fee and interest, then the reserve, hers.
@@ -144,37 +172,47 @@ internal fun ChooseSheet(
     val cost = fee.cost()
     // It stops protecting a little before it ends.
     val protectsFor = if (blocks > q.afterAssert) blocks - q.afterAssert else 0u
-    val chips: @Composable () -> Unit = {
-        if (coins.size > 1) {
-            Text("Paid from", modifier = Modifier.padding(top = 12.dp), style = MaterialTheme.typography.bodyLarge)
-            Row(Modifier.horizontalScroll(rememberScrollState())) {
-                for (c in coins) {
-                    FilterChip(
-                        selected = c == coin,
-                        onClick = { coin = c },
-                        label = { Text(sat(c.value)) },
-                        modifier = Modifier.padding(end = 8.dp).testTag("contract-coin"),
-                    )
-                }
+    Sheet(title, dismiss) {
+        if (fit != null) {
+            val after = coverAfter(cover, capped, funded)
+            CoverBar(after, Modifier.padding(top = 4.dp, bottom = 6.dp))
+            after.says?.let {
+                Text(
+                    "At ${name(q.hub)} then: ${it.replaceFirstChar { c -> c.lowercase() }}",
+                    modifier = Modifier.padding(bottom = 8.dp).testTag("contract-after"),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = colors.onSurfaceVariant,
+                )
             }
         }
-    }
-    Sheet("Protect at ${name(q.hub)}", dismiss) {
         Line("Covers up to", sat(capped), tag = "quote-cap")
         // Larger, the hub funds more of it: room to be paid more, at its interest.
-        if (fit != null && fits.size > 1) {
-            val at = fits.indexOf(fit)
+        if (fit != null && covers.size > 1) {
+            val at = covers.indexOfFirst { it.first == capped }
             Slider(
                 value = at.toFloat(),
-                onValueChange = { chosenCap = fits[it.roundToInt().coerceIn(fits.indices)].cap },
-                valueRange = 0f..fits.lastIndex.toFloat(),
-                steps = fits.size - 2,
+                onValueChange = { chosenCap = covers[it.roundToInt().coerceIn(covers.indices)].first },
+                valueRange = 0f..covers.lastIndex.toFloat(),
+                steps = covers.size - 2,
                 modifier = Modifier.testTag("contract-cap"),
             )
-            Line("The hub's part", sat(capped - funded), tag = "contract-hub-part")
         }
-        Line("For", span(protectsFor.toLong(), LocalBlockSeconds.current), tag = "quote-for")
-        if (fit != null) {
+        if (fit != null && coin != null) {
+            if (payers.size > 1) {
+                Text("Paid with", modifier = Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodyLarge)
+                Row(Modifier.horizontalScroll(rememberScrollState())) {
+                    for (c in payers) {
+                        FilterChip(
+                            selected = c == coin,
+                            onClick = { chosenCoin = c },
+                            label = { Text(sat(c.value)) },
+                            modifier = Modifier.padding(end = 8.dp).testTag("contract-coin"),
+                        )
+                    }
+                }
+            } else {
+                Line("Paid with", "${sat(coin.value)} on Bitcoin", tag = "contract-paid-with")
+            }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 FeeLine(
                     "Cost", cost, capped, tag = "quote-price", value = sat(cost),
@@ -186,8 +224,10 @@ internal fun ChooseSheet(
                 Line("Reserve, refundable", sat(range.reserve), Modifier.weight(1f), tag = "contract-reserve")
                 Info("Reserve", RESERVE_MEANS)
             }
+            Line("Into your balance", sat(funded), tag = "contract-funded")
         }
-        if (coin == null) {
+        Line("For", span(protectsFor.toLong(), blockSecs), tag = "quote-for")
+        if (coin == null && coins.isEmpty()) {
             Say("Paid from Bitcoin you hold, and you hold none yet. Receive some on Bitcoin, or cash out to yourself, then protect.")
         } else if (fit == null) {
             Text(
@@ -196,8 +236,6 @@ internal fun ChooseSheet(
                 style = MaterialTheme.typography.bodyMedium,
                 color = colors.error,
             )
-            // To pay with another coin: in sight.
-            chips()
         }
         More(modifier = Modifier.testTag("contract-more")) {
             if (range.maxBlocks > range.minBlocks) {
@@ -210,14 +248,7 @@ internal fun ChooseSheet(
                 )
             }
             if (fit != null) {
-                chips()
-                Line("Your part", sat(funded), tag = "contract-funded")
-                Text(
-                    YOUR_PART,
-                    modifier = Modifier.padding(bottom = 8.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = colors.onSurfaceVariant,
-                )
+                Line("The hub's part", sat(capped - funded), tag = "contract-hub-part")
                 Line("Opening fee", sat(fee.opening), tag = "contract-opening-fee")
                 Line(
                     "Interest",
@@ -232,24 +263,24 @@ internal fun ChooseSheet(
                     )
                 }
             }
+            Line("Takes", "Up to an hour, $download")
         }
-        Line("Takes", "Up to an hour, $download")
+        val now = System.currentTimeMillis() / 1000
         Text(
-            DUTY,
+            duty(day(now + protectsFor.toLong() * blockSecs.toLong(), now)),
             modifier = Modifier.padding(vertical = 8.dp).testTag("contract-duty"),
             style = MaterialTheme.typography.bodySmall,
             color = colors.onSurfaceVariant,
         )
         Worth(q.mock)
         Spacer(Modifier.height(8.dp))
-        val c = coin
-        if (c != null) {
+        if (coin != null) {
             BigButton(
-                if (ready) "Protect for ${sat(cost)}" else "Waiting for Bitcoin",
+                if (ready) "$verb for ${sat(cost)}" else "Waiting for Bitcoin",
                 Modifier.fillMaxWidth().testTag("protect"),
                 enabled = fit != null && ready,
             ) {
-                open(Chosen(capped, blocks, c.outpoint), price)
+                open(Chosen(capped, blocks, coin.outpoint), price)
             }
         }
         decline?.let {
@@ -259,17 +290,12 @@ internal fun ChooseSheet(
     }
 }
 
-/** Why a coin pays for no contract: it is spent whole, so it is short of the price or beyond what the largest takes. */
-internal const val NO_FIT = "No contract of this hub takes this coin whole: it is short of the price, " +
-    "or beyond what the largest contract takes. Pay with another coin."
+/** Why no coin pays for a contract: each is spent whole, so short of the price or beyond what the largest takes. */
+internal const val NO_FIT = "No contract of this hub takes a coin of yours whole: each is short of the price, " +
+    "or beyond what the largest contract takes."
 
-/** Her part of the cover, said under it. */
-internal const val YOUR_PART = "Your coin is spent whole: what is left of it after the cost and the reserve " +
-    "is your part of the cover, and joins your balance once confirmed. The hub charges less interest on it, or none."
-
-/** What protection asks of its owner, said before it is paid for. */
-internal const val DUTY = "Open Licash now and then, and before it ends: what it protects " +
-    "is recovered by this app, and is safe after it ends only once cashed out or protected again."
+/** What protection asks of its owner, said before it is paid for: its end, `ends`, as a day. */
+internal fun duty(ends: String): String = "Open Licash now and then, and before it ends on $ends."
 
 /** The blocks at `value` of a slider from `least` to `most`, in whole days but at its ends. */
 internal fun blocksAt(value: Float, least: UInt, most: UInt): UInt {

@@ -73,6 +73,12 @@ fun hubCover(hub: String, holding: Holding?, contracts: List<Contract>, notes: L
     )
 }
 
+/** `now` once a contract covering up to `cap` opens, `funded` of it hers, joining what is held. */
+fun coverAfter(now: HubCover, cap: ULong, funded: ULong): HubCover {
+    val held = now.held + funded
+    return now.copy(held = held, covered = minOf(held, now.covered + cap), caps = now.caps + cap)
+}
+
 /**
  * The least a contract at `hub` protects, if it opens them: below that,
  * what is not protected is not worth a contract of its own.

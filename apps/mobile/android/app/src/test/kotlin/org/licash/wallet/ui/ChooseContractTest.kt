@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
 import org.licash.core.ContractFit
+import org.licash.core.DepositCoin
 
 class ChooseContractTest {
     @Test
@@ -41,5 +42,33 @@ class ChooseContractTest {
         // None as large allowed: the largest.
         assertEquals(2_097_151uL, suggestedFit(fits, 1_500_000uL)?.cap)
         assertNull(suggestedFit(emptyList(), 1_000_000uL))
+    }
+
+    @Test
+    fun the_cover_is_chosen_first_and_decides_the_coins_paying_it() {
+        val small = DepositCoin("a:0", 600_000uL)
+        val large = DepositCoin("b:0", 1_000_000uL)
+        val tiny = DepositCoin("c:0", 1_000uL)
+        fun fit(cap: ULong) = ContractFit(cap = cap, funded = 1uL)
+        val fits = listOf(
+            large to listOf(fit(1_048_575uL), fit(2_097_151uL)),
+            small to listOf(fit(1_048_575uL)),
+            tiny to emptyList(),
+        )
+        // Every cover some coin opens, each with the coins that pay it, smallest first.
+        assertEquals(
+            listOf(1_048_575uL to listOf(small, large), 2_097_151uL to listOf(large)),
+            coversOf(fits),
+        )
+        // At first the one suggested for the smallest coin a contract takes whole.
+        assertEquals(1_048_575uL, suggestedCover(fits))
+        assertEquals(2_097_151uL, suggestedCover(listOf(large to fits[0].second)))
+        assertNull(suggestedCover(listOf(tiny to emptyList())))
+        assertEquals(emptyList<Pair<ULong, List<DepositCoin>>>(), coversOf(emptyList()))
+    }
+
+    @Test
+    fun what_protection_asks_says_the_day_it_ends() {
+        assertEquals("Open Licash now and then, and before it ends on May 21.", duty("May 21"))
     }
 }
