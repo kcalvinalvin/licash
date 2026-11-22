@@ -83,7 +83,9 @@ impl Hosts {
         let hosts = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let (times, since) = hosts.get(origin)?.unanswered?;
         let rest = RESTS[(times - 1).min(RESTS.len() - 1)];
-        (since + rest).checked_duration_since(now).filter(|left| !left.is_zero())
+        (since + rest)
+            .checked_duration_since(now)
+            .filter(|left| !left.is_zero())
     }
 
     /// That `origin` answered at `now` in `took`, or did not (None): then
@@ -116,7 +118,9 @@ impl Hosts {
 /// The scheme, host and port of `url`, as hosts rest by.
 fn origin(url: &str) -> &str {
     let after = url.find("://").map_or(0, |i| i + 3);
-    let end = url[after..].find(['/', '?', '#']).map_or(url.len(), |i| after + i);
+    let end = url[after..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| after + i);
     &url[..end]
 }
 
@@ -558,7 +562,10 @@ mod tests {
 
     #[test]
     fn a_host_not_answering_rests_longer_each_time_until_it_answers() {
-        assert_eq!(origin("https://hub.example:8443/v1/info?x=1"), "https://hub.example:8443");
+        assert_eq!(
+            origin("https://hub.example:8443/v1/info?x=1"),
+            "https://hub.example:8443"
+        );
         assert_eq!(origin("http://abc.onion"), "http://abc.onion");
         let hosts = Hosts::default();
         let (hub, now) = ("https://hub.example", Instant::now());
@@ -567,7 +574,10 @@ mod tests {
             let at = now + Duration::from_secs(1000 * times as u64);
             hosts.answered(hub, None, at);
             assert_eq!(hosts.left(hub, at), Some(*rest));
-            assert_eq!(hosts.left(hub, at + *rest - Duration::from_secs(1)), Some(Duration::from_secs(1)));
+            assert_eq!(
+                hosts.left(hub, at + *rest - Duration::from_secs(1)),
+                Some(Duration::from_secs(1))
+            );
             assert_eq!(hosts.left(hub, at + *rest), None);
             assert_eq!(hosts.left("https://other.example", at), None);
         }
@@ -608,19 +618,29 @@ mod tests {
         drop(closed);
         let refused = http.request(&url, None).await.unwrap_err();
         assert!(!refused.contains("did not answer lately"), "{refused}");
-        let passed = licash_wallet::in_background(http.request(&url, None)).await.unwrap_err();
-        assert!(passed.contains("did not answer lately, asked again in 30 s"), "{passed}");
+        let passed = licash_wallet::in_background(http.request(&url, None))
+            .await
+            .unwrap_err();
+        assert!(
+            passed.contains("did not answer lately, asked again in 30 s"),
+            "{passed}"
+        );
         assert!(http.resting(&url).is_some());
         let asked = http.request(&url, None).await.unwrap_err();
         assert!(!asked.contains("did not answer lately"), "{asked}");
         // Answering again: asked in the background at once.
         let host = answering(2);
         http.hosts.answered(&host, None, Instant::now());
-        let answer = http.request(&format!("{host}/v1/info"), None).await.unwrap();
+        let answer = http
+            .request(&format!("{host}/v1/info"), None)
+            .await
+            .unwrap();
         assert_eq!(answer.status, 200);
         assert!(http.answers_in(&format!("{host}/")).is_some());
         assert_eq!(http.answers_in(&url), None);
-        assert!(licash_wallet::in_background(http.request(&host, None)).await.is_ok());
+        assert!(licash_wallet::in_background(http.request(&host, None))
+            .await
+            .is_ok());
     }
 
     #[test]

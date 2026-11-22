@@ -422,7 +422,10 @@ impl Wallet {
     pub fn relearn_hub(&self, url: String) -> Result<Hub, LicashError> {
         if let Some(ms) = self.hub_resting_ms(url.clone()) {
             return Err(LicashError::Unavailable {
-                reason: format!("it did not answer lately, asked again in {} s", ms.div_ceil(1000)),
+                reason: format!(
+                    "it did not answer lately, asked again in {} s",
+                    ms.div_ceil(1000)
+                ),
             });
         }
         self.add_hub(url)
