@@ -353,7 +353,7 @@ it when offered for a coin on Bitcoin (titled "Add to balance, protected":
 the coin is safe already on Bitcoin, what it gains is being spendable in
 Licash), and "Waiting for Bitcoin" until the app is caught up, as opening
 needs. A hub's "Fees and limits" lists its opening fee, interest, reserve,
-covers and length a short row each. Opening downloads about 100 MB and takes minutes to an hour,
+covers and length a short row each. Opening downloads about 100 MB and takes a few minutes, then a confirmation on Bitcoin,
 in the background, one at a time, the step it is at shown; several
 contracts at a hub, and at several hubs, add up. Each says what it covers
 now of the hub's notes once unfolded: what its recovery would claim of them

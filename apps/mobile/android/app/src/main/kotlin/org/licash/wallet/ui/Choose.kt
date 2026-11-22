@@ -263,7 +263,7 @@ internal fun ChooseSheet(
                     )
                 }
             }
-            Line("Takes", "Up to an hour, $download")
+            Line("Takes", "$SETUP_TAKES · $download")
         }
         val now = System.currentTimeMillis() / 1000
         Text(

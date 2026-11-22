@@ -174,7 +174,7 @@ internal fun HubPage(
             }
             if (opening && !stepping) {
                 if (covers.isNotEmpty()) Divider()
-                Entry("Setting up", sub = "Up to an hour", tag = "opening")
+                Entry("Setting up", sub = SETUP_TAKES, tag = "opening")
                 LinearProgressIndicator(Modifier.fillMaxWidth().padding(bottom = 12.dp))
             }
         }

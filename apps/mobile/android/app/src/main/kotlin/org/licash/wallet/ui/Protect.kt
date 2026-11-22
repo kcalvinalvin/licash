@@ -407,6 +407,9 @@ internal fun Worth(mock: Boolean) {
  */
 internal const val FIXED_PART = 1_000uL
 
+/** How long opening a contract takes: a tester's took under four minutes, then its funding confirms. */
+internal const val SETUP_TAKES = "A few minutes, then a confirmation on Bitcoin"
+
 /**
  * What protecting at a hub covers, lasts and costs, before it is paid:
  * to pay it, or to get a coin on Bitcoin that pays it first. A coin is spent
@@ -419,7 +422,7 @@ internal fun ProtectSheet(q: ContractQuote, open: () -> Unit, cashOutFirst: () -
         Line("Covers up to", sat(q.cap), tag = "quote-cap")
         Line("For", span(q.protectsFor.toLong(), LocalBlockSeconds.current), tag = "quote-for")
         FeeLine("Cost", q.price, q.cap, tag = "quote-price", value = sat(q.price), breakdown = setupCost(q.cap, q.price))
-        Line("Takes", "Up to an hour, $download")
+        Line("Takes", "$SETUP_TAKES · $download")
         Worth(q.mock)
         Spacer(Modifier.height(8.dp))
         val coin = q.coin
