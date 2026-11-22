@@ -151,7 +151,7 @@ internal fun CoverRow(
                 if (recovery != null) {
                     Forced(recovery, developer, giveUp, allowFee, height)
                 } else {
-                    Unfolded(c, cover, developer, end, forceClose, plan, height, network)
+                    Unfolded(c, cover, developer, end, forceClose, plan, height, network, details?.holderReserve)
                 }
                 details?.let { ContractLayout(it, explorer) }
             }
@@ -198,13 +198,34 @@ private fun ContractLayout(info: ContractInspection, explorer: (String) -> Strin
 
 /** A protection's row unfolded: what it covers and costs; closing it with its hub, forcing it closed in advanced mode. */
 @Composable
-private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> Unit, forceClose: () -> Unit, safety: ContractSafety?, height: Int, network: Network) {
+private fun Unfolded(
+    c: Contract,
+    cover: Cover,
+    developer: Boolean,
+    end: () -> Unit,
+    forceClose: () -> Unit,
+    safety: ContractSafety?,
+    height: Int,
+    network: Network,
+    // Her reserve, of its price, once its layout is read: apart, as it comes back.
+    reserve: ULong? = null,
+) {
     val state = c.state
     if (state is ContractState.Failed) Line("Why", state.reason)
     // Of what its hub holds, those ending first covering first.
     if (cover.on) Line("Covers now", sat(c.covers), tag = "covers")
     if (cover.ends != null) Line("Ends by itself in", cover.ends)
-    if (!cover.failed) FeeLine("Cost", c.price, c.cap, value = sat(c.price), breakdown = setupCost(c.cap, c.price))
+    if (!cover.failed) {
+        // Until its layout is read, which takes a while, what was paid, the reserve in it.
+        val known = reserve?.takeIf { it <= c.price }
+        if (known == null) {
+            Line("Paid", sat(c.price), tag = "contract-paid")
+        } else {
+            val cost = c.price - known
+            FeeLine("Cost", cost, c.cap, value = sat(cost), breakdown = setupCost(c.cap, cost))
+            if (known > 0uL) Line("Reserve, refundable", sat(known), tag = "contract-reserve")
+        }
+    }
     // What she funded of it herself: hers once issued, else its recovery claims it.
     if (c.funded > 0uL && !cover.failed) {
         Line("You funded", "${sat(c.funded)} · ${if (c.fundedReceived) "in your balance" else "on its way"}", tag = "contract-funded")
