@@ -274,6 +274,20 @@ impl Store {
         Ok(())
     }
 
+    /// The services a probe found answering as themselves since `since`,
+    /// by id: when one last did.
+    pub fn answered_since(
+        &self,
+        since: i64,
+    ) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+        let db = self.db();
+        let mut query = db.prepare(
+            "SELECT service, max(at) FROM probes WHERE at >= ?1 AND ok GROUP BY service",
+        )?;
+        let rows = query.query_map([since], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// The probes since `since`, oldest first.
     pub fn probes_since(&self, since: i64) -> anyhow::Result<Vec<Probe>> {
         let db = self.db();
@@ -412,10 +426,17 @@ impl Store {
     }
 
     /// Forget probes, and terms other than each service's last, older than
-    /// `before`. Actions are kept: they are few, and the budget reads them.
+    /// `before`, and the services announced, last seen before it, that never
+    /// answered as themselves: announcing is free, and they would only pile
+    /// up. Actions are kept: they are few, and the budget reads them.
     pub fn prune(&self, before: i64) -> anyhow::Result<()> {
         let db = self.db();
         db.execute("DELETE FROM probes WHERE at < ?1", [before])?;
+        db.execute(
+            "DELETE FROM services WHERE key IS NOT NULL AND last_seen < ?1
+             AND id NOT IN (SELECT service FROM terms)",
+            [before],
+        )?;
         db.execute(
             "DELETE FROM terms WHERE at < ?1 AND at < (
                  SELECT max(at) FROM terms t WHERE t.service = terms.service)",

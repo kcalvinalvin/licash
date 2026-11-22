@@ -19,8 +19,13 @@ pub const KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
 /// How long probes are kept.
 pub const HISTORY: Duration = Duration::from_secs(90 * 24 * 3600);
 
-/// The most probes under way at once.
+/// The most probes under way at once of services that answered as
+/// themselves lately ([`Store::answered_since`]), or were configured.
 const AT_ONCE: usize = 8;
+
+/// The most probes under way at once of the others: announcing is free, so
+/// a flood of them waits on itself, never on those above.
+const AT_ONCE_UNPROVEN: usize = 4;
 
 /// What the observer watches, and how.
 #[derive(Clone)]
@@ -79,15 +84,27 @@ pub async fn discover(store: &Store, watching: &Watching) -> anyhow::Result<()> 
     if watching.relays.is_empty() {
         return Ok(());
     }
+    // Those that answered as themselves asked for by key too: a flood of
+    // newer announcements, filling what relays answer, hides none of them.
+    let services = store.services()?;
+    let answered = store.answered_since(now - millis(KEPT))?;
     for (role, announced) in [
         (Role::Hub, licash_nostr::Role::Hub),
         (Role::Provider, licash_nostr::Role::Swaps),
     ] {
-        let found = licash_nostr::discover(
+        let mut known: Vec<(i64, String)> = (services.iter())
+            .filter(|s| s.role == role)
+            .filter_map(|s| Some((*answered.get(&s.id)?, s.key.clone()?)))
+            .collect();
+        // The latest to answer first, should there be more than are asked.
+        known.sort_by(|a, b| b.cmp(a));
+        let known: Vec<String> = known.into_iter().map(|(_, key)| key).collect();
+        let found = licash_nostr::discover_known(
             &watching.relays,
             &watching.route,
             announced,
             &watching.network,
+            &known,
         )
         .await?;
         tracing::debug!(role = role.name(), found = found.len(), "announcements");
@@ -126,13 +143,21 @@ pub async fn round(store: Arc<Store>, watching: Watching) {
         Err(e) => return tracing::warn!("reading the services: {e:#}"),
     };
     let since = store::now() - millis(KEPT);
+    let answered = match store.answered_since(since) {
+        Ok(answered) => answered,
+        Err(e) => return tracing::warn!("reading the services answering: {e:#}"),
+    };
     let at_once = Arc::new(tokio::sync::Semaphore::new(AT_ONCE));
+    let at_once_unproven = Arc::new(tokio::sync::Semaphore::new(AT_ONCE_UNPROVEN));
     let mut probes = tokio::task::JoinSet::new();
     let spread = millis(watching.probe_every) as u64 / 2;
     for service in services.into_iter().filter(|s| s.last_seen >= since) {
+        let lane = match service.key.is_none() || answered.contains_key(&service.id) {
+            true => &at_once,
+            false => &at_once_unproven,
+        };
         for url in service.urls.iter().filter(|u| watching.dialer.reaches(u)) {
-            let (store, dialer, at_once) =
-                (store.clone(), watching.dialer.clone(), at_once.clone());
+            let (store, dialer, at_once) = (store.clone(), watching.dialer.clone(), lane.clone());
             let (service, url, timeout) = (service.clone(), url.clone(), watching.timeout);
             let delay = OsRng.next_u64() % spread.max(1);
             probes.spawn(async move {

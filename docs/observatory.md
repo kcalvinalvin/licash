@@ -29,6 +29,15 @@ announced it, so a URL cannot answer for another service. A service is
 still probed for seven days after its last announcement, so going away
 shows as downtime rather than vanishing. Probes are kept for 90 days.
 
+Announcing is free, so a flood of announcements must not hide or delay
+the services that work. Those that answered as themselves in the last
+seven days are asked of the relays by their keys too, so newer
+announcements filling what a relay answers cannot hide them. They are
+also probed apart: at most 8 of them at once, and 4 of all the others,
+so a flood of services that never answer delays only its own probes.
+An announced service that never answered is forgotten 90 days after it
+was last seen.
+
 ## Probes, and Tor
 
 Each service's URLs are probed every `--probe-every` seconds (300 by

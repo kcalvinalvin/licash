@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use licash_nostr::{discover, public_key, Announcement, Announcer, Role, Route, KIND, LIFETIME};
+use licash_nostr::{
+    discover, discover_known, public_key, Announcement, Announcer, Role, Route, KIND, LIFETIME,
+};
 use nostr_sdk::prelude::{
     Client, EventBuilder, FinalizeEvent, Keys, Kind, MockRelay, SecretKey, Tag, Timestamp,
 };
@@ -255,4 +257,61 @@ async fn a_watch_is_pushed_each_provider_announced_once_looked_at() {
     urls.sort_unstable();
     assert_eq!(urls, ["https://one.example", "https://two.example"]);
     assert_eq!(watch.found().await.unwrap(), kept);
+}
+
+/// A flood of newer announcements of other keys fills all a relay answers,
+/// hiding a hub announced before; asked for by its key, it is found still.
+#[tokio::test]
+async fn a_flood_of_announcements_hides_no_key_asked_for_by_name() {
+    use nostr_sdk::prelude::{LocalRelay, RateLimit};
+    // A relay answering 20 events at most, as others answer 500.
+    let most = 20;
+    let relay = LocalRelay::builder()
+        .max_filter_limit(most)
+        .rate_limit(RateLimit {
+            max_reqs: 500,
+            notes_per_minute: 10_000,
+        })
+        .build();
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let relays = [url.clone()];
+    let hub = Announcer::new(&[11; 32], Role::Hub, &relays, &Route::Direct)
+        .await
+        .unwrap();
+    let honest = announcement("https://hub.example", "regtest");
+    let at = Timestamp::now() - Duration::from_secs(60);
+    let client = raw(&url).await;
+    client
+        .send_event(&hub.event(&honest, at).unwrap())
+        .await
+        .unwrap();
+    let now = Timestamp::now();
+    for i in 0..=most as u32 {
+        let mut secret = [1; 32];
+        secret[..4].copy_from_slice(&i.to_be_bytes());
+        let sybil = Keys::new(SecretKey::from_slice(&secret).unwrap());
+        let junk = announcement(&format!("https://sybil{i}.example"), "regtest");
+        let tags = [
+            Tag::identifier("hub"),
+            Tag::hashtag("licash-hub"),
+            Tag::expiration(now + LIFETIME),
+        ];
+        let event = EventBuilder::new(Kind::Custom(KIND), serde_json::to_string(&junk).unwrap())
+            .tags(tags)
+            .custom_created_at(now)
+            .finalize(&sybil)
+            .unwrap();
+        client.send_event(&event).await.unwrap();
+    }
+    let found = discover(&relays, &Route::Direct, Role::Hub, "regtest")
+        .await
+        .unwrap();
+    assert!(found.iter().all(|f| f.key != hub.key()), "the flood hid it");
+    let known = [hub.key(), "not a key".into()];
+    let found = discover_known(&relays, &Route::Direct, Role::Hub, "regtest", &known)
+        .await
+        .unwrap();
+    let kept = found.iter().find(|f| f.key == hub.key()).expect("found");
+    assert_eq!(kept.announcement.urls, ["https://hub.example"]);
 }

@@ -641,3 +641,70 @@ async fn a_young_services_chart_covers_what_there_is_of_the_range() {
         "the newest cell has the probe"
     );
 }
+
+/// The services answering as themselves lately are told apart from those
+/// that never did, or not since: those a flood of announcements cannot
+/// crowd out, asked for by key and probed apart.
+#[test]
+fn the_services_answering_lately_are_those_with_a_probe_ok_since() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("o.sqlite")).unwrap();
+    let probe = |at, service: &str, ok| store::Probe {
+        at,
+        service: service.into(),
+        url: format!("https://{service}.example"),
+        ok,
+        open_ms: None,
+        rtt_ms: None,
+        info_ms: None,
+        error: None,
+    };
+    for p in [
+        probe(10, "honest", true),
+        probe(20, "honest", true),
+        probe(30, "honest", false),
+        probe(20, "sybil", false),
+        probe(5, "gone", true),
+    ] {
+        store.probed(&p).unwrap();
+    }
+    let answered = store.answered_since(10).unwrap();
+    assert_eq!(answered.len(), 1, "{answered:?}");
+    assert_eq!(answered["honest"], 20);
+}
+
+/// Announcements never answered for pile up no longer than the history:
+/// such a service gone that long is forgotten, unlike one configured, one
+/// that ever answered as itself, or one seen since.
+#[test]
+fn announced_services_never_answering_are_forgotten_with_the_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("o.sqlite")).unwrap();
+    let service = |id: &str, key: Option<&str>, last_seen| Service {
+        id: id.into(),
+        role: Role::Hub,
+        key: key.map(Into::into),
+        name: None,
+        urls: vec![format!("https://{id}.example")],
+        first_seen: 1,
+        last_seen,
+    };
+    for s in [
+        service("sybil", Some("sybil"), 10),
+        service("answered", Some("answered"), 10),
+        service("recent", Some("recent"), 200),
+        service("https://configured.example", None, 10),
+    ] {
+        store.seen(&s).unwrap();
+    }
+    store.terms_seen("answered", 5, "{}").unwrap();
+    store.prune(100).unwrap();
+    let mut kept: Vec<String> = store
+        .services()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    kept.sort();
+    assert_eq!(kept, ["answered", "https://configured.example", "recent"]);
+}

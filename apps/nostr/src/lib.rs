@@ -30,8 +30,8 @@ use std::{collections::HashMap, future::Future, net::SocketAddr, time::Duration}
 
 use anyhow::{ensure, Context};
 use nostr_sdk::prelude::{
-    Client, Event, EventBuilder, Filter, FinalizeEvent, Keys, Kind, Proxy, Relay, RelayUrl,
-    SecretKey, SignerAuthenticator, Tag, Timestamp,
+    Client, Event, EventBuilder, Filter, FinalizeEvent, Keys, Kind, Proxy, PublicKey, Relay,
+    RelayUrl, SecretKey, SignerAuthenticator, Tag, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 
@@ -341,17 +341,53 @@ pub async fn discover(
     role: Role,
     network: &str,
 ) -> anyhow::Result<Vec<Found>> {
+    discover_known(relays, route, role, network, &[]).await
+}
+
+/// The most keys asked for by name ([`discover_known`]), the first named.
+pub const MAX_KNOWN: usize = 500;
+
+/// [`discover`], the announcements of the `known` keys (x-only, in hex),
+/// up to [`MAX_KNOWN`], asked for apart as well: a flood of newer
+/// announcements of other keys, filling all a relay answers, hides none of
+/// theirs. Keys not in hex are passed over.
+pub async fn discover_known(
+    relays: &[String],
+    route: &Route,
+    role: Role,
+    network: &str,
+    known: &[String],
+) -> anyhow::Result<Vec<Found>> {
     let started = std::time::Instant::now();
     let client = client(relays, route, None).await?;
     let filter = Filter::new()
         .kind(Kind::Custom(KIND))
         .identifier(role.id())
-        .hashtag(role.topic())
-        .limit(MAX_EVENTS);
+        .hashtag(role.topic());
+    let known: Vec<PublicKey> = (known.iter())
+        .filter_map(|k| PublicKey::from_hex(k).ok())
+        .take(MAX_KNOWN)
+        .collect();
+    let named = (!known.is_empty()).then(|| {
+        let limit = known.len();
+        filter.clone().authors(known).limit(limit)
+    });
+    let filter = filter.limit(MAX_EVENTS);
     let timeout = route.timeout();
     let fetched = ask_each(client.relays().await, route, MIN_GRACE, |relay| {
-        let filter = filter.clone();
-        async move { Ok(relay.fetch_events(filter).timeout(timeout).await?) }
+        let (filter, named) = (filter.clone(), named.clone());
+        async move {
+            let mut events: Vec<Event> = relay
+                .fetch_events(filter)
+                .timeout(timeout)
+                .await?
+                .into_iter()
+                .collect();
+            if let Some(named) = named {
+                events.extend(relay.fetch_events(named).timeout(timeout).await?);
+            }
+            Ok(events)
+        }
     })
     .await;
     client.shutdown().await;
