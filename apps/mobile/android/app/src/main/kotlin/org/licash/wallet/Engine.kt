@@ -106,6 +106,8 @@ data class Ui(
     val chain: ChainStatus = ChainStatus(),
     /** How far looking for payments on Bitcoin got, once looking. */
     val scan: Scan? = null,
+    /** Whether the wallet's first catching up is over: from then on, the connections dot tells of it. */
+    val caughtUp: Boolean = false,
     /** How far the app's Tor client is in connecting, over Tor. */
     val torStatus: TorStatus? = null,
     /** Payments on Bitcoin on their way: in no block yet. */
@@ -114,8 +116,12 @@ data class Ui(
     val problem: String? = null,
     /** Whether each hub answered when last asked, by URL: none before it is asked. In memory only. */
     val hubsReached: Map<String, Boolean> = emptyMap(),
+    /** How long each hub reached took to answer what it serves, in milliseconds, by URL. */
+    val hubsMs: Map<String, Long> = emptyMap(),
     /** Whether the mailbox's relays were reached when last looked in, if looked in. In memory only. */
     val relaysReached: Boolean? = null,
+    /** How long looking in the mailbox's relays took when they answered, in milliseconds. */
+    val relaysMs: Long? = null,
     /** The recovery contracts with hubs, the newest first. */
     val contracts: List<Contract> = emptyList(),
     /** The contracts forced closed, the oldest first. */
@@ -169,6 +175,10 @@ data class ChainStatus(
     val peerHeight: Int = 0,
     /** How far, in percent, the headers this release pins are downloaded, before the client starts: -1 if not. */
     val importing: Int = -1,
+    /** The shortest last ping of a connected peer, in milliseconds: -1 if none answered one. */
+    val pingMs: Int = -1,
+    /** How far, in percent, the headers downloaded are stored, before the client starts: -1 if not, or not told yet. */
+    val storing: Int = -1,
 )
 
 /** How `light` stands now. */
@@ -179,6 +189,8 @@ private fun statusOf(light: LightClient): ChainStatus = ChainStatus(
     headers = runCatching { light.headers() }.getOrDefault(0),
     peerHeight = light.peerHeight(),
     importing = light.importing(),
+    pingMs = light.pingMs(),
+    storing = light.storing(),
 )
 
 /** Automatic backups to a folder: when last written whole, and what failed since, if anything. */
@@ -213,7 +225,7 @@ class Engine(context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mutex = Mutex()
     private val lightLock = Mutex()
-    private val state = MutableStateFlow(Ui(developer = prefs.developer, network = prefs.network))
+    private val state = MutableStateFlow(Ui(developer = prefs.developer, network = prefs.network, caughtUp = prefs.caughtUp))
     val ui: StateFlow<Ui> = state.asStateFlow()
     private val notices = MutableSharedFlow<Event>(extraBufferCapacity = 16)
     val events: SharedFlow<Event> = notices
@@ -763,6 +775,8 @@ class Engine(context: Context) {
                 }
                 if (scan.next > scan.height) {
                     caughtUp = true
+                    if (!prefs.caughtUp) prefs.caughtUp = true
+                    state.update { it.copy(caughtUp = true) }
                     phase("payments looked for to block ${scan.height}")
                     break
                 }
@@ -810,7 +824,7 @@ class Engine(context: Context) {
                 failed("the mailbox", e)
                 false
             }
-            state.update { it.copy(relaysReached = reached) }
+            state.update { it.copy(relaysReached = reached, relaysMs = collectedMs.takeIf { reached }) }
         }
         // Only with every coin found: a partial look could move part.
         if (caughtUp) {
@@ -836,8 +850,14 @@ class Engine(context: Context) {
      * Take the payments in the mailbox, each told of at once, their notes
      * unlinked after: whether there were any.
      */
+    /** How long the last look in the mailbox took, its relays asked and what they held taken, in milliseconds. */
+    @Volatile private var collectedMs: Long? = null
+
     private suspend fun collect(): Boolean {
-        val got = locked { it.collectNow() }
+        val got = locked {
+            val asked = SystemClock.elapsedRealtime()
+            it.collectNow().also { collectedMs = SystemClock.elapsedRealtime() - asked }
+        }
         for (one in got) {
             AppLog.info("received ${one.amount} sat in the mailbox")
             notices.tryEmit(Event("Received ${sat(one.amount)}", one.amount))
@@ -901,16 +921,22 @@ class Engine(context: Context) {
     /** Learn again what each hub trusted serves: it may have changed since added. */
     private suspend fun learnHubs(hubs: List<Hub>) {
         val reached = mutableMapOf<String, Boolean>()
+        val took = mutableMapOf<String, Long>()
         for (hub in hubs) {
             reached[hub.url] = try {
-                locked { it.addHub(hub.url) }
+                // Timed once it has the wallet: not the wait for it.
+                took[hub.url] = locked {
+                    val asked = SystemClock.elapsedRealtime()
+                    it.addHub(hub.url)
+                    SystemClock.elapsedRealtime() - asked
+                }
                 true
             } catch (e: LicashException) {
                 AppLog.warn("learning what ${hub.url} serves", e)
                 false
             }
         }
-        state.update { it.copy(hubsReached = reached) }
+        state.update { it.copy(hubsReached = reached, hubsMs = took) }
         hubsLearned = true
         hubsLearnedAt = System.currentTimeMillis()
     }
@@ -1970,6 +1996,7 @@ class Engine(context: Context) {
             prefs.watched = null
             prefs.warned = emptySet()
             prefs.askedAt = null
+            prefs.caughtUp = false
             seen = null
             looking = false
             WatchJob.cancel(app)
@@ -1979,7 +2006,7 @@ class Engine(context: Context) {
         }
         // Its network may differ from the one chosen next.
         lightLock.withLock { startLight() }
-        state.update { Ui(loaded = true, developer = prefs.developer, network = prefs.network) }
+        state.update { Ui(loaded = true, developer = prefs.developer, network = prefs.network, caughtUp = false) }
         refresh()
     }
 

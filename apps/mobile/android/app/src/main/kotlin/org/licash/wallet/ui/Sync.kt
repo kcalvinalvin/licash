@@ -53,12 +53,15 @@ enum class Progress { DONE, DOING, WAITING }
  * to is known.
  */
 data class Stage(val name: String, val state: Progress, val detail: String, val fraction: Float? = null) {
-    /** Whether the time it takes is shown: a step with no progress to count, that can take minutes. */
-    val timed: Boolean get() = state == Progress.DOING && detail == PREPARING
+    /** Whether the time it takes is shown: a step that can take many minutes. */
+    val timed: Boolean get() = state == Progress.DOING && (detail == PREPARING || detail.startsWith(STORING))
 }
 
-/** The pinned headers downloaded, checked and stored before the light client starts: no progress told. */
+/** The pinned headers downloaded, checked before they are stored: no progress told. */
 internal const val PREPARING = "Preparing, this can take a few minutes"
+
+/** The pinned headers checked, stored before the light client starts, how far told. */
+internal const val STORING = "Storing"
 
 /** How far `done` is of the way from `from` to `to`, if that way is known and `done` is on it. */
 internal fun fraction(from: Long, done: Long, to: Long): Float? =
@@ -99,9 +102,13 @@ fun stages(ui: Ui): List<Stage> {
     val chain = ui.chain
     if (chain.importing >= 0) {
         val f = chain.importing / 100f
-        // Downloaded, the client checks and stores them: minutes, uncounted.
-        if (chain.importing >= 100) add(HEADERS_DOWNLOAD, false, PREPARING, "")
-        else add(HEADERS_DOWNLOAD, false, "Downloading" + shown(f), "", f)
+        // Downloaded, the client checks them (minutes, uncounted), then stores them.
+        val stored = chain.storing.takeIf { it >= 0 }?.let { it / 100f }
+        when {
+            chain.importing < 100 -> add(HEADERS_DOWNLOAD, false, "Downloading" + shown(f), "", f)
+            stored != null -> add(HEADERS_DOWNLOAD, false, STORING + shown(stored), "", stored)
+            else -> add(HEADERS_DOWNLOAD, false, PREPARING, "")
+        }
     }
     val nodes = "${chain.peers} " + if (chain.peers == 1L) "node" else "nodes"
     add(NODES, chain.peers > 0, "Looking for nodes", nodes)
@@ -152,6 +159,9 @@ fun stages(ui: Ui): List<Stage> {
 /** Whether a step is under way, the wallet catching up. */
 fun catchingUp(ui: Ui): Boolean = stages(ui).any { it.state != Progress.DONE }
 
+/** Whether Home shows each step of catching up: a new wallet's first only, later ones told by the connections dot. */
+fun firstCatchingUp(ui: Ui): Boolean = !ui.caughtUp && ui.history.isEmpty() && catchingUp(ui)
+
 internal const val TOR = "Tor"
 internal const val HEADERS_DOWNLOAD = "Block headers download"
 internal const val NODES = "Bitcoin nodes"
@@ -165,7 +175,11 @@ internal fun said(stage: Stage, developer: Boolean): String = when {
     developer -> "${stage.name}: ${stage.detail}"
     stage.state == Progress.WAITING -> "Waiting for Tor"
     stage.name == TOR -> stage.detail
-    stage.name == HEADERS_DOWNLOAD -> if (stage.timed) PREPARING else "Downloading block headers" + shown(stage.fraction)
+    stage.name == HEADERS_DOWNLOAD -> when {
+        stage.detail == PREPARING -> PREPARING
+        stage.detail.startsWith(STORING) -> "Storing block headers" + shown(stage.fraction)
+        else -> "Downloading block headers" + shown(stage.fraction)
+    }
     stage.name == NODES -> "Looking for Bitcoin nodes"
     stage.name == PAYMENTS && stage.detail.startsWith("Waiting") -> "Waiting for your hub to catch up"
     stage.name == PAYMENTS -> "Looking for your payments" + shown(stage.fraction)
@@ -175,8 +189,8 @@ internal fun said(stage: Stage, developer: Boolean): String = when {
 /** How a connection stands, from fine to failing. */
 enum class Reach { UP, GOING, DOWN }
 
-/** A connection the app needs, and how it stands, in a few words. */
-data class Link(val name: String, val reach: Reach, val detail: String)
+/** A connection the app needs, how it stands in a few words, and how long it last took to answer, if known. */
+data class Link(val name: String, val reach: Reach, val detail: String, val ms: Long? = null)
 
 /**
  * The app's connections: Tor if on, then Bitcoin, up once caught up (a
@@ -197,10 +211,11 @@ fun links(ui: Ui): List<Link> {
     }
     val chain = ui.chain
     val up = "Up to date" + if (ui.developer) ", block ${block(chain.height.toLong())}, ${chain.peers} nodes" else ""
-    out += Link(BITCOIN, if (step == null) Reach.UP else Reach.GOING, step?.let { said(it, ui.developer) } ?: up)
+    val ping = chain.pingMs.toLong().takeIf { it > 0 && chain.peers > 0 }
+    out += Link(BITCOIN, if (step == null) Reach.UP else Reach.GOING, step?.let { said(it, ui.developer) } ?: up, ping)
     for (hub in ui.hubs) {
         out += when (ui.hubsReached[hub.url]) {
-            true -> Link(name(hub.url), Reach.UP, "Reached")
+            true -> Link(name(hub.url), Reach.UP, "Reached", ui.hubsMs[hub.url])
             false -> Link(name(hub.url), Reach.DOWN, "Not answering")
             null -> Link(name(hub.url), Reach.GOING, "Not asked yet")
         }
@@ -208,7 +223,7 @@ fun links(ui: Ui): List<Link> {
     // Only a wallet with a mailbox looks in one.
     if (ui.hubs.any { it.mailbox }) {
         out += when (ui.relaysReached) {
-            true -> Link(RELAYS, Reach.UP, "Reached")
+            true -> Link(RELAYS, Reach.UP, "Reached", ui.relaysMs)
             false -> Link(RELAYS, Reach.DOWN, "None reached: payments to you wait there until one is")
             null -> Link(RELAYS, Reach.GOING, "Not looked in yet")
         }
@@ -315,8 +330,16 @@ fun Connections(engine: Engine, ui: Ui) {
     var error by remember { mutableStateOf<String?>(null) }
     Sheet("Connections", dismiss = { open = false }) {
         KeptFresh(engine)
-        for (link in links) LinkRow(link)
-        if (ui.developer && links.first { it.name == BITCOIN }.reach != Reach.UP) SyncStages(engine, ui)
+        val preparing = rememberWait(ui.chain.importing >= 100)
+        for (link in links) {
+            LinkRow(link)
+            // In advanced mode, Bitcoin's steps while catching up, under it.
+            if (link.name == BITCOIN && ui.developer && link.reach != Reach.UP) {
+                Column(Modifier.padding(start = 22.dp).testTag("bitcoin-steps")) {
+                    for (stage in stages(ui)) if (stage.name != TOR) StageRow(stage, preparing)
+                }
+            }
+        }
         val since = stuck.since
         if (offerTorOff(ui, since?.let { SystemClock.elapsedRealtime() - it })) {
             Spacer(Modifier.height(8.dp))
@@ -351,8 +374,19 @@ private fun LinkRow(link: Link) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        link.ms?.let {
+            Text(
+                latency(it),
+                modifier = Modifier.padding(start = 8.dp).testTag("ms ${link.name}"),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
+
+/** A time to answer, as shown beside a connection: `85 ms`, `1,240 ms`. */
+internal fun latency(ms: Long): String = "${digits(ms.toULong())} ms"
 
 @Composable
 private fun StageRow(stage: Stage, preparing: Wait) {

@@ -90,6 +90,11 @@ class Prefs(context: Context) {
         get() = prefs.getStringSet("watched", null)?.toSet()
         set(keys) = prefs.edit().apply { if (keys == null) remove("watched") else putStringSet("watched", keys) }.apply()
 
+    /** Whether the wallet looked for its payments up to the chain's tip once: its first catching up over. */
+    var caughtUp: Boolean
+        get() = prefs.getBoolean("caught_up", false)
+        set(value) = prefs.edit().putBoolean("caught_up", value).apply()
+
     /** The exits and disputes already told of, by [ExitNotice.key]. */
     var exitsTold: Set<String>
         get() = prefs.getStringSet("exits_told", null)?.toSet().orEmpty()

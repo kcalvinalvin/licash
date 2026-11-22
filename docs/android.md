@@ -19,10 +19,16 @@ providers show in advanced mode only. With no hub yet, Home lists the hubs
 announced on Nostr to pick from, or takes one by its address. While a new
 wallet first catches up with Bitcoin, Home says the step under way in
 plain words and how far (each step, block numbers and all, in advanced
-mode). A dot beside the network shows how the connections stand (Tor if
-on, Bitcoin, each hub as it answered when last asked, every 5 minutes, and
-the mailbox's relays as last looked in, kept in memory only); tapped, it says each, and offers turning Tor off once
-Tor keeps the app from Bitcoin for 3 minutes, or says it is stuck.
+mode), the headers this release pins counted as downloaded, then as
+stored; once caught up, never again. A dot beside the network shows how
+the connections stand (Tor if on, Bitcoin, each hub as it answered when
+last asked, every 5 minutes, and the mailbox's relays as last looked in,
+kept in memory only); tapped, it says each with how long it took to
+answer (Bitcoin's nodes' shortest ping, a hub's info, a look in the
+mailbox), lists Bitcoin's steps under it while catching up in advanced
+mode, and offers turning Tor off once Tor keeps the app from Bitcoin for
+3 minutes, or says it is stuck. Notifications are asked for once a wallet
+is made or restored.
 
 Home says when bitcoin paid to the wallet waits outside the balance and no
 protection is offered for it ("N sat on Bitcoin, not in your balance"); it
@@ -418,7 +424,8 @@ fallback address. The app has no screen for it yet.
 ## Backup and restore
 
 - **Recovery words**: 24 words, shown after a warning, kept out of
-  screenshots. They encode the wallet's existing 256-bit seed as BIP39
+  screenshots, with a button copying them marked sensitive (no clipboard
+  preview). They encode the wallet's existing 256-bit seed as BIP39
   entropy (not a BIP39 PBKDF seed, so other wallets do not read them). They
   bring back the keys and coins on Bitcoin only: notes held at hubs and
   contracts need the backup file. They are shown with the wallet's birthday,

@@ -76,6 +76,45 @@ class SyncTest {
     }
 
     @Test
+    fun checked_the_pinned_headers_are_stored_as_far_as_told() {
+        val stage = stages(Ui(chain = ChainStatus(importing = 100, storing = 35), hubs = listOf(hub()))).first()
+        assertEquals("Storing (35%)", stage.detail)
+        assertEquals(0.35f, stage.fraction!!, 0.0001f)
+        assertTrue(stage.timed)
+        assertEquals("Storing block headers (35%)", said(stage, developer = false))
+        // Not told yet: still checked, for a time untold.
+        assertEquals(PREPARING, stages(Ui(chain = ChainStatus(importing = 100, storing = -1))).first().detail)
+    }
+
+    @Test
+    fun only_a_new_wallets_first_catching_up_is_shown_on_home() {
+        val behind = Ui(chain = ChainStatus(peers = 1, headers = 400, peerHeight = 800), hubs = listOf(hub()))
+        assertTrue(firstCatchingUp(behind))
+        // Caught up once: the connections dot tells of it from then on.
+        assertFalse(firstCatchingUp(behind.copy(caughtUp = true)))
+        assertFalse(firstCatchingUp(Ui(chain = caughtUp, hubs = listOf(hub()), scan = scan(800u, 901u, 900u))))
+    }
+
+    @Test
+    fun the_connections_say_how_long_they_took_to_answer() {
+        assertEquals("85 ms", latency(85))
+        assertEquals("1,240 ms", latency(1_240))
+        val ui = Ui(
+            chain = caughtUp.copy(pingMs = 120),
+            hubs = listOf(hub().copy(mailbox = true)),
+            scan = scan(800u, 901u, 900u),
+            hubsReached = mapOf("https://hub.example" to true),
+            hubsMs = mapOf("https://hub.example" to 640L),
+            relaysReached = true,
+            relaysMs = 900L,
+        )
+        assertEquals(listOf(120L, 640L, 900L), links(ui).map { it.ms })
+        // None for a hub not answering, nor for Bitcoin with no node.
+        val down = ui.copy(hubsReached = mapOf("https://hub.example" to false), chain = caughtUp.copy(pingMs = 120, peers = 0))
+        assertEquals(listOf(null, null), links(down).take(2).map { it.ms })
+    }
+
+    @Test
     fun the_step_under_way_is_said_plainly_and_in_full_in_advanced_mode() {
         val ui = Ui(chain = ChainStatus(peers = 1, headers = 400, peerHeight = 800), hubs = listOf(hub()))
         val step = stages(ui)[1]

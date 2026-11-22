@@ -125,7 +125,7 @@ fun Home(
                     Waiting(ui, money)
                     Unprotected(engine, ui, money)
                     // A new wallet's first catching up: each step, as it goes.
-                    if (ui.history.isEmpty() && catchingUp(ui)) {
+                    if (firstCatchingUp(ui)) {
                         Spacer(Modifier.height(16.dp))
                         Column(
                             Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
