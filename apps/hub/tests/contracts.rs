@@ -3326,6 +3326,7 @@ async fn a_force_close_claims_the_notes_of_a_payment_its_hub_never_released() ->
         "{forced:?}"
     );
     let mut done = None;
+    let mut last = None;
     for _ in 0..800 {
         rt.mine(1)?;
         while !watch::step(&hub, &source).await? {}
@@ -3338,8 +3339,9 @@ async fn a_force_close_claims_the_notes_of_a_payment_its_hub_never_released() ->
             done = Some(r);
             break;
         }
+        last = Some(r);
     }
-    let done = done.context("never paid")?;
+    let done = done.with_context(|| format!("never paid: {last:?}"))?;
     ensure!(
         done.response.is_none() && done.timeout.is_some() && done.payout == done.timeout,
         "{done:?}"
