@@ -301,10 +301,10 @@ private fun OnBitcoin(engine: Engine, ui: Ui, go: (String?) -> Unit) {
         // says what protecting costs and what it takes, hub by hub.
         val hubs = ui.hubs.filter { it.contracts != null }
         if (hubs.isNotEmpty()) {
-            Group("Protect") {
+            Group("Protect at") {
                 hubs.forEachIndexed { i, hub ->
                     if (i > 0) Divider()
-                    Entry("Protect at ${name(hub.url)}", tag = "protect-at", onClick = { go(hub.url) })
+                    Entry(engine.hubName(hub.url) ?: name(hub.url), tag = "protect-at", onClick = { go(hub.url) })
                 }
             }
         }

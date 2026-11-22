@@ -265,7 +265,8 @@ private fun Waiting(ui: Ui, money: (String?) -> Unit) {
     Spacer(Modifier.height(8.dp))
     Pill(
         icon = Glyphs.bitcoin,
-        text = "${sat(coin)} on Bitcoin, not in your balance",
+        // Counted in the total already: what it lacks is being spendable, as the offer says.
+        text = "Pay with your ${sat(coin)} on Bitcoin",
         tag = "waiting",
         onClick = { money(ON_BITCOIN) },
     )

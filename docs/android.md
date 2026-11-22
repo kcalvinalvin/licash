@@ -41,7 +41,8 @@ for up to two minutes with the wallet held; what the user asks for asks
 it still, and any answer ends the rest.
 
 Home says when bitcoin paid to the wallet waits outside the balance and no
-protection is offered for it ("N sat on Bitcoin, not in your balance"); it
+protection is offered for it ("Pay with your N sat on Bitcoin", as the
+offer says); it
 opens the page for what is on Bitcoin, which lists each hub's protection to
 open. That page is always one tap from the balance: its row says "Add it
 to your balance, protected or not" while bitcoin is held and nothing is
