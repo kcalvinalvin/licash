@@ -375,6 +375,7 @@ mod tests {
                 chain: None,
                 lightning: None,
                 donations: Some(donations(url)),
+                receive: None,
                 features: Vec::new(),
             },
         }

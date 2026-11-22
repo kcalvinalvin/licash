@@ -159,6 +159,34 @@ provider with donations under way refuses to start without `--lnurl-url`
 and `--lnd`. The provider must stay up while donations are under way: down
 past an HTLC's expiry, it may have paid the payee and lose the donation.
 
+With `--lnd` and `--receive`, it also takes payments over Lightning for
+wallets, as a hub's gateway does, so that a wallet can be paid over
+Lightning at a hub without one. Its info names the terms under `receive`.
+A wallet asks (`POST /v1/swaps/receive`) for an invoice of `amount` under
+a hash of its own, to its address at a hub the provider swaps at; the
+invoice asks the amount and the provider's fee (`--receive-fee-base`, 2
+sat, and `--receive-fee-ppm`, 5000, the hub's fee on the lock included),
+from `--receive-min` (100 sat) to `--receive-max` (1,000,000 sat), and
+`GET /v1/swaps/receive/HASH` says where it stands. Once the invoice is paid,
+the provider locks the amount to the wallet under that hash, for at most 15
+blocks; the wallet claims it with the preimage, which the hub shows the
+provider, who settles. Unclaimed, the lock is refunded once expired and the
+payment fails back to its payer. Nothing is trusted to the provider, but it
+sees which receipts go to one wallet's address. The lock expires early
+enough for the provider to force the preimage out on Bitcoin, should the
+hub keep it, and settle 18 blocks before the HTLCs expire: the invoice's
+final CLTV delta is the hub's lead (the refund request's confirmation, the
+hub's response window, a block to read the preimage, the provider's margin
+and one), 18 blocks, 15 for the wallet to claim and 3 of slack, about 230
+blocks on a hub with a day's window. A lock that expired, neither paid nor
+refunded, alerts the operator and never cancels the invoice. At most
+`--receive-max-open` receipts are under way at once (100 by default),
+each holding its amount of the provider's notes at the hub aside while
+unpaid. A provider with receipts under way refuses to start without
+`--receive` and `--lnd`. Receipts are kept in tables of their own, made in
+the provider's file when first taken: an existing provider's file is
+otherwise as it was.
+
 A hub could withhold the notes it holds of the provider's: a recovery
 contract at the hub (`licash-wallet open-contract`) recovers them, up to
 its cap, from its collateral. By default `run` takes in at each hub only

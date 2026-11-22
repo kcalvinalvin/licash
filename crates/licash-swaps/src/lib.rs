@@ -47,6 +47,7 @@ mod donations;
 mod invoices;
 mod issue;
 mod payouts;
+mod receives;
 mod store;
 
 use std::{
@@ -73,6 +74,7 @@ pub use invoices::MIN_SLACK;
 pub use issue::Issuer;
 use issue::{Issue, Issued};
 pub use payouts::{Chain, PayoutLimits, NO_SHOW_VSIZE, PAYOUT_ROOM};
+pub use receives::{Receipt, ReceiptState, ReceiveTerms, RECEIVE_BLOCKS, RECEIVE_EXPIRY};
 use store::{now, Store};
 
 /// Blocks a provider's lock leaves at least before it expires: for the
@@ -522,6 +524,8 @@ pub struct Provider<T: Transport> {
     lightning: Option<invoices::Payer>,
     /// Donations taken, if any ([`Provider::take_donations`]).
     donations: Option<donations::Receiver>,
+    /// Receipts over Lightning taken, if any ([`Provider::take_receives`]).
+    receives: Option<receives::Taker>,
 }
 
 /// The swaps into the provider's own hub under way, whose clients' locks
@@ -566,7 +570,7 @@ fn read_swaps(path: &Path) -> Result<Option<rusqlite::Connection>, Error> {
     }
 }
 
-/// Any recorded swap or donation reserves its hash, even terminal or not
+/// Any recorded swap, donation or receipt reserves its hash, even terminal or not
 /// yet locked: a donation's invoice, public, must never back a receipt of
 /// a gateway sharing the provider's node, whose notes its settling would
 /// pay.
@@ -580,7 +584,7 @@ pub fn holds_hash(path: &Path, hash: &[u8; 32]) -> Result<bool, Error> {
     let donation = conn
         .prepare("SELECT 1 FROM provider_donations WHERE hash = ?1")?
         .exists([hash])?;
-    Ok(swap || donation)
+    Ok(swap || donation || receives::holds_hash(&conn, hash)?)
 }
 
 /// A recorded lock id proves swap ownership. A reserved hash alone does
@@ -668,6 +672,7 @@ impl<T: Transport> Provider<T> {
             intake: Mutex::default(),
             lightning: None,
             donations: None,
+            receives: None,
         }
     }
 
@@ -747,6 +752,7 @@ impl<T: Transport> Provider<T> {
             nostr: None,
             chain: self.chain_info()?,
             donations: self.donations(),
+            receive: self.receive_terms(),
             lightning: self.lightning_terms().cloned(),
             features: Vec::new(),
         })
@@ -971,15 +977,17 @@ impl<T: Transport> Provider<T> {
         Ok(true)
     }
 
-    /// What the swaps accepted and not locked yet will lock at `url`.
+    /// What the swaps accepted and the receipts paid, not locked yet,
+    /// will lock at `url`.
     fn reserved(&self, url: &str) -> Result<u64, Error> {
         self.store.read(|c| {
-            Ok(c.query_row(
+            let swaps = c.query_row(
                 "SELECT coalesce(sum(amount), 0) FROM provider_swaps
                  WHERE to_url = ?1 AND state = 'accepted'",
                 [url],
                 |r| r.get::<_, i64>(0),
-            )? as u64)
+            )? as u64;
+            Ok(swaps.saturating_add(receives::reserved(c, url)?))
         })
     }
 }

@@ -17,7 +17,7 @@ use licash_contracts::holder::Node;
 use licash_lightning::{lnd::Lnd, Node as LightningNode};
 use licash_nostr::Route;
 use licash_notify::{Message, Priority, Target};
-use licash_swaps::{Config, DonationTerms, Provider};
+use licash_swaps::{Config, DonationTerms, Provider, ReceiveTerms};
 use licash_swaps_service::{
     dashboard,
     keeper::{self, Keeper},
@@ -498,6 +498,51 @@ struct DonationArgs {
     donation_max_open: u64,
 }
 
+/// Receipts over Lightning for wallets, with `--receive`.
+#[derive(Args)]
+struct ReceiveArgs {
+    /// Take payments over Lightning for wallets, through the node of
+    /// `--lnd`: held invoices paid on as locks of the provider's notes to
+    /// the wallets at its hubs, settled once claimed.
+    #[arg(long, env = "LICASH_SWAPS_RECEIVE", requires = "lnd")]
+    receive: bool,
+    /// The fee on each receipt, asked on top, in satoshis: the hub's fee
+    /// on the lock comes out of it.
+    #[arg(long, env = "LICASH_SWAPS_RECEIVE_FEE_BASE",
+          default_value_t = ReceiveTerms::default().fee.base)]
+    receive_fee_base: u64,
+    /// The fee on each receipt, in parts per million of it.
+    #[arg(long, env = "LICASH_SWAPS_RECEIVE_FEE_PPM",
+          default_value_t = ReceiveTerms::default().fee.ppm,
+          value_parser = clap::value_parser!(u64).range(0..=1_000_000))]
+    receive_fee_ppm: u64,
+    /// The smallest receipt, in satoshis.
+    #[arg(long, env = "LICASH_SWAPS_RECEIVE_MIN", default_value_t = ReceiveTerms::default().min)]
+    receive_min: u64,
+    /// The largest receipt, in satoshis.
+    #[arg(long, env = "LICASH_SWAPS_RECEIVE_MAX", default_value_t = ReceiveTerms::default().max)]
+    receive_max: u64,
+    /// The most receipts under way at once.
+    #[arg(long, env = "LICASH_SWAPS_RECEIVE_MAX_OPEN",
+          default_value_t = ReceiveTerms::default().max_open)]
+    receive_max_open: u64,
+}
+
+impl ReceiveArgs {
+    /// Its terms, if it takes receipts.
+    fn terms(&self) -> Option<ReceiveTerms> {
+        self.receive.then_some(ReceiveTerms {
+            fee: Fee {
+                base: self.receive_fee_base,
+                ppm: self.receive_fee_ppm,
+            },
+            min: self.receive_min,
+            max: self.receive_max,
+            max_open: self.receive_max_open,
+        })
+    }
+}
+
 impl DonationArgs {
     /// The provider's public URL and its terms, if it takes donations.
     fn terms(&self) -> anyhow::Result<Option<(String, DonationTerms)>> {
@@ -698,6 +743,10 @@ enum Command {
         /// the wallets of Licash codes over LNURL-pay too.
         #[command(flatten)]
         donations: DonationArgs,
+        /// With --receive and --lnd, the provider takes payments over
+        /// Lightning for wallets too.
+        #[command(flatten)]
+        receives: ReceiveArgs,
         #[command(flatten)]
         contracts: ContractArgs,
     },
@@ -811,6 +860,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             payouts,
             lightning,
             donations,
+            receives,
             contracts,
         } => {
             let config = terms.config()?;
@@ -863,6 +913,18 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     anyhow::ensure!(
                         open == 0,
                         "{open} Lightning payments under way: they need --lnd"
+                    );
+                    provider
+                }
+            };
+            let provider = match (receives.terms(), &node) {
+                (Some(terms), Some(node)) => provider.take_receives(node.clone(), terms)?,
+                (Some(_), None) => anyhow::bail!("--receive needs --lnd"),
+                (None, _) => {
+                    let open = provider.open_receives()?;
+                    anyhow::ensure!(
+                        open == 0,
+                        "{open} receipts over Lightning under way: they need --receive and --lnd"
                     );
                     provider
                 }
@@ -1091,6 +1153,19 @@ async fn serve(
         critical.spawn(
             "the invoices' payer",
             licash_swaps_service::pay_invoices(provider.clone(), every),
+        );
+    }
+    if let Some(terms) = provider.receive_terms() {
+        tracing::info!(
+            fee_base = terms.fee.base,
+            fee_ppm = terms.fee.ppm,
+            min = terms.min,
+            max = terms.max,
+            "taking payments over Lightning for wallets"
+        );
+        critical.spawn(
+            "the receipts' follower",
+            licash_swaps_service::take_receives(provider.clone(), every),
         );
     }
     if let (Some(terms), Some(route)) = (provider.donation_terms(), mailing) {

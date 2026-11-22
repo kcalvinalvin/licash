@@ -568,6 +568,7 @@ async fn a_wallet_finds_its_static_donation_address_at_a_provider_taking_them() 
     );
     let none = licash_api::swaps::Info {
         donations: None,
+        receive: None,
         ..info
     };
     let refused = donation(payee(none)).await;

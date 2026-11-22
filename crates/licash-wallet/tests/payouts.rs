@@ -314,6 +314,7 @@ impl Desk {
             chain: *self.terms.lock().unwrap(),
             lightning: None,
             donations: None,
+            receive: None,
             features: Vec::new(),
         }
     }

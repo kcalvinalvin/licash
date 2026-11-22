@@ -1,0 +1,489 @@
+//! Receipts over Lightning for wallets: a held invoice of the provider's
+//! node under the wallet's hash, paid on as a lock of the provider's notes
+//! to the wallet, settled with the preimage its claim shows; canceled
+//! while nothing was locked, or once the lock is refunded.
+
+#[allow(dead_code)]
+#[path = "../../licash-wallet/tests/net/mod.rs"]
+mod net;
+
+use std::sync::Arc;
+
+use bitcoin::hashes::Hash;
+use licash::spend::{lock_hash, ChainProfile};
+use licash_api::{swaps::ReceiveRequest, Code, Fee, Hex, ReceiveState};
+use licash_lightning::{fake::Fake, HeldState};
+use licash_swaps::{
+    Config, DonationTerms, Notice, Provider, ReceiptState, ReceiveTerms, RECEIVE_BLOCKS,
+    SETTLE_MARGIN,
+};
+use licash_wallet::Wallet;
+use lightning_invoice::Bolt11Invoice;
+use net::{Fault, Link, Net};
+
+const A: &str = "http://a.test";
+const FEE: Fee = Fee { base: 1, ppm: 0 };
+const TERMS: ReceiveTerms = ReceiveTerms {
+    fee: Fee { base: 2, ppm: 0 },
+    min: 10,
+    max: 500,
+    max_open: 3,
+};
+/// What the provider holds at A to start with.
+const HELD: u64 = 1_000;
+/// Blocks the payer's HTLCs outlive the provider's lock by, at least: the refund request's confirmation (36), A's window
+/// (20), reading the preimage, the provider's margin (12) and one.
+const LEAD: u32 = 36 + 20 + 1 + 12 + 1;
+
+struct Eco {
+    net: Arc<Net>,
+    dir: tempfile::TempDir,
+    node: Arc<Fake>,
+    provider: Option<Provider<Link>>,
+    payee: Wallet<Link>,
+}
+
+impl Eco {
+    /// Hub A, a provider holding 1,000 there taking receipts through its
+    /// node, and a payee at A.
+    async fn new() -> Self {
+        let net = Net::new();
+        net.start(A, FEE);
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Wallet::create(
+            &dir.path().join("wallet.sqlite"),
+            &[0x50; 32],
+            ChainProfile::Core30DefaultRegtest,
+            Link(net.clone()),
+        )
+        .unwrap();
+        wallet.add_hub(A).await.unwrap();
+        wallet
+            .receive(&net.pay(A, &wallet.address(), HELD))
+            .unwrap();
+        let node = Arc::new(Fake::new());
+        let provider = Provider::create(wallet, Config::default())
+            .unwrap()
+            .take_receives(node.clone(), TERMS)
+            .unwrap();
+        let payee = Wallet::create(
+            &dir.path().join("payee.sqlite"),
+            &[0xd0; 32],
+            ChainProfile::Core30DefaultRegtest,
+            Link(net.clone()),
+        )
+        .unwrap();
+        payee.add_hub(A).await.unwrap();
+        let eco = Self {
+            net,
+            dir,
+            node,
+            provider: Some(provider),
+            payee,
+        };
+        eco.mine(0).await;
+        eco
+    }
+
+    fn provider(&self) -> &Provider<Link> {
+        self.provider.as_ref().unwrap()
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self.dir.path().join("wallet.sqlite")
+    }
+
+    /// The provider, stopped and opened again over the same node.
+    fn restart(&mut self) {
+        drop(self.provider.take());
+        let wallet = Wallet::open(&self.path(), Link(self.net.clone())).unwrap();
+        let provider = Provider::open(wallet, Config::default())
+            .unwrap()
+            .take_receives(self.node.clone(), TERMS)
+            .unwrap();
+        self.provider = Some(provider);
+    }
+
+    /// Hub A's address, as the provider knows it.
+    fn hub_address(&self) -> licash::address::Address {
+        self.payee.hubs().unwrap()[0].1.address
+    }
+
+    fn height(&self) -> u32 {
+        self.net.view(A).height()
+    }
+
+    /// `blocks` mined, the node and the provider's view of A following.
+    async fn mine(&self, blocks: u32) {
+        if blocks > 0 {
+            self.net.mine(A, blocks, None);
+        }
+        self.node.tip(self.height(), [0; 32]);
+        if let Some(provider) = &self.provider {
+            provider.wallet().add_hub(A).await.unwrap();
+        }
+    }
+
+    /// The payee's request of a receipt of `amount` under the preimage
+    /// `[seed; 32]`.
+    fn request(&self, amount: u64, seed: u8) -> ReceiveRequest {
+        ReceiveRequest {
+            hub: self.hub_address(),
+            address: self.payee.address(),
+            amount,
+            hash: Hex(lock_hash(&[seed; 32]).to_vec()),
+            memo: None,
+        }
+    }
+
+    /// A receipt of `amount` asked for: its invoice and hash.
+    async fn receive(&self, amount: u64, seed: u8) -> (Bolt11Invoice, [u8; 32]) {
+        let receiving = self
+            .provider()
+            .receive(&self.request(amount, seed))
+            .await
+            .unwrap();
+        (receiving.request.parse().unwrap(), lock_hash(&[seed; 32]))
+    }
+
+    /// The receipt's invoice paid, its HTLCs expiring `blocks` from now.
+    fn pay(&self, hash: [u8; 32], blocks: u32) {
+        self.node.pay_held(hash, self.height() + blocks);
+    }
+
+    async fn follow(&self) {
+        let pending = self.provider().follow_receives().await.unwrap();
+        assert!(pending.is_empty(), "{pending:?}");
+    }
+
+    fn state(&self, hash: &[u8; 32]) -> ReceiptState {
+        self.provider().receipt(hash).unwrap().unwrap().state
+    }
+
+    fn held(&self) -> u64 {
+        let balance = self.provider().wallet().balance().unwrap();
+        balance
+            .iter()
+            .find(|b| b.hub == A)
+            .map_or(0, |b| b.available)
+    }
+
+    fn alerts(&self) -> Vec<String> {
+        let events = self.provider().events(0, 100).unwrap();
+        events
+            .iter()
+            .filter_map(|e| match e.notice() {
+                Some(Notice::Alert { message }) => Some(message),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The lock the provider tells the payee to claim.
+    fn lock(&self, hash: &[u8; 32]) -> String {
+        let status = self.provider().receive_status(hash).unwrap().unwrap();
+        assert_eq!(status.state, ReceiveState::Locked);
+        hex::encode(status.lock().unwrap().unwrap().as_bytes())
+    }
+}
+
+/// The final CLTV delta of a receipt's invoice at A.
+const CLTV: u32 = SETTLE_MARGIN + LEAD + RECEIVE_BLOCKS + 3;
+
+#[tokio::test]
+async fn a_receipt_paid_is_locked_to_the_wallet_and_settled_once_it_claims() {
+    let eco = Eco::new().await;
+    // Its info tells wallets its terms.
+    let receive = eco.provider().info().unwrap().receive.unwrap();
+    assert_eq!(
+        (receive.fee, receive.min, receive.max),
+        (TERMS.fee, 10, 500)
+    );
+    let (invoice, hash) = eco.receive(100, 5).await;
+    // The amount and the provider's fee, under the payee's hash, held long
+    // enough to force the preimage out on Bitcoin should A keep it.
+    assert_eq!(invoice.amount_milli_satoshis(), Some(102_000));
+    assert_eq!(invoice.payment_hash().as_ref() as &[u8], &hash[..]);
+    assert_eq!(eco.node.held_cltv(hash), Some(CLTV.into()));
+    assert!(licash_swaps::holds_hash(&eco.path(), &hash).unwrap());
+    // What it is to lock is set aside from what it swaps.
+    let max = |eco: &Eco| eco.provider().info().unwrap().hubs[0].max;
+    let before = max(&eco);
+    eco.provider().receive(&eco.request(10, 9)).await.unwrap();
+    assert_eq!(max(&eco), before - 10);
+    // Nothing is locked until its invoice is paid.
+    eco.follow().await;
+    assert_eq!(eco.state(&hash), ReceiptState::Open);
+    assert_eq!(eco.held(), HELD);
+    let status = eco.provider().receive_status(&hash).unwrap().unwrap();
+    assert_eq!((status.state, status.lock), (ReceiveState::Open, None));
+    let paid_at = eco.height();
+    eco.pay(hash, CLTV);
+    eco.follow().await;
+    assert_eq!(eco.state(&hash), ReceiptState::Locked);
+    assert_eq!(eco.node.held(hash).unwrap().0, HeldState::Accepted);
+    // Locked to expire RECEIVE_BLOCKS and the slack past the payment.
+    let receipt = eco.provider().receipt(&hash).unwrap().unwrap();
+    assert_eq!(receipt.expiry, Some(paid_at + RECEIVE_BLOCKS + 3));
+    // The amount locked, and the hub's fee on it.
+    assert!(eco.held() < HELD - 100, "{}", eco.held());
+    // The payee claims, showing the provider the preimage, which settles.
+    let lock = eco.lock(&hash);
+    let received = eco.payee.claim(A, &lock, &[5; 32]).await.unwrap();
+    assert_eq!(received.amount, 100);
+    eco.follow().await;
+    assert_eq!(eco.state(&hash), ReceiptState::Settled);
+    assert_eq!(eco.node.held(hash), Some((HeldState::Settled, 102_000)));
+    let status = eco.provider().receive_status(&hash).unwrap().unwrap();
+    assert_eq!(status.state, ReceiveState::Settled);
+    // Only the other, unpaid, is under way.
+    assert_eq!(eco.provider().open_receives().unwrap(), 1);
+    assert!(eco.alerts().is_empty());
+}
+
+#[tokio::test]
+async fn a_receipt_never_claimed_is_refunded_then_canceled() {
+    let eco = Eco::new().await;
+    let (_, hash) = eco.receive(100, 5).await;
+    eco.pay(hash, CLTV);
+    eco.follow().await;
+    assert_eq!(eco.state(&hash), ReceiptState::Locked);
+    // Expired, the lock is refunded, and only then the payment failed back.
+    eco.mine(RECEIVE_BLOCKS + 3).await;
+    eco.follow().await;
+    assert_eq!(eco.node.held(hash).unwrap().0, HeldState::Accepted);
+    for _ in 0..3 {
+        eco.mine(1).await;
+        eco.follow().await;
+    }
+    assert_eq!(eco.state(&hash), ReceiptState::Canceled);
+    assert_eq!(eco.node.held(hash).unwrap().0, HeldState::Canceled);
+    let status = eco.provider().receive_status(&hash).unwrap().unwrap();
+    assert_eq!(status.state, ReceiveState::Canceled);
+    // The provider holds what it held, but the hub's fees.
+    assert!(eco.held() >= HELD - 2, "{}", eco.held());
+}
+
+#[tokio::test]
+async fn a_payment_expiring_too_soon_to_lock_is_failed_back_unlocked() {
+    let eco = Eco::new().await;
+    let (_, hash) = eco.receive(100, 5).await;
+    // HTLCs held by an older invoice's delta, too short for the lead.
+    eco.pay(hash, SETTLE_MARGIN + LEAD);
+    eco.follow().await;
+    assert_eq!(eco.state(&hash), ReceiptState::Canceled);
+    assert_eq!(eco.node.held(hash).unwrap().0, HeldState::Canceled);
+    assert!(eco.provider().wallet().locks().unwrap().is_empty());
+    assert_eq!(eco.held(), HELD);
+}
+
+#[tokio::test]
+async fn a_provider_stopped_while_locking_adopts_its_lock_never_locking_again() {
+    let mut eco = Eco::new().await;
+    let (_, hash) = eco.receive(100, 5).await;
+    eco.pay(hash, CLTV);
+    eco.follow().await;
+    assert_eq!(eco.state(&hash), ReceiptState::Locked);
+    // As if it stopped once its wallet recorded the lock, before it did.
+    let db = rusqlite::Connection::open(eco.path()).unwrap();
+    db.execute(
+        "UPDATE provider_receives SET lock = NULL, state = 'open' WHERE hash = ?1",
+        [hash],
+    )
+    .unwrap();
+    eco.restart();
+    eco.follow().await;
+    assert_eq!(eco.state(&hash), ReceiptState::Locked);
+    assert_eq!(eco.provider().wallet().locks().unwrap().len(), 1);
+    let lock = eco.lock(&hash);
+    eco.payee.claim(A, &lock, &[5; 32]).await.unwrap();
+    eco.follow().await;
+    assert_eq!(eco.state(&hash), ReceiptState::Settled);
+
+    // Stopped once it timed its lock, before its wallet recorded one:
+    // locked then, once.
+    let (_, other) = eco.receive(50, 6).await;
+    eco.pay(other, CLTV);
+    let expiry = eco.height() + RECEIVE_BLOCKS;
+    db.execute(
+        "UPDATE provider_receives SET expiry = ?2 WHERE hash = ?1",
+        rusqlite::params![other, expiry],
+    )
+    .unwrap();
+    eco.restart();
+    eco.follow().await;
+    assert_eq!(eco.state(&other), ReceiptState::Locked);
+    let locks = eco.provider().wallet().locks().unwrap();
+    assert_eq!(locks.len(), 2);
+    assert_eq!(locks[0].expiry, expiry);
+}
+
+#[tokio::test]
+async fn a_hub_neither_paying_nor_refunding_a_receipts_lock_is_alerted_never_canceled() {
+    let eco = Eco::new().await;
+    let (_, hash) = eco.receive(100, 5).await;
+    eco.pay(hash, CLTV);
+    eco.follow().await;
+    let withhold = |fault| eco.net.fail(licash_api::REFUND, fault);
+    // Expired at depth and A's reaction: A owes the refund, and withholds it.
+    eco.mine(RECEIVE_BLOCKS + 3 + 1 + 2).await;
+    withhold(Fault::Lost);
+    let pending = eco.provider().follow_receives().await.unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    let alerts = eco.alerts();
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert!(alerts[0].contains("may keep the preimage"), "{alerts:?}");
+    assert_eq!(eco.node.held(hash).unwrap().0, HeldState::Accepted);
+    // Told once.
+    withhold(Fault::Refused(Code::Unexpired));
+    eco.follow().await;
+    assert_eq!(eco.alerts().len(), 1);
+    assert_eq!(eco.state(&hash), ReceiptState::Locked);
+    // Refunded at last: failed back.
+    eco.follow().await;
+    assert_eq!(eco.state(&hash), ReceiptState::Canceled);
+    assert_eq!(eco.node.held(hash).unwrap().0, HeldState::Canceled);
+}
+
+#[tokio::test]
+async fn receipts_are_asked_within_the_terms_once_under_each_hash() {
+    let eco = Eco::new().await;
+    let provider = eco.provider();
+    let (invoice, hash) = eco.receive(100, 5).await;
+    // The same request again: the same invoice.
+    let again = provider.receive(&eco.request(100, 5)).await.unwrap();
+    assert_eq!(again.request, invoice.to_string());
+    let refused = |r: Result<licash_api::Receiving, licash_api::Problem>| r.unwrap_err().code;
+    // Another under its hash.
+    assert_eq!(
+        refused(provider.receive(&eco.request(101, 5)).await),
+        Code::Declined
+    );
+    // Beyond the terms.
+    assert_eq!(
+        refused(provider.receive(&eco.request(9, 6)).await),
+        Code::Invalid
+    );
+    assert_eq!(
+        refused(provider.receive(&eco.request(501, 6)).await),
+        Code::Invalid
+    );
+    // To a hub's address, or at a hub the provider does not swap at.
+    let to_hub = ReceiveRequest {
+        address: eco.hub_address(),
+        ..eco.request(100, 6)
+    };
+    assert_eq!(refused(provider.receive(&to_hub).await), Code::Invalid);
+    let elsewhere = ReceiveRequest {
+        hub: eco.payee.address(),
+        ..eco.request(100, 6)
+    };
+    assert_eq!(refused(provider.receive(&elsewhere).await), Code::Declined);
+    // A memo not as made.
+    let memo = ReceiveRequest {
+        memo: Some(" Lunch".into()),
+        ..eco.request(100, 6)
+    };
+    assert_eq!(refused(provider.receive(&memo).await), Code::Invalid);
+    // More than the provider holds beside what it is to lock.
+    eco.receive(500, 6).await;
+    assert_eq!(
+        refused(provider.receive(&eco.request(450, 7)).await),
+        Code::Declined
+    );
+    // At most three under way.
+    eco.receive(10, 7).await;
+    assert_eq!(
+        refused(provider.receive(&eco.request(10, 8)).await),
+        Code::Unavailable
+    );
+    assert_eq!(provider.open_receives().unwrap(), 3);
+    assert!(licash_swaps::holds_hash(&eco.path(), &hash).unwrap());
+}
+
+#[tokio::test]
+async fn a_hash_of_a_donation_is_no_receipts() {
+    let mut eco = Eco::new().await;
+    drop(eco.provider.take());
+    let wallet =
+        Wallet::open(&eco.dir.path().join("wallet.sqlite"), Link(eco.net.clone())).unwrap();
+    let provider = Provider::open(wallet, Config::default())
+        .unwrap()
+        .take_donations(
+            eco.node.clone(),
+            DonationTerms::default(),
+            "https://swaps.test",
+        )
+        .unwrap()
+        .take_receives(eco.node.clone(), TERMS)
+        .unwrap();
+    let code = eco
+        .payee
+        .payment_code(&[A.into()])
+        .unwrap()
+        .licash
+        .unwrap()
+        .to_string();
+    let donation: Bolt11Invoice = provider
+        .donate(&code, 100_000)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    let hash = donation.payment_hash().to_byte_array();
+    let request = ReceiveRequest {
+        hub: eco.hub_address(),
+        address: eco.payee.address(),
+        amount: 100,
+        hash: Hex(hash.to_vec()),
+        memo: None,
+    };
+    let refused = provider.receive(&request).await.unwrap_err();
+    assert_eq!(refused.code, Code::Declined, "{refused:?}");
+    assert!(provider.receipt(&hash).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_file_of_an_older_provider_opens_and_takes_receipts_once_asked() {
+    let eco = Eco::new().await;
+    let net = eco.net.clone();
+    let path = eco.dir.path().join("older.sqlite");
+    let wallet = Wallet::create(
+        &path,
+        &[0x51; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Link(net.clone()),
+    )
+    .unwrap();
+    let older = Provider::create(wallet, Config::default()).unwrap();
+    // As an older provider's file: no receipts' tables.
+    let tables = |path: &std::path::Path| {
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.query_row(
+            "SELECT count(*) FROM schema_versions WHERE component = 'provider_receives'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(tables(&path), 0);
+    assert_eq!(older.open_receives().unwrap(), 0);
+    assert!(older.receipt(&[1; 32]).unwrap().is_none());
+    assert!(!licash_swaps::holds_hash(&path, &[1; 32]).unwrap());
+    assert!(older.info().unwrap().receive.is_none());
+    assert!(older.follow_receives().await.unwrap().is_empty());
+    let declined = older.receive(&eco.request(100, 5)).await.unwrap_err();
+    assert_eq!(declined.code, Code::Declined);
+    drop(older);
+    // Opened by this version, taking receipts: made then, once.
+    for _ in 0..2 {
+        let wallet = Wallet::open(&path, Link(net.clone())).unwrap();
+        let provider = Provider::open(wallet, Config::default())
+            .unwrap()
+            .take_receives(eco.node.clone(), TERMS)
+            .unwrap();
+        assert_eq!(provider.open_receives().unwrap(), 0);
+        assert!(provider.info().unwrap().receive.is_some());
+    }
+    assert_eq!(tables(&path), 1);
+}

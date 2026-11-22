@@ -537,6 +537,94 @@ async fn donations_over_lnurl_answer_as_lnurl_asks() {
     assert!(node.sent().is_empty());
 }
 
+#[tokio::test]
+async fn receipts_over_lightning_are_asked_and_followed_through_the_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = Wallet::create(
+        &dir.path().join("wallet.sqlite"),
+        &[5; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Offline,
+    )
+    .unwrap();
+    let address = wallet.address();
+    let node = Arc::new(Fake::new());
+    let provider = Provider::create(wallet, Config::default())
+        .unwrap()
+        .take_receives(node.clone(), licash_swaps::ReceiveTerms::default())
+        .unwrap();
+    let router = licash_swaps_service::router(Arc::new(provider), None);
+    // Its info tells wallets its terms.
+    let (status, info) = call(&router, swaps::SWAPS_INFO, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: serde_json::Value = serde_json::from_slice(&info).unwrap();
+    assert_eq!(info["receive"]["min"], 100, "{info}");
+    // At a hub it does not swap at: declined, no invoice made.
+    let request = swaps::ReceiveRequest {
+        hub: address,
+        address,
+        amount: 1_000,
+        hash: licash_api::Hex(vec![1; 32]),
+        memo: None,
+    };
+    let body = serde_json::to_string(&request).unwrap();
+    let (status, answer) = call(&router, swaps::RECEIVES, Some(&body)).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "{}",
+        String::from_utf8_lossy(&answer)
+    );
+    assert_eq!(problem(&answer).code, Code::Declined);
+    assert!(node.sent().is_empty());
+    // Not JSON of one.
+    let (status, _) = call(&router, swaps::RECEIVES, Some("{}")).await;
+    assert!(status.is_client_error(), "{status}");
+    // None under a hash never asked; not a hash.
+    let (status, answer) = call(&router, &swaps::receive_state(&[1; 32]), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(problem(&answer).code, Code::UnknownLock);
+    let (status, _) = call(&router, "/v1/swaps/receive/nonsense", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn receipts_need_a_node_and_one_under_way_needs_them() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(licash_swaps(&dir, &["init", "--network", "regtest"])
+        .status
+        .success());
+    let listen = ["--listen", "127.0.0.1:0", "--no-contracts"];
+    let out = licash_swaps(&dir, &[&["run", "--receive"], &listen[..]].concat());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--lnd"));
+    // A receipt under way, recorded by a provider taking them: refused
+    // without its node, before it serves.
+    let wallet = Wallet::open(&dir.path().join("data/wallet.sqlite"), Offline).unwrap();
+    let provider = Provider::open(wallet, Config::default())
+        .unwrap()
+        .take_receives(Arc::new(Fake::new()), licash_swaps::ReceiveTerms::default())
+        .unwrap();
+    drop(provider);
+    let swaps = rusqlite::Connection::open(dir.path().join("data/wallet.sqlite")).unwrap();
+    swaps
+        .execute_batch(
+            "INSERT INTO provider_receives (hash, hub, address, amount, sat, request, state,
+                created_at, updated_at)
+             VALUES (zeroblob(32), 'http://a.test', x'00', 100, 102, 'lnbcrt', 'open', 0, 0);",
+        )
+        .unwrap();
+    drop(swaps);
+    let out = licash_swaps(&dir, &[&["run"], &listen[..]].concat());
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("1 receipts over Lightning under way: they need --receive and --lnd"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("serving at"), "{stderr}");
+}
+
 /// A Licash code of `wallet`'s, paid at a hub of its own address.
 fn a_code<T: Transport>(wallet: &Wallet<T>) -> String {
     let code = licash_wallet::LicashCode {

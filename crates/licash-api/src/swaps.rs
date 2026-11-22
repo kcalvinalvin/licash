@@ -10,6 +10,8 @@
 //! | `GET /v1/swaps/chain/{id}` |  | [`ChainSwap`] |
 //! | `POST /v1/swaps/lightning` | [`LightningRequest`] | [`LightningSwap`] |
 //! | `GET /v1/swaps/lightning/{id}` |  | [`LightningSwap`] |
+//! | `POST /v1/swaps/receive` | [`ReceiveRequest`] | [`crate::Receiving`] |
+//! | `GET /v1/swaps/receive/{hash}` |  | [`crate::ReceiveStatus`] |
 //!
 //! The client draws a preimage and locks, at hub `from`, the amount and the
 //! provider's fee to [`Info::address`] under its hash, then asks for the
@@ -61,6 +63,12 @@ pub const LIGHTNING_SWAPS: &str = "/v1/swaps/lightning";
 /// The path of [`lightning_swap_state`], as a route.
 pub const LIGHTNING_SWAP_STATE: &str = "/v1/swaps/lightning/{id}";
 
+/// Where a wallet asks a provider for an invoice paying it in notes
+/// ([`ReceiveRequest`], [`Info::receive`]).
+pub const RECEIVES: &str = "/v1/swaps/receive";
+/// The path of [`receive_state`], as a route.
+pub const RECEIVE_STATE: &str = "/v1/swaps/receive/{hash}";
+
 /// Where a provider taking donations ([`Info::donations`]) serves the
 /// LNURL-pay request (LUD-06) of donations to the wallet of a Licash code,
 /// its text in place of `{code}`.
@@ -94,6 +102,11 @@ pub fn lightning_swap_state(id: &ProposalId) -> String {
     format!("{LIGHTNING_SWAPS}/{}", hex::encode(id.as_bytes()))
 }
 
+/// Where the receipt over Lightning under `hash` stands at a provider.
+pub fn receive_state(hash: &[u8; 32]) -> String {
+    format!("{RECEIVES}/{}", hex::encode(hash))
+}
+
 /// What a provider swaps, and on what terms.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Info {
@@ -122,6 +135,10 @@ pub struct Info {
     /// codes, if it does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub donations: Option<Donations>,
+    /// The payments over Lightning it takes for wallets, paid on in notes
+    /// at a hub it swaps at, if it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receive: Option<Receives>,
     /// What it takes beyond this version of the protocol, by name, such
     /// as a later way of paying for swaps: a client uses one only if it
     /// names it. Empty from older providers.
@@ -198,6 +215,61 @@ pub struct Donations {
     /// it holds at the payee's hub, too.
     pub min: u64,
     pub max: u64,
+}
+
+/// What a provider takes over Lightning for a wallet that asks
+/// ([`ReceiveRequest`]): a held invoice of its node, under the wallet's
+/// hash, asking the amount and its fee. Once paid, the provider locks the
+/// amount to the wallet at the hub under that hash, and settles with the
+/// preimage the wallet's claim shows it: unclaimed, its lock is refunded
+/// and the payment fails back to its payer. Nothing is taken on trust, but
+/// the provider links the receipts of one wallet, paid to one address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Receives {
+    /// Its fee on the amount, which the invoice asks on top.
+    pub fee: Fee,
+    /// The least and the most received at once, in satoshis.
+    pub min: u64,
+    pub max: u64,
+}
+
+impl Receives {
+    /// What the invoice of a receipt of `amount` asks, in satoshis.
+    pub fn asks(&self, amount: u64) -> u64 {
+        amount.saturating_add(self.fee.due(amount))
+    }
+}
+
+/// Ask a provider for an invoice whose payment it pays on as a lock of
+/// `amount` to `address` at hub `hub`, under `hash`, the wallet's: the
+/// invoice says `memo`, if given, to its payer. The same request again
+/// answers the same invoice.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiveRequest {
+    pub hub: Address,
+    pub address: Address,
+    pub amount: u64,
+    pub hash: Hex,
+    /// As [`crate::memo`] makes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+}
+
+impl ReceiveRequest {
+    pub fn hash(&self) -> Result<[u8; 32], Problem> {
+        self.hash.array("hash")
+    }
+
+    /// Its memo, if it says one, checked as [`crate::memo`] makes it.
+    pub fn checked_memo(&self) -> Result<Option<String>, Problem> {
+        match &self.memo {
+            None => Ok(None),
+            Some(text) => match crate::memo(text)? {
+                normal if normal == *text => Ok(Some(normal)),
+                _ => Err(Problem::invalid("a memo not as `memo` makes it")),
+            },
+        }
+    }
 }
 
 /// What a provider pays over Lightning: invoices it pays from its own node,

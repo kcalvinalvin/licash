@@ -586,6 +586,7 @@ fn swap_bodies_name_hubs_by_address_and_locks_by_id() {
         chain: None,
         lightning: None,
         donations: None,
+        receive: None,
         features: Vec::new(),
     };
     assert_eq!(json(&info), info);
@@ -888,6 +889,67 @@ fn a_provider_taking_donations_says_where_payers_reach_it() {
     assert_eq!(
         (swaps::DONATE, swaps::DONATE_CALLBACK),
         ("/v1/lnurlp/{code}", "/v1/lnurlp/{code}/callback")
+    );
+}
+
+#[test]
+fn a_provider_says_the_receipts_over_lightning_it_takes() {
+    use licash_api::swaps;
+    use serde_json::json;
+
+    let hub = OwnerKeys::from_seed(&[1; 32]).unwrap();
+    // As an older provider answers: none.
+    let info: swaps::Info = serde_json::from_value(json!({
+        "address": hub.address(), "fee": {"base": 0, "ppm": 0}, "min": 1,
+        "max": 2, "margin": 12, "hubs": []
+    }))
+    .unwrap();
+    assert_eq!(info.receive, None);
+    assert!(!serde_json::to_string(&info).unwrap().contains("receive"));
+    let receives = swaps::Receives {
+        fee: Fee { base: 2, ppm: 5000 },
+        min: 100,
+        max: 1_000_000,
+    };
+    let receiving = swaps::Info {
+        receive: Some(receives),
+        ..info
+    };
+    let value = serde_json::to_value(&receiving).unwrap();
+    assert_eq!(
+        value["receive"],
+        json!({"fee": {"base": 2, "ppm": 5000}, "min": 100, "max": 1_000_000})
+    );
+    assert_eq!(json(&receiving), receiving);
+    // The invoice asks the amount and the fee on it.
+    assert_eq!(receives.asks(1_000), 1_007);
+    let request = swaps::ReceiveRequest {
+        hub: hub.address(),
+        address: hub.address(),
+        amount: 1_000,
+        hash: Hex(vec![7; 32]),
+        memo: None,
+    };
+    assert_eq!(json(&request), request);
+    assert!(!serde_json::to_string(&request).unwrap().contains("memo"));
+    assert_eq!(request.hash().unwrap(), [7; 32]);
+    assert_eq!(request.checked_memo().unwrap(), None);
+    let saying = |memo: &str| swaps::ReceiveRequest {
+        memo: Some(memo.into()),
+        ..request.clone()
+    };
+    assert_eq!(
+        saying("Lunch").checked_memo().unwrap(),
+        Some("Lunch".into())
+    );
+    assert!(saying(" Lunch").checked_memo().is_err());
+    assert_eq!(
+        swaps::receive_state(&[0xab; 32]),
+        format!("/v1/swaps/receive/{}", "ab".repeat(32))
+    );
+    assert_eq!(
+        (swaps::RECEIVES, swaps::RECEIVE_STATE),
+        ("/v1/swaps/receive", "/v1/swaps/receive/{hash}")
     );
 }
 

@@ -1,8 +1,8 @@
 //! The swap provider service: a [`Provider`] behind the HTTP API of
 //! [`licash_api::swaps`], the steps that take its swaps on, the chain its
-//! payouts on Bitcoin follow, the node its Lightning payments follow, the
-//! donations it takes over LNURL-pay ([`lnurl`]), and its announcement on
-//! Nostr.
+//! payouts on Bitcoin follow, the node its Lightning payments and receipts
+//! follow, the donations it takes over LNURL-pay ([`lnurl`]), and its
+//! announcement on Nostr.
 
 pub mod dashboard;
 pub mod keeper;
@@ -19,8 +19,11 @@ use axum::{
 };
 use bitcoin::{BlockHash, Transaction};
 use licash_api::{
-    swaps::{self, ChainRequest, ChainSwap, LightningRequest, LightningSwap, Request, Swap},
-    Code, Problem,
+    swaps::{
+        self, ChainRequest, ChainSwap, LightningRequest, LightningSwap, ReceiveRequest, Request,
+        Swap,
+    },
+    Code, Problem, ReceiveStatus, Receiving,
 };
 use licash_chain_client::Source;
 use licash_nostr::{Announcement, Announcer, Role, Route};
@@ -153,6 +156,8 @@ fn paths<T: Transport + 'static, C: Chain + Send + 'static>(
         .route(swaps::CHAIN_SWAP_STATE, get(payout_state::<T, C>))
         .route(swaps::LIGHTNING_SWAPS, post(take_invoice::<T, C>))
         .route(swaps::LIGHTNING_SWAP_STATE, get(invoice_state::<T, C>))
+        .route(swaps::RECEIVES, post(take_receive::<T, C>))
+        .route(swaps::RECEIVE_STATE, get(receive_state::<T, C>))
         .with_state(Arc::new(served))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
 }
@@ -341,6 +346,28 @@ async fn invoice_state<T: Transport + 'static, C>(
     }
 }
 
+async fn take_receive<T: Transport + 'static, C>(
+    State(served): Shared<T, C>,
+    body: Result<Json<ReceiveRequest>, JsonRejection>,
+) -> Answer<Receiving> {
+    let Json(request) = body?;
+    let receiving = served.provider.receive(&request).await.inspect_err(|p| {
+        tracing::debug!(code = ?p.code, message = %p.message, "receipt declined");
+    })?;
+    Ok(Json(receiving))
+}
+
+async fn receive_state<T: Transport + 'static, C>(
+    State(served): Shared<T, C>,
+    Path(hash): Path<String>,
+) -> Answer<ReceiveStatus> {
+    let hash = licash_api::hash_of(&hash)?;
+    match served.provider.receive_status(&hash)? {
+        Some(status) => Ok(Json(status)),
+        None => Err(Problem::new(Code::UnknownLock, "no receipt under this hash").into()),
+    }
+}
+
 /// Take the swaps of `provider` on every `every`, and alert of the hubs it
 /// holds too little at to swap to, for good.
 pub async fn step<T: Transport + 'static>(provider: Arc<Provider<T>>, every: Duration) {
@@ -406,6 +433,22 @@ pub async fn pay_invoices<T: Transport + 'static>(provider: Arc<Provider<T>>, ev
                 }
             }
             Err(e) => tracing::warn!("following the Lightning payments: {e}"),
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
+/// Follow the receipts over Lightning of `provider` every `every`, for
+/// good: lock each paid on to its wallet, settle or cancel.
+pub async fn take_receives<T: Transport + 'static>(provider: Arc<Provider<T>>, every: Duration) {
+    loop {
+        match provider.follow_receives().await {
+            Ok(pending) => {
+                for (hash, reason) in pending {
+                    tracing::debug!(%hash, reason, "receipt pending");
+                }
+            }
+            Err(e) => tracing::warn!("following the receipts: {e}"),
         }
         tokio::time::sleep(every).await;
     }
