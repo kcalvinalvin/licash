@@ -19,6 +19,20 @@ const ONION_OPEN: Duration = Duration::from_secs(30);
 /// How long an onion service whose stream did not open is passed over.
 const ONION_RESTS: Duration = Duration::from_secs(10 * 60);
 
+/// How long a host that did not answer is passed over in the background
+/// ([`licash_wallet::in_background`]), by how many times in a row: the
+/// last for every time after. Asked by someone waiting, it is asked still.
+const RESTS: [Duration; 4] = [
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+];
+
+/// How long the fastest answer of a host stands for how fast it answers:
+/// one taking longer replaces it after.
+const FASTEST_FOR: Duration = Duration::from_secs(5 * 60);
+
 /// The most an answer may hold: far above any grant.
 const MAX_ANSWER: usize = 4 << 20;
 
@@ -47,6 +61,63 @@ fn sending(bytes: usize) -> Option<Duration> {
 pub struct Http {
     route: Route,
     onions: Onions,
+    hosts: Hosts,
+}
+
+/// How each host answered, by origin.
+#[derive(Default)]
+struct Hosts(Mutex<HashMap<String, Host>>);
+
+#[derive(Default)]
+struct Host {
+    /// How many requests in a row got no answer, and when the last.
+    unanswered: Option<(usize, Instant)>,
+    /// The fastest answer lately, and when.
+    fastest: Option<(Duration, Instant)>,
+}
+
+impl Hosts {
+    /// How much longer `origin` rests at `now`, if it does: passed over
+    /// in the background since it did not answer.
+    fn left(&self, origin: &str, now: Instant) -> Option<Duration> {
+        let hosts = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (times, since) = hosts.get(origin)?.unanswered?;
+        let rest = RESTS[(times - 1).min(RESTS.len() - 1)];
+        (since + rest).checked_duration_since(now).filter(|left| !left.is_zero())
+    }
+
+    /// That `origin` answered at `now` in `took`, or did not (None): then
+    /// it rests longer.
+    fn answered(&self, origin: &str, took: Option<Duration>, now: Instant) {
+        let mut hosts = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let host = hosts.entry(origin.to_owned()).or_default();
+        let Some(took) = took else {
+            let times = host.unanswered.map_or(0, |(times, _)| times);
+            host.unanswered = Some((times + 1, now));
+            return;
+        };
+        host.unanswered = None;
+        let faster = host.fastest.is_none_or(|(fastest, at)| {
+            took <= fastest || now.saturating_duration_since(at) >= FASTEST_FOR
+        });
+        if faster {
+            host.fastest = Some((took, now));
+        }
+    }
+
+    /// The fastest `origin` answered within [`FASTEST_FOR`] of `now`.
+    fn fastest(&self, origin: &str, now: Instant) -> Option<Duration> {
+        let hosts = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (took, at) = hosts.get(origin)?.fastest?;
+        (now.saturating_duration_since(at) < FASTEST_FOR).then_some(took)
+    }
+}
+
+/// The scheme, host and port of `url`, as hosts rest by.
+fn origin(url: &str) -> &str {
+    let after = url.find("://").map_or(0, |i| i + 3);
+    let end = url[after..].find(['/', '?', '#']).map_or(url.len(), |i| after + i);
+    &url[..end]
 }
 
 /// Onion services standing in for hubs' own URLs, over Tor only: by the
@@ -167,6 +238,7 @@ impl Http {
         Ok(Self {
             route: Route::Direct(client.build()?),
             onions: Onions::default(),
+            hosts: Hosts::default(),
         })
     }
 
@@ -177,6 +249,7 @@ impl Http {
         Self {
             route: Route::Tor(tor),
             onions: Onions::default(),
+            hosts: Hosts::default(),
         }
     }
 
@@ -193,6 +266,19 @@ impl Http {
     pub fn set_onion(&self, base: &str, onion: Option<&str>) -> bool {
         !matches!(self.route, Route::Direct(_)) && self.onions.set(base, onion)
     }
+
+    /// How much longer the host of `url` is passed over in the background,
+    /// since it did not answer, if it is.
+    pub fn resting(&self, url: &str) -> Option<Duration> {
+        self.hosts.left(origin(url), Instant::now())
+    }
+
+    /// How fast the host of `url` answers: its fastest answer of the last
+    /// minutes, a round trip on a connection or circuit already open
+    /// rather than one opened for it. None if it answered none lately.
+    pub fn answers_in(&self, url: &str) -> Option<Duration> {
+        self.hosts.fastest(origin(url), Instant::now())
+    }
 }
 
 impl Transport for Http {
@@ -204,7 +290,25 @@ impl Transport for Http {
         // A large body on circuits of its own, as a download: sent beside
         // others to the same host.
         let timeout = body.as_ref().and_then(|b| sending(b.len()));
-        self.exchange(url, body, MAX_ANSWER, timeout, timeout.is_some())
+        let origin = origin(url).to_owned();
+        let exchange = self.exchange(url, body, MAX_ANSWER, timeout, timeout.is_some());
+        // A host not answering lately: passed over in the background, not
+        // waited on again for minutes, each answer or none told.
+        async move {
+            if licash_wallet::in_background_now() {
+                if let Some(left) = self.hosts.left(&origin, Instant::now()) {
+                    return Err(format!(
+                        "{origin} did not answer lately, asked again in {} s",
+                        left.as_millis().div_ceil(1000)
+                    ));
+                }
+            }
+            let asked = Instant::now();
+            let answer = exchange.await;
+            let took = answer.is_ok().then(|| asked.elapsed());
+            self.hosts.answered(&origin, took, Instant::now());
+            answer
+        }
     }
 
     fn download(
@@ -450,6 +554,73 @@ mod tests {
         let url = answering(1001);
         let refused = http.download(&url, 1000).await.unwrap_err();
         assert!(refused.contains("an answer over 1000 bytes"), "{refused}");
+    }
+
+    #[test]
+    fn a_host_not_answering_rests_longer_each_time_until_it_answers() {
+        assert_eq!(origin("https://hub.example:8443/v1/info?x=1"), "https://hub.example:8443");
+        assert_eq!(origin("http://abc.onion"), "http://abc.onion");
+        let hosts = Hosts::default();
+        let (hub, now) = ("https://hub.example", Instant::now());
+        assert_eq!(hosts.left(hub, now), None);
+        for (times, rest) in RESTS.iter().chain([&RESTS[3]]).enumerate() {
+            let at = now + Duration::from_secs(1000 * times as u64);
+            hosts.answered(hub, None, at);
+            assert_eq!(hosts.left(hub, at), Some(*rest));
+            assert_eq!(hosts.left(hub, at + *rest - Duration::from_secs(1)), Some(Duration::from_secs(1)));
+            assert_eq!(hosts.left(hub, at + *rest), None);
+            assert_eq!(hosts.left("https://other.example", at), None);
+        }
+        hosts.answered(hub, Some(Duration::from_secs(2)), now);
+        assert_eq!(hosts.left(hub, now), None);
+        hosts.answered(hub, None, now);
+        assert_eq!(hosts.left(hub, now), Some(RESTS[0]));
+    }
+
+    #[test]
+    fn a_host_answers_as_fast_as_its_fastest_answer_lately() {
+        let hosts = Hosts::default();
+        let (hub, now) = ("https://hub.example", Instant::now());
+        let ms = Duration::from_millis;
+        assert_eq!(hosts.fastest(hub, now), None);
+        // A circuit opened for the first: the next, on it, is the round trip.
+        hosts.answered(hub, Some(ms(30_000)), now);
+        hosts.answered(hub, Some(ms(900)), now);
+        hosts.answered(hub, Some(ms(4_000)), now + ms(1_000));
+        assert_eq!(hosts.fastest(hub, now + ms(1_000)), Some(ms(900)));
+        // Not answering keeps it; minutes later, a slower one replaces it.
+        hosts.answered(hub, None, now + ms(2_000));
+        assert_eq!(hosts.fastest(hub, now + ms(2_000)), Some(ms(900)));
+        let later = now + FASTEST_FOR;
+        assert_eq!(hosts.fastest(hub, later), None);
+        hosts.answered(hub, Some(ms(1_500)), later);
+        assert_eq!(hosts.fastest(hub, later), Some(ms(1_500)));
+    }
+
+    /// Asked in the background, a host that did not answer is passed over
+    /// at once while it rests; asked by someone waiting, it is asked still.
+    #[tokio::test]
+    async fn a_host_not_answering_is_passed_over_in_the_background_only() {
+        let http = Http::new(None).unwrap();
+        // A port nothing listens at.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/info", closed.local_addr().unwrap());
+        drop(closed);
+        let refused = http.request(&url, None).await.unwrap_err();
+        assert!(!refused.contains("did not answer lately"), "{refused}");
+        let passed = licash_wallet::in_background(http.request(&url, None)).await.unwrap_err();
+        assert!(passed.contains("did not answer lately, asked again in 30 s"), "{passed}");
+        assert!(http.resting(&url).is_some());
+        let asked = http.request(&url, None).await.unwrap_err();
+        assert!(!asked.contains("did not answer lately"), "{asked}");
+        // Answering again: asked in the background at once.
+        let host = answering(2);
+        http.hosts.answered(&host, None, Instant::now());
+        let answer = http.request(&format!("{host}/v1/info"), None).await.unwrap();
+        assert_eq!(answer.status, 200);
+        assert!(http.answers_in(&format!("{host}/")).is_some());
+        assert_eq!(http.answers_in(&url), None);
+        assert!(licash_wallet::in_background(http.request(&host, None)).await.is_ok());
     }
 
     #[test]

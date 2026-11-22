@@ -12,6 +12,9 @@
 //! the wallet from the payments it took, one payment's delivery from
 //! another's. What the requests say links them still: a spend of the notes
 //! a take made, the inbox entry a payment on is taken by.
+//!
+//! What runs by itself is marked as such the same way ([`in_background`]):
+//! no one waits on it, so a host that did not answer lately is passed over.
 
 use std::{
     cell::Cell,
@@ -109,9 +112,83 @@ pub fn current_lane() -> Option<u64> {
     LANE.with(Cell::get).flatten()
 }
 
+thread_local! {
+    /// Whether the future being polled on this thread runs by itself, no
+    /// one waiting on it ([`in_background`]).
+    static BACKGROUND: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A future polled in the background, whether it was put back after.
+struct Unwaited<F>(Pin<Box<F>>);
+
+impl<F: Future> Future for Unwaited<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                BACKGROUND.with(|b| b.set(self.0));
+            }
+        }
+        let _restore = Restore(BACKGROUND.with(|b| b.replace(true)));
+        self.0.as_mut().poll(cx)
+    }
+}
+
+/// `run`, and whatever it awaits, as what runs by itself, no one waiting
+/// on it: a transport may pass over at once a host that did not answer
+/// lately ([`in_background_now`]), rather than wait on it again.
+pub async fn in_background<F: Future>(run: F) -> F::Output {
+    Unwaited(Box::pin(run)).await
+}
+
+/// What a synchronous caller blocks on runs in the background while this
+/// is held ([`in_background`]): a runtime's `block_on` polls on its thread.
+/// Not for async code, which may move between threads.
+pub struct Background(bool);
+
+impl Background {
+    /// Until dropped, on this thread.
+    pub fn enter() -> Self {
+        Self(BACKGROUND.with(|b| b.replace(true)))
+    }
+}
+
+impl Drop for Background {
+    fn drop(&mut self) {
+        BACKGROUND.with(|b| b.set(self.0));
+    }
+}
+
+/// Whether the request being asked runs in the background ([`in_background`]).
+pub fn in_background_now() -> bool {
+    BACKGROUND.with(Cell::get)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_background_holds_what_it_awaits_and_ends_with_it() {
+        assert!(!in_background_now());
+        let (inner, laned) = in_background(async {
+            tokio::task::yield_now().await;
+            let laned = in_lane(Lane::Fresh, async { in_background_now() }).await;
+            (in_background_now(), laned)
+        })
+        .await;
+        assert!(inner && laned);
+        assert!(!in_background_now());
+        {
+            let _background = Background::enter();
+            assert!(in_background_now());
+            assert!(in_background(async { in_background_now() }).await);
+            assert!(in_background_now());
+        }
+        assert!(!in_background_now());
+    }
 
     #[tokio::test]
     async fn an_operation_holds_its_steps_and_a_fresh_lane_is_new_within_it() {
