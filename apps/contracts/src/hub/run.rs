@@ -265,6 +265,7 @@ impl Openings {
                     .map_err(Refused::unavailable)?;
                 let hub = Hub::new(*quote, bounds, payout);
                 let (hub, out) = stepped(&self.heavy, hub, Input::Message(message), ctx).await?;
+                self.reads(&hub).await?;
                 let out = self.keep(&id, out)?;
                 let state = hub.to_bytes();
                 // Counted again as stored, in one hold of the store: others
@@ -406,6 +407,25 @@ impl Openings {
             )));
         }
         Ok(())
+    }
+
+    /// Refused 503, and its operator told, unless the hub's prover reads a
+    /// statement's input of `hub`'s Base with the program it names: before
+    /// the hub keeps or signs anything of it. Without a prover (the mock
+    /// authority's proofs), no program to read it.
+    async fn reads(&self, hub: &Hub) -> Result<(), Refused> {
+        let (Some(prover), Some(base)) = (&self.prover, hub.base()) else {
+            return Ok(());
+        };
+        let Err(e) = prover.reads(base).await else {
+            return Ok(());
+        };
+        let why = format!(
+            "the hub's program reads no statement of the contract it was asked to open \
+             ({e:#}): it opens none, as it could prove nothing of them"
+        );
+        prover.alert(&why);
+        Err(Refused::unavailable(why))
     }
 
     /// A state must never reference an artifact that has not reached disk.

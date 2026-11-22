@@ -578,9 +578,17 @@ without making one it committed to late; contested by more holders at once
 than it can prove for, it proves for the largest stakes and lets the others'
 timeouts pay them (a claim is decided on the poll after the one that first
 saw it, all of them known). It plans with its prover's speed, measured at
-startup (`licash-r0 probe`, then `licash-r0 bench` once per device, kept in
+startup (`licash-r0 probe <program>`, then `licash-r0 bench` once per device, kept in
 `<data>/hp-proofs/bench.json`: delete it to measure again, as after
-changing the GPU). So that no claim it could reduce is paid by a timeout,
+changing the GPU). The probe also executes the program contracts open
+under on the benchmark's input, which the image's own library made: a
+program built before a change of the format of notes, spends or Bases
+panics reading it, and leaves the prover not ready. Before it keeps or
+signs anything of a new opening, the hub executes the program the
+opening's Base names on an input of that Base (`licash-r0 hp-reads`), and
+refuses the opening with 503, and alerts, if the program can't read it: it
+could prove nothing of such a contract, and each claim of it would be paid
+all it asks. A hub of the mock authority has no prover and checks neither. So that no claim it could reduce is paid by a timeout,
 it opens a contract only if its prover could make, one after another in an
 assert window, the largest proof of an exit of every contract it is
 committed to and of the new one (all its headers to the close, and the

@@ -427,6 +427,17 @@ impl Prover {
         self.0.alert(message);
     }
 
+    /// That the program `base` names reads a statement's input of it:
+    /// executed on one before the hub signs anything of its contract. A
+    /// program that can't read its own Base proves nothing of its contract,
+    /// and each claim of it would be paid all it asks.
+    pub async fn reads(&self, base: &licash::base::Base) -> Result<()> {
+        let inner = self.0.clone();
+        let bytes = base.to_bytes();
+        let program = base.parts().recipe.program;
+        tokio::task::spawn_blocking(move || inner.reads(&bytes, &program)).await?
+    }
+
     /// How many proofs of the smallest contract's statement (the
     /// benchmark's input, 15 headers) the prover makes in `blocks`: what
     /// bounds the exits it can contest at once. None until it is ready.
@@ -755,17 +766,48 @@ impl Inner {
         self.wake.notify_all();
     }
 
+    /// That `program` reads a statement's input of the Base of `bytes`
+    /// (`hp-reads`).
+    fn reads(&self, bytes: &[u8], program: &[u8; 32]) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let digest = licash::crypto::tagged_hash("licash/hub/reads", &[bytes]);
+        let path = self
+            .dir
+            .join(format!("reads-{}.base", hex::encode(&digest[..8])));
+        std::fs::write(&path, bytes)?;
+        let out = self
+            .command()
+            .arg("hp-reads")
+            .arg(&path)
+            .arg(hex::encode(program))
+            .output();
+        let _ = std::fs::remove_file(&path);
+        let out = out.with_context(|| format!("{} doesn't run", self.command))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // Its error, not the guest's panic before it.
+            let why = stderr.find("Error:").map_or(&*stderr, |at| &stderr[at..]);
+            bail!("{}", why.trim().replace('\n', " "));
+        }
+        Ok(())
+    }
+
     fn command(&self) -> Command {
         let mut cmd = Command::new(&self.command);
         cmd.stdin(Stdio::null());
         cmd
     }
 
-    /// Probe, then benchmark unless measured on this device before.
+    /// Probe, then benchmark unless measured on this device before. The
+    /// probe executes the program contracts open under on the benchmark's
+    /// input, which the prover's own library made: one built before a change
+    /// of format leaves the prover not ready, and no contract opened.
     fn ready(&self) -> Result<Speed> {
+        let program = hex::encode(self.program);
         let out = self
             .command()
             .arg("probe")
+            .arg(&program)
             .output()
             .with_context(|| format!("no prover: {} doesn't run", self.command))?;
         if !out.status.success() {
@@ -784,7 +826,6 @@ impl Inner {
                     .collect()
             })
             .unwrap_or_default();
-        let program = hex::encode(self.program);
         if !uninstalled(&probe, &[self.program]).is_empty() {
             problems.push(format!(
                 "the program contracts open under, {program}, is not installed"
@@ -1517,6 +1558,50 @@ mod tests {
         p.0.state().readiness.clone()
     }
 
+    /// A contract's Base is read by the program it names, `hp-reads <base>
+    /// <program>`, its bytes kept only as long: refused with the prover's
+    /// reason if the program doesn't read it.
+    #[tokio::test]
+    async fn a_base_its_program_does_not_read_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = licash_contract::opening::testing::base(&[3; 32]);
+        let program = hex::encode(base.parts().recipe.program);
+        let script = format!(
+            r#"echo "$@" >> "$(dirname "$0")/calls"
+case "$1" in
+hp-reads) cmp -s "$2" "$(dirname "$0")/expected" && [ "$3" = {program} ] && exit 0
+  echo 'thread panicked: the statement'"'"'s input' >&2
+  echo 'Error: it does not read the input this build'"'"'s library makes' >&2; exit 1 ;;
+esac
+"#
+        );
+        std::fs::write(dir.path().join("expected"), base.to_bytes()).unwrap();
+        let p = fake(dir.path(), &script);
+        p.reads(&base).await.unwrap();
+        // Another Base, or the same of another program: not read.
+        let mut parts = base.parts().clone();
+        parts.nonce = [9; 32];
+        let other = licash::base::Base::new(parts).unwrap();
+        let e = p.reads(&other).await.unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "Error: it does not read the input this build's library makes"
+        );
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        let reads: Vec<_> = calls
+            .lines()
+            .filter(|l| l.starts_with("hp-reads"))
+            .collect();
+        assert_eq!(reads.len(), 2, "{calls}");
+        assert!(reads.iter().all(|l| l.ends_with(&program)), "{calls}");
+        let kept = std::fs::read_dir(p.0.dir.clone()).unwrap();
+        assert!(
+            kept.flatten()
+                .all(|e| !e.file_name().to_string_lossy().starts_with("reads-")),
+            "a Base left behind"
+        );
+    }
+
     /// Probed, benchmarked once, then each proof committed to made once its
     /// input is frozen, by `hp-prove <input> <dir> <program>`.
     #[test]
@@ -1556,7 +1641,7 @@ esac
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
         let input = p.dir(&[1; 32]).join("input.bin");
         let lines: Vec<_> = calls.lines().collect();
-        assert_eq!(lines[0], "probe");
+        assert_eq!(lines[0], format!("probe {id}"));
         assert!(
             lines[1].starts_with("bench ") && lines[1].ends_with(&id),
             "{calls}"
@@ -1577,7 +1662,7 @@ esac
             matches!(readiness(&p), Some(Readiness::Ready(_)))
         });
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
-        assert_eq!(calls, "probe\n");
+        assert_eq!(calls, format!("probe {id}\n"));
     }
 
     /// A hub's header chain of 20 blocks the node has, a dispute asking
