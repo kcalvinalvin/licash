@@ -22,6 +22,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import org.licash.core.ContractFit
 import org.licash.core.ContractQuote
 import org.licash.core.ContractRange
 import org.licash.core.DepositCoin
@@ -33,6 +34,7 @@ import org.licash.wallet.Engine
 import org.licash.wallet.digits
 import org.licash.wallet.percent
 import org.licash.wallet.sat
+import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 
 /**
@@ -64,14 +66,38 @@ internal fun OfferSheet(engine: Engine, q: ContractQuote, ready: Boolean, dismis
 }
 
 /**
- * The contract within `range` over `blocks` that `coin` pays for whole
- * ([contractFit]): at least as large as the cover suggested, else the
- * least the hub allows; none if no contract takes the coin. The coin is spent
- * whole, the price and the rest of it her part, issued back to her as notes.
+ * The contracts within `range` over `blocks` that `coin` pays for whole
+ * ([contractFit]), one of each cap, smallest first: none if no contract
+ * takes the coin. The coin is spent whole, the price and the rest of it her
+ * part, issued back to her as notes; the rest of the cap is the hub's.
  */
-internal fun fitOf(q: ContractQuote, range: ContractRange, blocks: UInt, coin: DepositCoin) =
-    contractFit(range, blocks, coin.value, q.suggestedCap, q.dust, q.denominations, q.fundedNotes)
-        ?: contractFit(range, blocks, coin.value, range.minCap, q.dust, q.denominations, q.fundedNotes)
+internal fun fitsOf(q: ContractQuote, range: ContractRange, blocks: UInt, coin: DepositCoin): List<ContractFit> =
+    fitsFrom(range.minCap) { least ->
+        contractFit(range, blocks, coin.value, least, q.dust, q.denominations, q.fundedNotes)
+    }
+
+/** Each contract `fit` gives of `least` sat at least and above, the smallest it finds above the last. */
+internal fun fitsFrom(least: ULong, fit: (least: ULong) -> ContractFit?): List<ContractFit> = buildList {
+    var from = least
+    while (true) {
+        val found = fit(from)?.takeIf { it.cap >= from } ?: break
+        add(found)
+        if (found.cap == ULong.MAX_VALUE) break
+        from = found.cap + 1uL
+    }
+}
+
+/**
+ * The contract offered at first of `fits` for a coin of `coin` sat: the
+ * smallest covering half again the coin, room to be paid more, else the
+ * largest the hub allows for it.
+ */
+internal fun suggestedFit(fits: List<ContractFit>, coin: ULong): ContractFit? =
+    fits.firstOrNull { it.cap >= coin + coin / 2uL } ?: fits.lastOrNull()
+
+/** The contract offered at first for `coin`, if one takes it whole. */
+internal fun fitOf(q: ContractQuote, range: ContractRange, blocks: UInt, coin: DepositCoin): ContractFit? =
+    suggestedFit(fitsOf(q, range, blocks, coin), coin.value)
 
 /**
  * Protection of terms chosen within what its hub allows: what it covers,
@@ -105,7 +131,11 @@ internal fun ChooseSheet(
         val sorted = coins.sortedBy { it.value }
         mutableStateOf(sorted.firstOrNull { fitOf(q, range, blocks, it) != null } ?: sorted.firstOrNull())
     }
-    val fit = coin?.let { fitOf(q, range, blocks, it) }
+    // The cap chosen, kept while the coin and how long take it; at first, or
+    // once they do not, the one suggested for the coin.
+    var chosenCap by remember(q, coin) { mutableStateOf<ULong?>(null) }
+    val fits = coin?.let { fitsOf(q, range, blocks, it) }.orEmpty()
+    val fit = fits.firstOrNull { it.cap == chosenCap } ?: coin?.let { suggestedFit(fits, it.value) }
     val capped = fit?.cap ?: range.minCap
     val funded = fit?.funded ?: 0uL
     // What the hub is paid: its fee and interest, then the reserve, hers.
@@ -131,6 +161,18 @@ internal fun ChooseSheet(
     }
     Sheet("Protect at ${name(q.hub)}", dismiss) {
         Line("Covers up to", sat(capped), tag = "quote-cap")
+        // Larger, the hub funds more of it: room to be paid more, at its interest.
+        if (fit != null && fits.size > 1) {
+            val at = fits.indexOf(fit)
+            Slider(
+                value = at.toFloat(),
+                onValueChange = { chosenCap = fits[it.roundToInt().coerceIn(fits.indices)].cap },
+                valueRange = 0f..fits.lastIndex.toFloat(),
+                steps = fits.size - 2,
+                modifier = Modifier.testTag("contract-cap"),
+            )
+            Line("The hub's part", sat(capped - funded), tag = "contract-hub-part")
+        }
         Line("For", span(protectsFor.toLong(), LocalBlockSeconds.current), tag = "quote-for")
         if (fit != null) {
             Row(verticalAlignment = Alignment.CenterVertically) {

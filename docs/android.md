@@ -306,11 +306,15 @@ to her as notes at that hub once its funding is 3 blocks deep (or claimed by a
 recovery should the hub never issue it), the hub charging its interest on its
 own part only. No change comes back from the coin, so the sheet shows, for the
 coin chosen (at first the smallest that a contract takes), the contract it
-takes: the smallest cover the hub allows that does (at a hub that lets the
-wallet choose, `--contracts-max-cap`, among its sizes, `2^n - 1` sat, at most
-the hub's `--contracts-per-coin` times the coin paying), her part, and why none
-does, a coin short of the price or beyond what the hub's largest contract
-takes; a slider chooses how long it lasts (at first half a year). With no coin
+takes: at first the smallest cover at least half again the coin, room to be
+paid more, else the largest the hub allows (at a hub that lets the wallet
+choose, `--contracts-max-cap`, among its sizes, `2^n - 1` sat, at most the
+hub's `--contracts-per-coin` times the coin paying), a slider choosing among
+the covers that take it when several do, the hub's part and hers, and why
+none does, a coin short of the price or beyond what the hub's largest
+contract takes; a slider chooses how long it lasts (at first half a year).
+Covers being powers of two, a hub allowing 2 times the coin leaves most
+coins one. With no coin
 on Bitcoin, the sheet says to cash out to the wallet first. Priced live as the
 hub prices it: its cost (the hub's opening fee and its yearly interest on each
 part, itemized on a tap) apart from her reserve, "refundable", each with an
