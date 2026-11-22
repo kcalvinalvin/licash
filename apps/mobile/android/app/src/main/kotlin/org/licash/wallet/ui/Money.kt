@@ -165,7 +165,8 @@ private fun Summary(
             )
         }
     }
-    Line("Notes", digits(noteCount(notes)), tag = "note-count")
+    // In line with the total above it, not the groups' insides.
+    Line("Notes", digits(noteCount(notes)), Modifier.padding(horizontal = 4.dp), tag = "note-count")
     Group("") {
         held.forEach { holding ->
             // How much of it its contracts cover, and the notes it is in.
@@ -234,6 +235,9 @@ private fun Summary(
     }
 }
 
+/** How bitcoin comes to be held, said while none is. */
+internal const val NOTHING_ONCHAIN = "Receive at a Bitcoin address, then add it here"
+
 /** What the On Bitcoin page does with bitcoin held, said under its row. */
 internal const val ADD_ONCHAIN = "Add it to your balance, protected or not"
 
@@ -282,7 +286,7 @@ private fun OnBitcoin(engine: Engine, ui: Ui, go: (String?) -> Unit) {
         Triple("Arriving", coming, "coming"),
     ).filter { it.second > 0uL }
     Group("") {
-        if (rows.isEmpty()) Entry("Nothing here")
+        if (rows.isEmpty()) Entry("Nothing here", sub = NOTHING_ONCHAIN)
         rows.forEachIndexed { i, (label, amount, tag) ->
             if (i > 0) Divider()
             Line(label, sat(amount), tag = tag)
