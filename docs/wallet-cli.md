@@ -254,7 +254,10 @@ paying out on chain: the wallet locks the amount and the fees to the
 provider, which locks a coin under the lock's hash, and the wallet claims
 that coin, paying the address exactly `amount`, once it finds it confirmed
 on its own chain source. Nothing is revealed before; a payout that fails
-leaves the lock to return once expired. `--max-fee` bounds everything on
+leaves the lock to return once expired. The chain source is trusted for
+that confirmation, and its claim reveals the lock's preimage: use your
+own node or one you trust, never one the provider runs or names, or the
+provider could show a coin that is not on Bitcoin and take the lock. `--max-fee` bounds everything on
 top of the amount (the claim's fee, the provider's and the hub's). Without
 `--provider`, the wallet takes one announced on Nostr (on `--relay`, else
 the relays its hubs name) that pays the amount out within `--max-fee`: one
