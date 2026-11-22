@@ -42,6 +42,7 @@ import org.licash.core.ContractSafety
 import org.licash.core.ContractInspection
 import org.licash.core.ContractState
 import org.licash.core.Network
+import org.licash.core.OpeningStep
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
 import org.licash.core.blockSeconds
@@ -118,7 +119,7 @@ internal fun CoverRow(
                 // How fast what it sends and gets goes, while it does.
                 c.transfer?.takeIf { forcing == null && step != null }?.let {
                     Text(
-                        transferred(it),
+                        transferred(it, busy = c.step is OpeningStep.Preparing),
                         modifier = Modifier.testTag("contract-transfer"),
                         style = MaterialTheme.typography.bodySmall,
                         color = colors.onSurfaceVariant,

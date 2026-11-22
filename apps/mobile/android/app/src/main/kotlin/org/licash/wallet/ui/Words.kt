@@ -370,11 +370,13 @@ fun ticking(seconds: ULong): String {
 /**
  * What setting a protection up sent and got so far, its speed and about
  * how long the rest takes at it: `12 MB of about 100 MB · 1.5 MB/s · about
- * 1 min left`. Its speed once a second has passed, the rest once some is.
+ * 1 min left`. Its speed once a second has passed, the rest once some is;
+ * neither while the wallet works out a step itself (`busy`), which its
+ * seconds count too: what little went then said nothing of the network.
  */
-fun transferred(t: Transfer): String {
+fun transferred(t: Transfer, busy: Boolean = false): String {
     val parts = mutableListOf("${megabytes(t.bytes)} of about ${megabytes(t.expected)}")
-    if (t.seconds > 0uL && t.bytes > 0uL) {
+    if (!busy && t.seconds > 0uL && t.bytes > 0uL) {
         val rate = t.bytes / t.seconds
         parts += "${megabytes(rate)}/s"
         if (t.expected > t.bytes && rate > 0uL) {
@@ -382,7 +384,8 @@ fun transferred(t: Transfer): String {
             parts += when {
                 left == 0L -> "almost done"
                 left < 60 -> "about $left s left"
-                else -> "about ${(left + 59) / 60} min left"
+                left < 90 * 60 -> "about ${(left + 59) / 60} min left"
+                else -> "about ${(left + 1800) / 3600} h left"
             }
         }
     }
