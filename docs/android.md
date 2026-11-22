@@ -108,8 +108,9 @@ rows alone are no reason to write one, and an unreadable `stats` component
 ### Settings
 
 Settings is one page: the hubs (each tapped for its fees, more added by
-address or found on Nostr; one added from those found is listed by the name
-it announced, kept in the app's settings, its address under it), Backup, Bitcoin (each step of catching up:
+address or found on Nostr; one added from those found goes by the name it
+announced, kept in the app's settings, in the hubs, the balance and
+protecting; its address under it in the hubs), Backup, Bitcoin (each step of catching up:
 Tor, the nodes, the block headers and filters against the best peer's
 height, and the wallet's payments from its birthday, with their progress),
 Tor (on or off, and a page with its bootstrap progress, what it is doing,

@@ -61,6 +61,7 @@ internal fun OfferSheet(engine: Engine, q: ContractQuote, ready: Boolean, dismis
         fitting,
         ready,
         hubCover(q.hub, holding, ui.contracts, emptyList()),
+        hub = engine.called(q.hub),
         title = "Add to balance, protected",
         verb = "Add",
         open = { chosen, price ->
@@ -146,7 +147,9 @@ internal fun ChooseSheet(
     cover: HubCover,
     open: (Chosen, price: ULong) -> Unit,
     dismiss: () -> Unit,
-    title: String = "Protect at ${name(q.hub)}",
+    // The hub, as named to her ([called]).
+    hub: String,
+    title: String = "Protect at $hub",
     verb: String = "Protect",
     decline: (() -> Unit)? = null,
 ) {
@@ -178,7 +181,7 @@ internal fun ChooseSheet(
             CoverBar(after, Modifier.padding(top = 4.dp, bottom = 6.dp))
             after.says?.let {
                 Text(
-                    "At ${name(q.hub)} then: ${it.replaceFirstChar { c -> c.lowercase() }}",
+                    "At $hub then: ${it.replaceFirstChar { c -> c.lowercase() }}",
                     modifier = Modifier.padding(bottom = 8.dp).testTag("contract-after"),
                     style = MaterialTheme.typography.bodySmall,
                     color = colors.onSurfaceVariant,

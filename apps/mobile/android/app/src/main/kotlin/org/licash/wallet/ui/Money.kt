@@ -84,7 +84,7 @@ fun Money(
             ON_BITCOIN -> TopBar("On Bitcoin", back = { go(null) }) {
                 Info("On Bitcoin", ON_BITCOIN_MEANS)
             }
-            else -> TopBar(name(at), back = { go(null) })
+            else -> TopBar(engine.called(at), back = { go(null) })
         }
         error?.let {
             Text(
@@ -172,7 +172,7 @@ private fun Summary(
             // How much of it its contracts cover, and the notes it is in.
             val cover = hubCover(holding.hub, holding, ui.contracts, notes)
             Entry(
-                name(holding.hub),
+                engine.called(holding.hub),
                 value = sat(holding.available + holding.pending),
                 sub = listOfNotNull(cover.says, cover.noteWords.takeIf { cover.notes > 0uL })
                     .joinToString(" · ").ifEmpty { null },
@@ -304,7 +304,7 @@ private fun OnBitcoin(engine: Engine, ui: Ui, go: (String?) -> Unit) {
             Group("Protect at") {
                 hubs.forEachIndexed { i, hub ->
                     if (i > 0) Divider()
-                    Entry(engine.hubName(hub.url) ?: name(hub.url), tag = "protect-at", onClick = { go(hub.url) })
+                    Entry(engine.called(hub.url), tag = "protect-at", onClick = { go(hub.url) })
                 }
             }
         }
@@ -353,3 +353,6 @@ internal const val UNPROTECTED_MOVE = "In your balance, it is held at your hub: 
 internal const val ON_BITCOIN_MEANS = "Bitcoin you hold yourself: already safe, but paid only on Bitcoin, " +
     "slowly. Add it to your balance to pay in Licash: protected, through a contract at a hub that " +
     "covers it, or without protection, on the hub's word."
+
+/** A hub of the wallet's, by the name it announced when added, else by its address. */
+internal fun Engine.called(url: String): String = hubName(url) ?: name(url)

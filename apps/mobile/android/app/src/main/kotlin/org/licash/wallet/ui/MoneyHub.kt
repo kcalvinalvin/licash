@@ -213,10 +213,12 @@ internal fun HubPage(
                     engine.openContract(q.hub, price, chosen)
                 },
                 dismiss = { quote = null },
+                hub = engine.called(q.hub),
             )
         } else {
             ProtectSheet(
                 q,
+                engine.called(q.hub),
                 open = {
                     quote = null
                     engine.openContract(q.hub, q.price)

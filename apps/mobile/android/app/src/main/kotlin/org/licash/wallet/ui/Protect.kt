@@ -416,9 +416,9 @@ internal const val SETUP_TAKES = "A few minutes, then a confirmation on Bitcoin"
  * whole: it pays the price, and the rest of it is her part of the contract.
  */
 @Composable
-internal fun ProtectSheet(q: ContractQuote, open: () -> Unit, cashOutFirst: () -> Unit, dismiss: () -> Unit) {
+internal fun ProtectSheet(q: ContractQuote, hub: String, open: () -> Unit, cashOutFirst: () -> Unit, dismiss: () -> Unit) {
     val download = android.text.format.Formatter.formatShortFileSize(LocalContext.current, q.download.toLong())
-    Sheet("Protect at ${name(q.hub)}", dismiss) {
+    Sheet("Protect at $hub", dismiss) {
         Line("Covers up to", sat(q.cap), tag = "quote-cap")
         Line("For", span(q.protectsFor.toLong(), LocalBlockSeconds.current), tag = "quote-for")
         FeeLine("Cost", q.price, q.cap, tag = "quote-price", value = sat(q.price), breakdown = setupCost(q.cap, q.price))
