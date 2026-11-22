@@ -249,6 +249,20 @@ class SyncTest {
     }
 
     @Test
+    fun the_index_a_block_or_two_behind_is_up_to_date() {
+        for (behind in 1..INDEX_SLACK) {
+            val height = (900 - behind).toUInt()
+            val ui = Ui(chain = caughtUp, hubs = listOf(hub()), scan = scan(from = 800u, next = height + 1u, height = height))
+            assertEquals(Progress.DONE, stages(ui).last().state)
+            assertEquals("Up to date", stages(ui).last().detail)
+            assertFalse(catchingUp(ui))
+        }
+        val height = (900 - INDEX_SLACK - 1).toUInt()
+        val further = Ui(chain = caughtUp, hubs = listOf(hub()), scan = scan(from = 800u, next = height + 1u, height = height))
+        assertEquals(Progress.DOING, stages(further).last().state)
+    }
+
+    @Test
     fun without_a_hub_payments_wait_for_one() {
         assertEquals("Choose a hub first", stages(Ui(chain = caughtUp)).last().detail)
     }

@@ -150,8 +150,10 @@ fun stages(ui: Ui): List<Stage> {
     val reachable = scan.height.toLong()
     val from = scan.from.toLong().takeIf { it in 1..next } ?: next
     // Silent payments are found from each block's index, made by the hubs
-    // from the full block once the light client has it, so a little later.
-    val lagging = reachable < filters
+    // from the full block once the light client has it, so a little later:
+    // up to INDEX_SLACK blocks behind is the usual wait after a block, up
+    // to date, not catching up.
+    val lagging = filters - reachable > INDEX_SLACK
     val looked = next > reachable
     val doing = when {
         looked && lagging -> "Checked to block ${block(reachable)}, $INDEX_WAIT ${block(reachable + 1)}"
@@ -174,6 +176,7 @@ internal const val HEADERS_DOWNLOAD = "Block headers download"
 internal const val NODES = "Bitcoin nodes"
 internal const val PAYMENTS = "Your payments"
 private const val INDEX_WAIT = "waiting for the silent payment index of block"
+internal const val INDEX_SLACK = 2
 
 /**
  * A step under way in a few plain words: in advanced mode, its name and
