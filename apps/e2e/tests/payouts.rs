@@ -218,3 +218,101 @@ async fn notes_are_paid_out_to_a_silent_payment_address() -> anyhow::Result<()> 
     .await?;
     Ok(())
 }
+
+/// Whether Bitcoin Core's mempool takes a claim of a coin locked to the
+/// claim leaf of a payout's HTLC, `sized` or not, by a preimage of `len`
+/// bytes: the coin paid, mined, and the claim signed by the claim key.
+async fn claim_taken(eco: &Eco, sized: bool, len: usize) -> anyhow::Result<bool> {
+    use bitcoin::{
+        consensus::encode::serialize_hex,
+        hashes::{sha256, Hash},
+        key::{Keypair, Secp256k1},
+        secp256k1::{Message, SecretKey},
+        sighash::{Prevouts, SighashCache},
+        taproot::LeafVersion,
+        transaction, Amount, Network, OutPoint, ScriptBuf, Sequence, TapLeafHash, TapSighashType,
+        Transaction, TxIn, TxOut, Txid, Witness,
+    };
+    use licash_onchain::deposit::Htlc;
+
+    let secp = Secp256k1::new();
+    let claim = SecretKey::from_slice(&[0x31; 32])?;
+    let refund = SecretKey::from_slice(&[0x32; 32])?;
+    let preimage = vec![7; len];
+    let htlc = Htlc {
+        hash: sha256::Hash::hash(&preimage).to_byte_array(),
+        claim: claim.x_only_public_key(&secp).0,
+        refund: refund.x_only_public_key(&secp).0,
+        timeout: 100_000,
+        wait: None,
+        sized,
+    };
+    let value = Amount::from_sat(100_000);
+    let address = htlc.address(Network::Regtest).to_string();
+    let txid = eco.send_to(&address, value.to_sat()).await?;
+    let paid = eco.core("getrawtransaction", json!([txid, true])).await?;
+    let vout = paid["vout"]
+        .as_array()
+        .context("outputs")?
+        .iter()
+        .find(|o| o["scriptPubKey"]["address"] == address.as_str())
+        .and_then(|o| o["n"].as_u64())
+        .context("the coin's output")?;
+    eco.mine(1).await?;
+    let script = htlc.claim_script();
+    let control = htlc
+        .spend_info()
+        .control_block(&(script.clone(), LeafVersion::TapScript))
+        .context("the claim leaf")?;
+    let mut tx = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(txid.parse::<Txid>()?, vout as u32),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: value - Amount::from_sat(1_000),
+            script_pubkey: htlc.script_pubkey(),
+        }],
+    };
+    let prevout = TxOut {
+        value,
+        script_pubkey: htlc.script_pubkey(),
+    };
+    let sighash = SighashCache::new(&tx).taproot_script_spend_signature_hash(
+        0,
+        &Prevouts::All(&[prevout]),
+        TapLeafHash::from_script(&script, LeafVersion::TapScript),
+        TapSighashType::Default,
+    )?;
+    let keypair = Keypair::from_secret_key(&secp, &claim);
+    let signature =
+        secp.sign_schnorr_no_aux_rand(&Message::from_digest(sighash.to_byte_array()), &keypair);
+    let mut witness = Witness::new();
+    witness.push(signature.as_ref());
+    witness.push(&preimage);
+    witness.push(script.as_bytes());
+    witness.push(control.serialize());
+    tx.input[0].witness = witness;
+    let tested = eco
+        .core("testmempoolaccept", json!([[serialize_hex(&tx)]]))
+        .await?;
+    tested[0]["allowed"].as_bool().context("a verdict")
+}
+
+/// A payout's coin is claimed with a preimage of 32 bytes only once its
+/// claim is sized: an unsized claim leaf lets a client who chose the hash
+/// claim with a longer preimage, one no lock takes.
+#[tokio::test]
+#[ignore = "needs the stack of apps/e2e/run.sh"]
+async fn a_sized_claim_takes_a_preimage_of_32_bytes_only() -> anyhow::Result<()> {
+    let eco = Eco::up().await?;
+    assert!(claim_taken(&eco, false, 33).await?);
+    assert!(!claim_taken(&eco, true, 33).await?);
+    assert!(!claim_taken(&eco, true, 31).await?);
+    assert!(claim_taken(&eco, true, 32).await?);
+    Ok(())
+}
