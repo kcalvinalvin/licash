@@ -182,7 +182,7 @@ class SyncTest {
         // Full of mail, junk perhaps: a payment may be hidden there.
         val full = links(mail.copy(relaysReached = true, relaysFull = true)).last()
         assertEquals(Reach.DOWN, full.reach)
-        assertTrue(full.detail.contains("may hide a payment"), full.detail)
+        assertTrue(full.detail, full.detail.contains("may hide a payment"))
         assertEquals(Reach.DOWN, links(mail.copy(relaysReached = false)).maxOf { it.reach })
     }
 
