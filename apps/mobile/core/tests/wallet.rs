@@ -954,6 +954,34 @@ fn a_phone_paid_at_its_fallback_address_finds_it_and_shows_the_next() {
 }
 
 #[test]
+fn a_phone_restored_from_its_words_finds_what_its_fallback_addresses_were_paid() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let born = net.height();
+    let alice = net.wallet("alice", born);
+    let first = alice.bitcoin_code(None).unwrap().address.unwrap();
+    net.mine(1, vec![net.pay_plain(&first, 3_000, 1)]);
+    assert_eq!(scan(&alice, &light), (1, 3_000));
+    let second = alice.bitcoin_code(None).unwrap().address.unwrap();
+    net.mine(1, vec![net.pay_plain(&second, 4_000, 2)]);
+    // Restored from its words alone, no address handed out there yet.
+    let restored = Wallet::from_phrase(
+        net.dir("restored"),
+        alice.backup_phrase().unwrap(),
+        Network::Regtest,
+        Some(born),
+        None,
+    )
+    .unwrap();
+    restored.add_hub(net.url.clone()).unwrap();
+    assert_eq!(scan(&restored, &light), (2, 7_000));
+    assert_eq!(restored.balance().unwrap().onchain, 7_000);
+    // And hands out the next, not one paid.
+    let next = restored.bitcoin_code(None).unwrap().address.unwrap();
+    assert!(next != first && next != second, "{next}");
+}
+
+#[test]
 fn a_phone_sees_payments_to_its_fallback_address_on_their_way() {
     let net = Net::new(true);
     let light = Light::new(&net);

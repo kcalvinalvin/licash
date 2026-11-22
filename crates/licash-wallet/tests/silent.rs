@@ -1406,6 +1406,27 @@ async fn a_fallback_address_is_watched_once_handed_out_and_the_next_once_paid() 
 }
 
 #[tokio::test]
+async fn a_wallet_restored_watches_the_fallback_addresses_its_copy_handed_out() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    // Its copy handed out the first two and was paid at the second.
+    let paying = s.pay_plain(&fallback_of(&s.wallet, 1), 10_000);
+    s.mine(vec![paying]);
+    s.wallet.watch_fallbacks().unwrap();
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.found.len(), 1);
+    // Watching again changes nothing: the next handed out is past it.
+    s.wallet.watch_fallbacks().unwrap();
+    assert_eq!(s.fallback(), fallback_of(&s.wallet, 2));
+    // Paid past the 20 after the first handed out, as its copy went on:
+    // watched 20 past the last paid.
+    let paying = s.pay_plain(&fallback_of(&s.wallet, 1 + 20), 20_000);
+    s.mine(vec![paying]);
+    assert_eq!(s.scan().await.unwrap().found.len(), 1);
+    assert_eq!(s.fallback(), fallback_of(&s.wallet, 22));
+}
+
+#[tokio::test]
 async fn the_fallback_address_handed_out_never_goes_back() {
     let s = setup().await;
     s.wallet.watch_silent(HUB, 1).unwrap();

@@ -424,7 +424,9 @@ fallback address. The app has no screen for it yet.
   contracts need the backup file. They are shown with the wallet's birthday,
   the first block its payments are looked for from (learned on its first
   scan if not known when it was made); restoring with it scans from there,
-  without it from block 1.
+  without it from block 1. A restored wallet watches its fallback addresses
+  from the first, and 20 past the last one paid, so coins its copy received
+  there (a contract's reserve returned, a payout to itself) are found.
 - **Backup file**: everything the wallet holds as of when it is saved (the
   wallet's database, which holds its contracts too, the birthday, the
   instances a contract's recovery needs, contacts), in a checksummed,

@@ -146,7 +146,9 @@ impl Finder {
 
 /// The fallback outputs watched, by key, and the index to hand out next:
 /// past every one paid, never before the highest handed out. None watched
-/// until one is handed out.
+/// until one is handed out (or [`Wallet::watch_fallbacks`]), then those
+/// and [`FALLBACK_GAP`] past the highest handed out or paid, so a wallet
+/// restored finds those its copy handed out one after another.
 fn fallbacks(
     c: &rusqlite::Connection,
     scanner: &Scanner,
@@ -164,12 +166,17 @@ fn fallbacks(
     };
     let mut watched = HashMap::new();
     let mut next = shown;
-    for index in 0..=shown.saturating_add(FALLBACK_GAP) {
+    let mut index = 0u32;
+    while index <= next.max(shown).saturating_add(FALLBACK_GAP) {
         let found = scanner.fallback(index).map_err(invalid)?;
         if paid.contains(&found.output.serialize()) {
             next = next.max(index.saturating_add(1));
         }
         watched.insert(found.output, found);
+        index = match index.checked_add(1) {
+            Some(i) => i,
+            None => break,
+        };
     }
     Ok((watched, next))
 }
@@ -470,8 +477,11 @@ impl<T: Transport> Wallet<T> {
         // Read after the chain's height: an address handed out meanwhile is
         // paid in a later block than these.
         let scanner = self.keys.silent.scanner([]);
-        let (fallbacks, _) = self.store.read(|c| fallbacks(c, &scanner))?;
-        let finder = Finder { scanner, fallbacks };
+        let (watched, _) = self.store.read(|c| fallbacks(c, &scanner))?;
+        let mut finder = Finder {
+            scanner,
+            fallbacks: watched,
+        };
         let mut coins = self.held_outputs()?;
         while scanned.next <= end {
             let count = (end - scanned.next + 1).min(MAX_TWEAK_BLOCKS);
@@ -500,6 +510,10 @@ impl<T: Transport> Wallet<T> {
             };
             self.record_silent(scanned.next, &batch, url.is_none())?;
             scanned.next = last + 1;
+            // A fallback paid: those past it are watched from the next block.
+            if !batch.found.is_empty() {
+                finder.fallbacks = self.store.read(|c| fallbacks(c, &finder.scanner))?.0;
+            }
             scanned
                 .found
                 .extend(
@@ -864,6 +878,21 @@ impl<T: Transport> Wallet<T> {
                 held.insert(OutPoint::new(Txid::from_byte_array(txid), vout), output);
             }
             Ok(held)
+        })
+    }
+
+    /// Watch the fallback addresses from the first on, though none is
+    /// handed out here yet: a wallet restored from its words, whose copy
+    /// may have handed some out and been paid there. Nothing if some are
+    /// watched already.
+    pub fn watch_fallbacks(&self) -> Result<(), Error> {
+        self.store.write(|t| {
+            t.execute(
+                "INSERT INTO silent_fallback (one, shown) VALUES (1, 0)
+                 ON CONFLICT (one) DO NOTHING",
+                [],
+            )?;
+            Ok(())
         })
     }
 

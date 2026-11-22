@@ -106,9 +106,12 @@ impl Wallet {
             .map_err(LicashError::failed)?,
         )
         .map_err(LicashError::failed)?;
-        Self::start(dir, tor, |path, http| {
+        let restored = Self::start(dir, tor, |path, http| {
             licash_wallet::Wallet::create(path, &seed, network.profile(), http)
-        })
+        })?;
+        // Its copy may have handed out fallback addresses, and been paid there.
+        restored.wallet.watch_fallbacks()?;
+        Ok(restored)
     }
 
     /// Freeze contract drivers and take WAL-aware database snapshots before
@@ -161,6 +164,8 @@ impl Wallet {
             }
         }
         let from = self.first_block(chain.as_ref())?.min(next);
+        // As asked, every address the words make: a copy's fallbacks too.
+        self.wallet.watch_fallbacks()?;
         self.wallet.watch_silent(None, from)?;
         tracing::info!(from, next, "looking at Bitcoin again, as asked");
         Ok(Some(from))
