@@ -20,8 +20,9 @@ use licash_api::{
     Code, Fee, Problem,
 };
 use licash_hub::Timing;
+use licash_onchain::deposit::Htlc;
 use licash_swaps::{Chain, Config, PayoutLimits, Provider, Stage, NO_SHOW_VSIZE};
-use licash_wallet::{Blocks, Error, Payout, PayoutState, Response, Transport, Wallet};
+use licash_wallet::{Blocks, Error, Payee, Payout, PayoutState, Response, Transport, Wallet};
 use net::{Link, Net, View, TIMING};
 
 const A: &str = "http://a.test";
@@ -752,6 +753,197 @@ async fn a_claim_mined_in_blocks_replacing_those_looked_through_pays_the_provide
 #[tokio::test]
 async fn a_claim_mined_in_blocks_replacing_those_a_provider_before_looked_through_pays_it() {
     claimed_in_blocks_replacing_those_looked_through(true).await;
+}
+
+/// The payout under way made again as a provider before payout coins were
+/// sized left it: its coin unsized, the only one paid, its funding recorded
+/// if `recorded`, else not, as a provider stopped between paying the coin
+/// and recording it left it; then the provider opened again, upgraded. The
+/// coin's terms, and its transaction, broadcast.
+async fn made_unsized(eco: &Eco, recorded: bool) -> (Htlc, Transaction) {
+    use bitcoin::{
+        consensus::{deserialize, serialize},
+        secp256k1::{Secp256k1, SecretKey, XOnlyPublicKey},
+    };
+    use rusqlite::params;
+
+    let db = rusqlite::Connection::open(eco.dir.path().join("wallet.sqlite")).unwrap();
+    type Row = (Vec<u8>, [u8; 32], u32, [u8; 32], [u8; 32], Vec<u8>, u32);
+    let (id, hash, timeout, claim, refund, sized, vout): Row = db
+        .query_row(
+            "SELECT s.id, s.hash, s.expiry_height, p.claim_key, p.refund_key, f.tx, f.vout
+             FROM provider_swaps s JOIN provider_payouts p ON p.id = s.id
+             JOIN provider_payout_fundings f ON f.id = s.id",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    let sized: Transaction = deserialize(&sized).unwrap();
+    let refund = SecretKey::from_slice(&refund).unwrap();
+    let legacy = Htlc {
+        hash,
+        claim: XOnlyPublicKey::from_slice(&claim).unwrap(),
+        refund: refund.x_only_public_key(&Secp256k1::new()).0,
+        timeout,
+        wait: None,
+        sized: false,
+    };
+    let output = &sized.output[vout as usize];
+    let script = legacy.script_pubkey();
+    assert_eq!(
+        output.script_pubkey,
+        Htlc {
+            sized: true,
+            ..legacy
+        }
+        .script_pubkey()
+    );
+    // The sized coin never paid: its coins the provider's again.
+    eco.pool.txs.lock().unwrap().clear();
+    let txid = sized.compute_txid().to_byte_array();
+    db.execute(
+        "UPDATE silent_coins SET spent_by = NULL WHERE spent_by = ?1",
+        [txid],
+    )
+    .unwrap();
+    db.execute("DELETE FROM silent_spends WHERE txid = ?1", [txid])
+        .unwrap();
+    eco.restart();
+    let paid = eco
+        .provider()
+        .wallet()
+        .spend_silent(
+            Payee::Script(script.clone()),
+            Some(output.value.to_sat()),
+            ONE_SAT,
+        )
+        .unwrap();
+    let at = paid.output.iter().position(|o| o.script_pubkey == script);
+    db.execute(
+        "UPDATE provider_swaps SET address = ?2 WHERE id = ?1",
+        params![id, script.as_bytes()],
+    )
+    .unwrap();
+    match recorded {
+        true => db.execute(
+            "UPDATE provider_payout_fundings SET tx = ?2, vout = ?3 WHERE id = ?1",
+            params![id, serialize(&paid), at.unwrap() as u32],
+        ),
+        false => db.execute("DELETE FROM provider_payout_fundings WHERE id = ?1", [&id]),
+    }
+    .unwrap();
+    drop(db);
+    eco.restart();
+    eco.pool.broadcast(&paid).await.unwrap();
+    (legacy, paid)
+}
+
+/// A coin made unsized before the provider was upgraded, claimed by its
+/// client after: the provider reads the preimage off the claim, by the
+/// unsized claim leaf, and is paid its lock.
+#[tokio::test]
+async fn a_coin_made_unsized_before_an_upgrade_is_followed_to_its_claim() {
+    let eco = Eco::new(STOCK, TERMS).await;
+    let payout = eco.pay_out(1_000).await;
+    let (legacy, coin) = made_unsized(&eco, true).await;
+    eco.pool.mine();
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Locked);
+    let claimed = eco.client_follows(&payout).await;
+    assert_eq!(claimed.state, PayoutState::Claimed);
+    assert_eq!(claimed.funding.unwrap().txid, coin.compute_txid());
+    let mined = eco.pool.mine();
+    let claim = mined.iter().find(|tx| is_claim(tx)).expect("its claim");
+    let leaf = claim.input[0].witness.taproot_leaf_script().unwrap();
+    assert_eq!(leaf.script, legacy.claim_script().as_script());
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Done);
+    assert!(eco.provider_held() > 1_000);
+    assert_eq!(eco.client_follows(&payout).await.state, PayoutState::Done);
+}
+
+/// A payout whose recorded coin pays neither its terms nor them unsized, as
+/// payouts made before a coin's keys were aggregated: said pending each
+/// follow, never failed nor taken back on a guess, and followed again once
+/// its coin is as recorded.
+#[tokio::test]
+async fn a_coin_of_other_terms_than_its_own_is_left_as_it_stands() {
+    let eco = Eco::new(STOCK, TERMS).await;
+    eco.pay_out(1_000).await;
+    eco.pool.mine();
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Locked);
+    let db = rusqlite::Connection::open(eco.dir.path().join("wallet.sqlite")).unwrap();
+    let address: Vec<u8> = db
+        .query_row("SELECT address FROM provider_swaps", [], |r| r.get(0))
+        .unwrap();
+    let other = bitcoin::ScriptBuf::new_p2tr_tweaked(
+        bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
+            bitcoin::XOnlyPublicKey::from_slice(&[0x02; 32]).unwrap(),
+        ),
+    );
+    db.execute("UPDATE provider_swaps SET address = ?1", [other.as_bytes()])
+        .unwrap();
+    eco.mine_to(timeout(&eco));
+    for _ in 0..2 {
+        let pending = eco.provider().follow_payouts(&eco.pool).await.unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert!(pending[0].1.contains("other terms"), "{pending:?}");
+        assert_eq!(eco.stage(), Stage::Locked);
+        assert!(eco.pool.waiting().is_empty());
+        eco.net.mine(A, 1, None);
+    }
+    db.execute("UPDATE provider_swaps SET address = ?1", [address])
+        .unwrap();
+    drop(db);
+    eco.follow().await;
+    assert_eq!(eco.pool.waiting().len(), 1, "its refund");
+    eco.pool.mine();
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Refunded);
+}
+
+/// A coin made unsized before the provider was upgraded, its funding not
+/// recorded, never claimed: the provider finds it among its own spends and
+/// takes it back once timed out, by the unsized coin's refund leaf.
+#[tokio::test]
+async fn a_coin_made_unsized_before_an_upgrade_is_taken_back_once_timed_out() {
+    use bitcoin::{secp256k1::Secp256k1, taproot::ControlBlock, XOnlyPublicKey};
+
+    let eco = Eco::new(STOCK, TERMS).await;
+    eco.pay_out(1_000).await;
+    let (legacy, coin) = made_unsized(&eco, false).await;
+    eco.follow().await;
+    eco.pool.mine();
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Locked);
+    eco.mine_to(timeout(&eco));
+    eco.follow().await;
+    let refund = eco.pool.waiting();
+    assert_eq!(refund.len(), 1);
+    let input = &refund[0].input[0];
+    assert_eq!(input.previous_output.txid, coin.compute_txid());
+    let leaf = input.witness.taproot_leaf_script().unwrap();
+    assert_eq!(leaf.script, legacy.refund_script().as_script());
+    let witness: Vec<&[u8]> = input.witness.iter().collect();
+    let control = ControlBlock::decode(witness[witness.len() - 1]).unwrap();
+    let output = legacy.script_pubkey();
+    let key = XOnlyPublicKey::from_slice(&output.as_bytes()[2..]).unwrap();
+    let secp = Secp256k1::verification_only();
+    assert!(control.verify_taproot_commitment(&secp, key, leaf.script));
+    eco.pool.mine();
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Refunded);
 }
 
 /// The operator's alerts of refunds that left the chain.

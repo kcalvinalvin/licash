@@ -626,11 +626,12 @@ impl<T: Transport> Provider<T> {
             Option<u32>,
             Option<Vec<u8>>,
             Option<u32>,
+            Vec<u8>,
         );
         let raw: Option<Raw> = self.store.read(|c| {
             Ok(c.query_row(
                 "SELECT s.hash, s.expiry_height, p.claim_key, p.refund_key, f.tx,
-                    f.vout, p.refund_tx, c.height
+                    f.vout, p.refund_tx, c.height, s.address
                  FROM provider_payouts p JOIN provider_swaps s ON s.id = p.id
                  LEFT JOIN provider_payout_fundings f ON f.id = p.id
                  LEFT JOIN provider_payout_scans c ON c.id = p.id
@@ -646,17 +647,19 @@ impl<T: Transport> Provider<T> {
                         r.get(5)?,
                         r.get(6)?,
                         r.get(7)?,
+                        r.get(8)?,
                     ))
                 },
             )
             .optional()?)
         })?;
-        let Some((hash, timeout, claim, refund_key, funding, vout, refund, scanned)) = raw else {
+        let Some((hash, timeout, claim, refund_key, funding, vout, refund, scanned, address)) = raw
+        else {
             return Ok(None);
         };
         let bad = |what: &str| licash_wallet::Error::Invalid(format!("a payout's {what}"));
         let refund_key = SecretKey::from_slice(&refund_key).map_err(|_| bad("refund key"))?;
-        let htlc = Htlc {
+        let terms = Htlc {
             hash,
             claim: XOnlyPublicKey::from_slice(&claim).map_err(|_| bad("claim key"))?,
             refund: x_only(&refund_key),
@@ -664,6 +667,12 @@ impl<T: Transport> Provider<T> {
             wait: None,
             sized: true,
         };
+        // As its coin was made: unsized by a provider before sized coins.
+        let htlc = terms
+            .sized_or_not()
+            .into_iter()
+            .find(|h| h.script_pubkey().as_bytes() == address)
+            .ok_or_else(|| bad("coin of other terms than its own"))?;
         let tx = |raw: Option<Vec<u8>>| -> Result<Option<Transaction>, Error> {
             raw.map(|raw| deserialize(&raw).map_err(|_| bad("transaction").into()))
                 .transpose()
