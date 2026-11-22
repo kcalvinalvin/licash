@@ -263,6 +263,7 @@ pub(crate) fn close_htlc(root: &XOnlyPublicKey, hash: &[u8; 32], refund: &XOnlyP
         refund: *refund,
         timeout: 0,
         wait: Some(CLOSE_WAIT),
+        sized: false,
     }
 }
 
@@ -808,6 +809,7 @@ impl<T: Transport> Wallet<T> {
                     refund,
                     timeout: terms.timeout,
                     wait: None,
+                    sized: false,
                 };
                 let preimage = preimage(seed, address, number, &ephemeral, amount, pays);
                 (preimage, htlc)
@@ -1117,6 +1119,7 @@ impl<T: Transport> Wallet<T> {
                     refund: x_only(refund),
                     timeout: terms.timeout,
                     wait: None,
+                    sized: false,
                 }
             }
         };
@@ -1216,6 +1219,7 @@ impl<T: Transport> Wallet<T> {
             timeout,
             // A close deposit waits after its payment, and names no height.
             wait: closes(&body).then_some(CLOSE_WAIT),
+            sized: false,
         };
         let tx = htlc
             .refund_tx(funding, value, to, rate, &secret)

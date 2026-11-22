@@ -29,6 +29,7 @@ fn htlc() -> Htlc {
         refund: key(&secret(2)),
         timeout: 850_000,
         wait: None,
+        sized: false,
     }
 }
 
@@ -87,11 +88,12 @@ fn a_deposit_is_a_taproot_output_of_its_terms() {
         .assume_checked();
     assert_eq!(parsed, address);
     // Each term makes another address.
-    let mut others = vec![htlc; 4];
+    let mut others = vec![htlc; 5];
     others[0].hash[0] ^= 1;
     others[1].claim = key(&secret(5));
     others[2].refund = key(&secret(5));
     others[3].timeout += 1;
+    others[4].sized = true;
     for other in others {
         assert_ne!(other.script_pubkey(), htlc.script_pubkey());
     }
@@ -191,6 +193,45 @@ fn a_relative_refund_waits_blocks_after_the_payment_and_names_no_height() {
     assert!(!relative.claimed_by(&tx, funding()));
 }
 
+/// A sized claim takes a preimage of 32 bytes only: its leaf checks the
+/// size first, its coin is another, and its claim is made, recognized and
+/// read as an unsized one's. The unsized leaf is as before, byte for byte,
+/// so that coins paid to it are found and spent again.
+#[test]
+fn a_sized_claim_checks_the_preimage_is_32_bytes_and_keeps_the_old_leaf_apart() {
+    let old = htlc();
+    let sized = Htlc { sized: true, ..old };
+    let mut plain = vec![0xa8, 0x20];
+    plain.extend(old.hash);
+    plain.extend([0x88, 0x20]);
+    plain.extend(old.claim.serialize());
+    plain.push(0xac);
+    assert_eq!(old.claim_script().as_bytes(), plain);
+    // OP_SIZE 32 OP_EQUALVERIFY, then the same.
+    let mut want = vec![0x82, 0x01, 0x20, 0x88];
+    want.extend(&plain);
+    assert_eq!(sized.claim_script().as_bytes(), want);
+    assert_eq!(sized.refund_script(), old.refund_script());
+    assert_ne!(sized.script_pubkey(), old.script_pubkey());
+
+    let rate = FeeRate::from_sat_per_vb(2).unwrap();
+    let claim = sized
+        .claim_tx(funding(), VALUE, to(), rate, &secret(1), &[7; 32])
+        .unwrap();
+    let witness: Vec<&[u8]> = claim.input[0].witness.iter().collect();
+    assert_eq!(witness.len(), 4);
+    assert_eq!(witness[1], [7; 32]);
+    verify(&sized, &claim, &sized.claim_script(), &sized.claim);
+    assert!(sized.claimed_by(&claim, funding()));
+    assert!(!old.claimed_by(&claim, funding()));
+    assert_eq!(sized.preimage_in(&claim, funding()), Some([7; 32]));
+    let refund = sized
+        .refund_tx(funding(), VALUE, to(), rate, &secret(2))
+        .unwrap();
+    verify(&sized, &refund, &sized.refund_script(), &sized.refund);
+    assert!(!sized.claimed_by(&refund, funding()));
+}
+
 /// A hub publishes a deposit root; the claim key of a close deposit is the
 /// root tweaked by the deposit's hash and its payer's refund key, which the
 /// hub signs with the root's secret tweaked the same: whichever the parity of
@@ -235,6 +276,7 @@ fn a_close_deposits_claim_key_is_derived_from_the_hubs_root_and_signed_by_its_se
         refund,
         timeout: 0,
         wait: Some(licash_onchain::deposit::CLOSE_WAIT),
+        sized: false,
     };
     let claim = close_claim_secret(&secret(1), &htlc.hash, &refund);
     let rate = FeeRate::from_sat_per_vb(1).unwrap();

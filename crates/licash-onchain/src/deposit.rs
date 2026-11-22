@@ -17,7 +17,7 @@ use bitcoin::{
     absolute::LockTime,
     hashes::Hash,
     key::Secp256k1,
-    opcodes::all::{OP_CHECKSIG, OP_CLTV, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256},
+    opcodes::all::{OP_CHECKSIG, OP_CLTV, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256, OP_SIZE},
     script::Builder,
     secp256k1::{Keypair, Message, Parity, Scalar, SecretKey, XOnlyPublicKey},
     sighash::{Prevouts, SighashCache},
@@ -59,7 +59,17 @@ pub struct Htlc {
     /// so that the script depends on no height, and a wallet knowing only its
     /// keys and the hub's can rebuild it. None: the refund is by `timeout`.
     pub wait: Option<u16>,
+    /// Whether the claim takes a preimage of 32 bytes only (`OP_SIZE 32
+    /// OP_EQUALVERIFY` first), as every lock and Lightning payment does.
+    /// Where the claimer chose the hash, as a payout's client does, a claim
+    /// with a longer preimage of it would take the coin and leave its payer
+    /// none to settle the lock it pays for: such coins are sized. The hub's
+    /// deposits, whose hashes their payers choose, are not.
+    pub sized: bool,
 }
+
+/// What a sized claim's preimage is, in bytes.
+const PREIMAGE_BYTES: i64 = 32;
 
 /// How many blocks after its payment a deposit that returns a contract's
 /// reserve may be taken back by its payer ([`Htlc::wait`]): some two weeks.
@@ -132,9 +142,17 @@ enum Pay {
 }
 
 impl Htlc {
-    /// `OP_SHA256 <hash> OP_EQUALVERIFY <claim> OP_CHECKSIG`
+    /// `OP_SHA256 <hash> OP_EQUALVERIFY <claim> OP_CHECKSIG`, after
+    /// `OP_SIZE 32 OP_EQUALVERIFY` where [`Htlc::sized`].
     pub fn claim_script(&self) -> ScriptBuf {
-        Builder::new()
+        let builder = match self.sized {
+            true => Builder::new()
+                .push_opcode(OP_SIZE)
+                .push_int(PREIMAGE_BYTES)
+                .push_opcode(OP_EQUALVERIFY),
+            false => Builder::new(),
+        };
+        builder
             .push_opcode(OP_SHA256)
             .push_slice(self.hash)
             .push_opcode(OP_EQUALVERIFY)

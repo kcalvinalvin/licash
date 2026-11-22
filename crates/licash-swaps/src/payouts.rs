@@ -351,6 +351,7 @@ impl<T: Transport> Provider<T> {
             refund: x_only(&refund_key),
             timeout,
             wait: None,
+            sized: true,
         };
         let taken = Taken {
             from,
@@ -661,6 +662,7 @@ impl<T: Transport> Provider<T> {
             refund: x_only(&refund_key),
             timeout,
             wait: None,
+            sized: true,
         };
         let tx = |raw: Option<Vec<u8>>| -> Result<Option<Transaction>, Error> {
             raw.map(|raw| deserialize(&raw).map_err(|_| bad("transaction").into()))

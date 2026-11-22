@@ -407,6 +407,7 @@ fn record(r: &Row<'_>) -> rusqlite::Result<Record> {
             // a wait after its payment, whatever the height.
             timeout: if close.is_some() { 0 } else { r.get(6)? },
             wait: close.as_ref().map(|_| CLOSE_WAIT),
+            sized: false,
         },
         until: r.get(6)?,
         fund_by: r.get(7)?,
@@ -692,6 +693,7 @@ impl Store {
                         refund: x_only(r, 4)?,
                         timeout: r.get(5)?,
                         wait: None,
+                        sized: false,
                     },
                 ))
             })?
@@ -1009,6 +1011,7 @@ impl Gateway {
                 refund,
                 timeout: if body.close.is_some() { 0 } else { until },
                 wait: body.close.as_ref().map(|_| CLOSE_WAIT),
+                sized: false,
             };
             // Its window from now, not from where the scan is: a scan behind
             // the node would leave it a part of it, or none once caught up.

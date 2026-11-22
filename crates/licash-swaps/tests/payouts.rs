@@ -412,6 +412,10 @@ async fn a_payout_claimed_pays_the_provider_its_lock() {
     assert_eq!(claimed.funding.unwrap().txid, coin[0].compute_txid());
     let mined = eco.pool.mine();
     assert!(mined.iter().any(is_claim), "{mined:?}");
+    // By a claim leaf taking a preimage of 32 bytes only.
+    let claim = mined.iter().find(|tx| is_claim(tx)).unwrap();
+    let leaf = claim.input[0].witness.taproot_leaf_script().unwrap();
+    assert_eq!(leaf.script.as_bytes()[..4], [0x82, 0x01, 0x20, 0x88]);
     eco.follow().await;
     let record = eco.provider().records(1).unwrap().remove(0);
     assert_eq!(record.stage, Stage::Done);
