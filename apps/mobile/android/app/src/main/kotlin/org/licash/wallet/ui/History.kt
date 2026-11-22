@@ -182,6 +182,6 @@ private fun glyph(activity: Activity, coming: Boolean, failed: Boolean): ImageVe
         Kind.SWAP, Kind.OPTIMIZED -> Glyphs.swap
         Kind.CONTRACT, Kind.CLOSED -> Glyphs.shield
         Kind.SENT, Kind.PAYOUT -> Glyphs.up
-        Kind.RECEIVED, Kind.MOVED, Kind.ONCHAIN -> Glyphs.down
+        Kind.RECEIVED, Kind.MOVED, Kind.FUNDED, Kind.ONCHAIN -> Glyphs.down
     }
 }

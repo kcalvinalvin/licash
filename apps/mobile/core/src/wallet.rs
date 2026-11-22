@@ -1312,10 +1312,13 @@ impl Wallet {
         // An invoice is a payment once paid: its hub locked notes to it.
         let paid = invoices.iter().filter(|i| i.lock.is_some());
         history.extend(paid.map(invoice_activity));
-        // A move its hub never answered moved nothing.
+        // A move its hub never answered moved nothing; one for a
+        // contract's reserve, paid only once it closes, is part of the
+        // contract until paid.
         let answered = deposits
             .iter()
-            .filter(|d| d.terms.is_some() || d.state == DepositState::Open);
+            .filter(|d| d.terms.is_some() || d.state == DepositState::Open)
+            .filter(|d| !(d.close && d.funding.is_none() && d.state == DepositState::Open));
         history.extend(answered.map(|d| {
             let mut activity = moved_activity(d);
             // Its refund made, not yet found in a block.
@@ -1370,6 +1373,20 @@ impl Wallet {
         let (at_codes, swept) = self.code_lines()?;
         history.retain(|a| a.kind != Kind::Received || !swept.contains(&a.id));
         history.extend(at_codes);
+        // Her part of a coin a contract took, back as notes: not a payment.
+        let contracts = licash_contracts::holder::list(self.wallet.path()).map_err(|e| {
+            LicashError::Failed {
+                reason: format!("{e:#}"),
+            }
+        })?;
+        let funded = contracts
+            .iter()
+            .filter(|c| c.funded_received)
+            .map(|c| (c.hub.as_str(), c.funded, c.created_at));
+        let issued = stats::issued_receipts(&history, funded);
+        for line in history.iter_mut().filter(|a| issued.contains(&a.id)) {
+            line.kind = Kind::Funded;
+        }
         history.sort_by_key(|a| (a.at.is_some(), std::cmp::Reverse(a.at)));
         Ok(history)
     }
@@ -1380,7 +1397,9 @@ impl Wallet {
     pub fn notes_of(&self, kind: Kind, id: String) -> Result<NotesOf, LicashError> {
         let unknown = || LicashError::invalid(format!("nothing in the history is {id}"));
         let operations: Vec<String> = match kind {
-            Kind::Sent | Kind::Received | Kind::Lightning | Kind::Optimized => vec![id.clone()],
+            Kind::Sent | Kind::Received | Kind::Funded | Kind::Lightning | Kind::Optimized => {
+                vec![id.clone()]
+            }
             Kind::Moved => {
                 let deposit = self.wallet.deposits()?.into_iter().find(|d| d.hash == id);
                 deposit.ok_or_else(unknown)?.lock.into_iter().collect()
@@ -1467,7 +1486,7 @@ impl Wallet {
                 let hub = sent.ok_or_else(unknown)?.hub;
                 Ok(Details::Notes { hub })
             }
-            Kind::Received => {
+            Kind::Received | Kind::Funded => {
                 let got = self.wallet.receipts()?.into_iter().find(|r| r.id == id);
                 // Else one an extra code took.
                 let got = match got {

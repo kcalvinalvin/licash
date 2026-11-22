@@ -181,12 +181,11 @@ impl Wallet {
             .filter_map(|c| c.spent_by)
             .collect();
         let history = self.history()?;
-        let mut own: HashSet<String> = records
+        let own: HashSet<String> = records
             .swaps
             .values()
             .filter_map(|s| s.theirs.clone())
             .collect();
-        own.extend(issued_receipts(&history, &contracts));
         let records = Records {
             spends,
             own,
@@ -372,21 +371,23 @@ impl Wallet {
 
 /// The receipts among `history`'s lines that are the notes a contract's hub
 /// issued the wallet of the coin it funded the contract with: its funded
-/// part, back as notes. Nothing the wallet keeps says which receipt it is,
-/// so each contract takes the earliest after it began that is of its
-/// hub and of exactly its amount, none twice.
-fn issued_receipts(history: &[Activity], contracts: &[crate::Contract]) -> HashSet<String> {
+/// part, back as notes. Of `funded`, each contract whose notes were
+/// received, as its hub, what she funded and when it began. Nothing the
+/// wallet keeps says which receipt it is, so each contract takes the
+/// earliest after it began that is of its hub and of exactly its amount,
+/// none twice.
+pub(super) fn issued_receipts<'a>(
+    history: &[Activity],
+    funded: impl IntoIterator<Item = (&'a str, u64, i64)>,
+) -> HashSet<String> {
     let mut taken = HashSet::new();
-    for c in contracts
-        .iter()
-        .filter(|c| c.funded > 0 && c.funded_received)
-    {
-        let hub = c.hub.trim_end_matches('/');
+    for (hub, amount, began) in funded.into_iter().filter(|(_, amount, _)| *amount > 0) {
+        let hub = hub.trim_end_matches('/');
         let found = history
             .iter()
             .filter(|a| a.kind == Kind::Received && a.state == State::Done)
-            .filter(|a| a.amount == c.funded && a.detail.trim_end_matches('/') == hub)
-            .filter(|a| a.at.is_some_and(|at| at >= c.created_at))
+            .filter(|a| a.amount == amount && a.detail.trim_end_matches('/') == hub)
+            .filter(|a| a.at.is_some_and(|at| at >= began))
             .filter(|a| !taken.contains(&a.id))
             .min_by_key(|a| a.at);
         if let Some(found) = found {
@@ -441,6 +442,8 @@ fn line_event(line: &Activity, records: &Records) -> Option<StatEvent> {
             event.hub_fee = Some(settled);
             driven(&mut event);
         }
+        // Her own coin's, back as notes: no payment.
+        Kind::Funded => return None,
         Kind::Received if records.own.contains(&line.id) => return None,
         Kind::Received => event.flow = Flow::Received,
         Kind::Invoice => {
@@ -581,21 +584,35 @@ mod tests {
             line("other", Kind::Received, State::Done, 701, 0, 150),
             line("sent", Kind::Sent, State::Done, 700, 1, 160),
         ];
+        let funded = |c: &[Contract]| {
+            let received: Vec<_> = c.iter().filter(|c| c.funded_received).cloned().collect();
+            received
+                .into_iter()
+                .map(|c| (c.hub, c.funded, c.created_at))
+                .collect::<Vec<_>>()
+        };
+        let of = |c: &[Contract]| {
+            let funded = funded(c);
+            issued_receipts(
+                &history,
+                funded.iter().map(|(h, f, at)| (h.as_str(), *f, *at)),
+            )
+        };
         let one = [contract("a", 700, 100)];
-        let taken = issued_receipts(&history, &one);
+        let taken = of(&one);
         assert_eq!(taken, HashSet::from(["early".to_owned()]));
         // Two contracts of one amount take two, none twice; one with none
         // funded, or not yet received, takes none.
         let mut unreceived = contract("c", 700, 100);
         unreceived.funded_received = false;
         let many = [contract("a", 700, 100), contract("b", 700, 100)];
-        let taken = issued_receipts(&history, &many);
+        let taken = of(&many);
         assert_eq!(
             taken,
             HashSet::from(["early".to_owned(), "late".to_owned()])
         );
         let none = [unreceived, contract("d", 0, 100)];
-        assert!(issued_receipts(&history, &none).is_empty());
+        assert!(of(&none).is_empty());
     }
 
     #[test]

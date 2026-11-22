@@ -166,6 +166,7 @@ internal fun title(activity: Activity, coming: Boolean): String = when {
         Kind.SENT -> "Sent"
         Kind.RECEIVED -> "Received"
         Kind.MOVED -> "From Bitcoin"
+        Kind.FUNDED -> "From Bitcoin, protected"
         Kind.ONCHAIN -> "On Bitcoin"
         Kind.LIGHTNING -> "Paid over Lightning"
         Kind.INVOICE -> "Received over Lightning"
@@ -176,6 +177,10 @@ internal fun title(activity: Activity, coming: Boolean): String = when {
         Kind.CLOSED -> "Protection closed"
     }
 }
+
+/** What her part of a coin a contract took is, said on its line. */
+internal const val FUNDED_MEANS = "The rest of your coin on Bitcoin, after the cost and reserve of its " +
+    "protection: added to your balance once it confirmed. The reserve comes back when it ends."
 
 /** Of a contract's `price`, what it cost: the rest, its `reserve`, comes back. */
 internal fun opened(price: ULong, reserve: ULong): ULong = price - minOf(price, reserve)
@@ -448,6 +453,7 @@ private fun Summary(
                 (details as? Details.Notes)?.let { Line("From", name(it.hub)) }
             } else {
                 (details as? Details.Notes)?.let { Line("At", name(it.hub)) }
+                if (activity.kind == Kind.FUNDED) Say(FUNDED_MEANS)
                 if (activity.kind == Kind.OPTIMIZED) Say("Smaller notes leave room for receiving and help recovery fit its note limit.")
             }
         }

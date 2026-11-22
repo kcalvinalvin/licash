@@ -78,7 +78,7 @@ internal fun paidTo(kind: Kind, to: PaidTo?): String = when (to) {
 
 /** Where notes of none spent came from, in words. */
 private fun from(kind: Kind): String = when (kind) {
-    Kind.MOVED, Kind.ONCHAIN -> "From Bitcoin"
+    Kind.MOVED, Kind.FUNDED, Kind.ONCHAIN -> "From Bitcoin"
     Kind.INVOICE -> "Over Lightning"
     Kind.SWAP -> "From the provider"
     else -> "From the payer"

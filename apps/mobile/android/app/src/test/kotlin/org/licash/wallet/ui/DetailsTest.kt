@@ -123,6 +123,9 @@ class DetailsTest {
         assertEquals("Protection", title(line(Kind.CONTRACT), coming = false))
         assertEquals("Sent on Bitcoin", title(line(Kind.PAYOUT), coming = false))
         assertEquals("From Bitcoin", title(line(Kind.MOVED), coming = false))
+        // Her part of the coin a contract took, back as notes: not a payment from anyone.
+        assertEquals("From Bitcoin, protected", title(line(Kind.FUNDED), coming = false))
+        assertFalse(paid(line(Kind.FUNDED)))
     }
 
     @Test

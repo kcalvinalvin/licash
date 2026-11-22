@@ -1236,6 +1236,16 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.tagged("paid-from", "Your Bitcoin", 10).await?;
     phone.back().await?;
     phone.back_to("receive").await?;
+    // Her part in the history as what it is, the rest of her own coin back
+    // as notes: not a payment received from anyone.
+    opened(phone, "From Bitcoin, protected").await?;
+    let back = amount(&phone.by_id("amount", 10).await?.text);
+    ensure!(
+        back == funded,
+        "{back} of her part of {funded} in the history"
+    );
+    phone.back().await?;
+    phone.back_to("receive").await?;
     Ok(())
 }
 

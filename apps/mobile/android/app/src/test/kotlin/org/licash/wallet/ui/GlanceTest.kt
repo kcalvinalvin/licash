@@ -58,6 +58,7 @@ class GlanceTest {
             Kind.RECEIVED to "Receiving 10,000 sat",
             Kind.INVOICE to "Receiving 10,000 sat",
             Kind.MOVED to "Receiving 10,000 sat",
+            Kind.FUNDED to "Receiving 10,000 sat",
             Kind.ONCHAIN to "Receiving 10,000 sat",
             Kind.SWAP to "Moving 10,000 sat",
             Kind.CONTRACT to "Setting up protection",

@@ -245,11 +245,15 @@ details who paid: a contact, or a code to save as one. A payment made to a
 contact's wallet, or by one whose shared code is a contact's, says "To" or
 "From" that contact on its line.
 
-A contract is two lines of the history: "Protection", its price paid on
+A contract is three lines of the history: "Protection", its price paid on
 Bitcoin, its details splitting it into the cost and the reserve that comes
-back; and "Protection closed", what it paid back to the wallet's Bitcoin
-(closed early with the hub, or forced closed), from the contract at its
-hub, rather than a coin received.
+back; "From Bitcoin, protected", the rest of the coin it took, issued back
+as notes once its funding confirmed (the earliest receipt at its hub of
+exactly that amount after it began, as nothing kept says which), rather
+than a payment received; and "Protection closed", what it paid back to the
+wallet's Bitcoin (closed early with the hub, or forced closed), from the
+contract at its hub, rather than a coin received. The move set up to take
+its reserve back as notes when it closes is no line until a close pays it.
 
 Receive, showing the Licash code, lets the user pick which identity: the
 main one (the wallet's own code), or an anonymous identity, a separate
