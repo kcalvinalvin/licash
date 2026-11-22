@@ -148,8 +148,22 @@ private fun Summary(
             if (safe > 0) Box(Modifier.weight(safe.toFloat()).fillMaxHeight().background(colors.primary))
             if (safe < 100) Box(Modifier.weight((100 - safe).toFloat()).fillMaxHeight().background(colors.outline))
         }
-        Share(Glyphs.shield, colors.primary, PROTECTED, share.protected, "protected", PROTECTED_MEANS)
+        // Safe on Bitcoin apart from protected by contracts: bitcoin held
+        // protects notes once it pays for a contract.
+        val split = safeSplit(share, b.onchain + b.moving + b.opening)
+        if (split.bitcoin > 0uL) {
+            Share(Glyphs.bitcoin, colors.primary, "On Bitcoin", split.bitcoin, "safe-onchain", SAFE_ONCHAIN_MEANS)
+        }
+        Share(Glyphs.shield, colors.primary, PROTECTED_BY_CONTRACTS, split.contracts, "protected", PROTECTED_MEANS)
         Share(Glyphs.shieldOff, colors.onSurfaceVariant, NOT_PROTECTED, share.open, "credit", NOT_PROTECTED_MEANS)
+        if (share.open > 0uL && b.onchain > 0uL) {
+            Entry(
+                "Protect it with your bitcoin",
+                sub = "A contract paid with a coin on Bitcoin covers notes here",
+                tag = "protect-with-bitcoin",
+                onClick = { go(ON_BITCOIN) },
+            )
+        }
     }
     Line("Notes", digits(noteCount(notes)), tag = "note-count")
     Group("") {

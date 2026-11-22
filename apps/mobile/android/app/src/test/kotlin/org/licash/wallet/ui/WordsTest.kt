@@ -195,4 +195,15 @@ class WordsTest {
         // Past what was expected: no time left to say.
         assertEquals("120 MB of about 100 MB · 12 MB/s", transferred(Transfer(120_000_000uL, 10uL, 100_100_000uL)))
     }
+
+    @Test
+    fun what_is_safe_is_told_apart_as_on_bitcoin_and_protected_by_contracts() {
+        // 110,000 on Bitcoin, 9,800 in notes no contract covers: nothing by contracts.
+        val share = Protection(protected = 110_000uL, open = 9_800uL)
+        assertEquals(SafeSplit(bitcoin = 110_000uL, contracts = 0uL), safeSplit(share, 110_000uL))
+        // A contract covering notes besides.
+        assertEquals(SafeSplit(110_000uL, 50_000uL), safeSplit(Protection(160_000uL, 0uL), 110_000uL))
+        // Never more on Bitcoin than what is protected.
+        assertEquals(SafeSplit(5uL, 0uL), safeSplit(Protection(5uL, 1uL), 9uL))
+    }
 }

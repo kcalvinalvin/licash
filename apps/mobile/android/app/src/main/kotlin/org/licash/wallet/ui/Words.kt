@@ -36,6 +36,15 @@ import kotlin.math.roundToLong
 /** How much of what the wallet holds is protected: all, some or none of it. */
 enum class Shield { ALL, SOME, NONE }
 
+/** Of what is protected, what is `bitcoin` held and what `contracts` cover: in sat. */
+data class SafeSplit(val bitcoin: ULong, val contracts: ULong)
+
+/** `share`'s protected part split into what is on Bitcoin, `onBitcoin` at most, and what contracts cover. */
+fun safeSplit(share: Protection, onBitcoin: ULong): SafeSplit {
+    val bitcoin = minOf(share.protected, onBitcoin)
+    return SafeSplit(bitcoin, share.protected - bitcoin)
+}
+
 /** What the wallet holds, as `protected` and `open`, the rest: in sat. */
 data class Protection(val protected: ULong, val open: ULong) {
     val total: ULong get() = protected + open
@@ -87,13 +96,20 @@ fun protection(balance: Balance): Protection = Protection(balance.total - balanc
 fun homeProtection(balance: Balance, opening: Boolean): Protection? = if (opening) null else protection(balance)
 
 const val PROTECTED = "Protected"
+const val PROTECTED_BY_CONTRACTS = "Protected by contracts"
 const val NOT_PROTECTED = "Not protected"
 
 /** What each means, where asked. */
 const val PROTECTED_MEANS =
-    "On Bitcoin, or claimable from a live recovery contract. Coverage counts whole eligible notes within each contract's payout and note limits. Recovering costs Bitcoin fees and needs the app opened before the contract's deadline."
+    "Notes claimable from a live recovery contract, should their hub fail you. Coverage counts whole eligible notes within each contract's payout and note limits. Recovering costs Bitcoin fees and needs the app opened before the contract's deadline."
 const val NOT_PROTECTED_MEANS =
-    "Held on credit: a hub owes it to you, on its word alone. Protect it, or cash it out to Bitcoin."
+    "Held on credit: a hub owes it to you, on its word alone. Protect it with a contract, paid with a coin " +
+        "you hold on Bitcoin, or cash it out to Bitcoin."
+
+/** What bitcoin held is, beside what is protected: safe already, needing no contract. */
+const val SAFE_ONCHAIN_MEANS =
+    "Bitcoin you hold yourself: safe whatever a hub does. Paying for a contract with a coin of it protects " +
+        "your notes at that hub, and adds the rest of the coin to your balance."
 
 /**
  * What paying through a swap provider risks, said before paying: should it

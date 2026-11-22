@@ -352,7 +352,9 @@ now, the notes at a hub shared out among its contracts so that together
 they recover the most, those ending first served first. Notes still
 arriving count as not protected until they settle. The hub's page says how
 much of what it holds they protect; what they cover counts as protected,
-on Home and behind the balance;
+on Home and behind the balance, where bitcoin held ("On Bitcoin", safe
+already) is said apart from what contracts protect, and notes not
+protected, with bitcoin held, link to protecting them with it;
 what a contract is worth for now (nothing, under the mock authority) is said
 wherever one shows. The fees a hub charges as a contract opens there are
 the most the app pays it from then on: a hub that raised them since is not
