@@ -772,7 +772,25 @@ impl<T: Transport> Wallet<T> {
         self.advance_invoice(&hash_id(hash)?).await
     }
 
+    /// One caller at a time for each invoice: asked, followed and resumed
+    /// alongside, two would each send its request and update it.
     pub(crate) async fn advance_invoice(&self, hash: &[u8; 32]) -> Result<Invoice, Error> {
+        let lock = {
+            let mut advancing = self.advancing.lock().unwrap_or_else(|e| e.into_inner());
+            advancing.entry(*hash).or_default().clone()
+        };
+        let held = lock.lock().await;
+        let advanced = self.advance_invoice_alone(hash).await;
+        drop(held);
+        let mut advancing = self.advancing.lock().unwrap_or_else(|e| e.into_inner());
+        // Kept only while another waits for it.
+        if std::sync::Arc::strong_count(&lock) == 2 {
+            advancing.remove(hash);
+        }
+        advanced
+    }
+
+    async fn advance_invoice_alone(&self, hash: &[u8; 32]) -> Result<Invoice, Error> {
         let pending = |e: Error| match e {
             Error::Pending { .. } | Error::UnknownPayment(_) => e,
             e => Error::Pending {

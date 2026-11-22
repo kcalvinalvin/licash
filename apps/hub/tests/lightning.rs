@@ -371,6 +371,76 @@ async fn a_payment_received_is_claimed_and_settles_its_invoice() {
 }
 
 /// What `request` says it pays for, in words, if anything.
+/// The service, its answers coming after others have had their turn, and
+/// counting the requests about invoices: as over a network.
+#[derive(Clone)]
+struct Slow {
+    local: Local,
+    receives: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Transport for Slow {
+    fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
+        let (this, url) = (self.clone(), url.to_owned());
+        async move {
+            if url.contains(licash_api::LN_RECEIVE) {
+                this.receives
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            tokio::task::yield_now().await;
+            this.local.request(&url, body).await
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_invoice_followed_and_resumed_at_once_is_claimed_once() {
+    let net = Net::new().await;
+    let receives = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let slow = Slow {
+        local: Local(net.app.clone()),
+        receives: receives.clone(),
+    };
+    let path = net.dir.path().join("alice.sqlite");
+    let wallet = Wallet::create(&path, &[7; 32], ChainProfile::Core30DefaultRegtest, slow).unwrap();
+    let invoice = wallet.invoice(HUB, 20).await.unwrap();
+    net.pay_held(&invoice.hash);
+    net.gateway.round().await;
+    let asked = receives.load(std::sync::atomic::Ordering::SeqCst);
+    // The app follows it while its round resumes what is under way: one
+    // advances it, the other then finds it done, asking its hub nothing.
+    let (followed, resumed) = tokio::join!(wallet.follow_invoice(&invoice.hash), wallet.resume());
+    assert_eq!(followed.unwrap().state, InvoiceState::Received);
+    let resumed = resumed.unwrap();
+    assert!(resumed.pending.is_empty(), "{:?}", resumed.pending);
+    assert!(resumed
+        .invoices
+        .iter()
+        .all(|i| i.state == InvoiceState::Received));
+    assert_eq!(
+        receives.load(std::sync::atomic::Ordering::SeqCst) - asked,
+        1
+    );
+    assert_eq!(
+        wallet
+            .balance()
+            .unwrap()
+            .iter()
+            .map(|b| b.available)
+            .sum::<u64>(),
+        20
+    );
+    net.gateway.round().await;
+    assert_eq!(
+        net.node.held(bytes(&invoice.hash)).unwrap(),
+        (HeldState::Settled, 21_000)
+    );
+}
+
 fn description(request: &str) -> Option<String> {
     let invoice: Bolt11Invoice = request.parse().unwrap();
     match invoice.description() {

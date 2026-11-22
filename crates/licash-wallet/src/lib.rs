@@ -545,6 +545,9 @@ pub struct Wallet<T> {
     /// Whether the wallet's extra codes are being collected
     /// ([`Wallet::collect_codes`]): once at a time.
     collecting_codes: std::sync::atomic::AtomicBool,
+    /// The invoices being advanced, each by one caller at a time
+    /// ([`Wallet::advance_invoice`]): by hash.
+    advancing: Mutex<HashMap<[u8; 32], std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// The height by which a lock at the hub reached at any of the URLs given,
@@ -616,6 +619,7 @@ impl<T: Transport> Wallet<T> {
             horizon: Mutex::default(),
             told_tip: AtomicU32::new(0),
             collecting_codes: Default::default(),
+            advancing: Mutex::default(),
         })
     }
 
@@ -656,6 +660,7 @@ impl<T: Transport> Wallet<T> {
             horizon: Mutex::default(),
             told_tip: AtomicU32::new(0),
             collecting_codes: Default::default(),
+            advancing: Mutex::default(),
         })
     }
 
