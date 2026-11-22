@@ -156,7 +156,8 @@ private fun Summary(
         }
         Share(Glyphs.shield, colors.primary, PROTECTED_BY_CONTRACTS, split.contracts, "protected", PROTECTED_MEANS)
         Share(Glyphs.shieldOff, colors.onSurfaceVariant, NOT_PROTECTED, share.open, "credit", NOT_PROTECTED_MEANS)
-        if (share.open > 0uL && b.onchain > 0uL) {
+        // Not while a contract is set up: it is that coin's being protected, as On Bitcoin says.
+        if (share.open > 0uL && b.onchain > 0uL && ui.opening == null) {
             Entry(
                 "Protect it with your bitcoin",
                 sub = "A contract paid with a coin on Bitcoin covers notes here",
