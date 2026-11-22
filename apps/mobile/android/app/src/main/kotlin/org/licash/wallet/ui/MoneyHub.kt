@@ -214,6 +214,15 @@ internal fun HubPage(
                 },
                 dismiss = { quote = null },
                 hub = engine.called(q.hub),
+                cashOut = { coin ->
+                    quote = null
+                    scope.launch {
+                        engine.bitcoinAddress().fold(
+                            { payOwn("bitcoin:$it?amount=${btc(coin)}", it) },
+                            { fail(explain(it)) },
+                        )
+                    }
+                },
             )
         } else {
             ProtectSheet(

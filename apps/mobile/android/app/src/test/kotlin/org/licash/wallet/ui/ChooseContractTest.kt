@@ -68,6 +68,38 @@ class ChooseContractTest {
     }
 
     @Test
+    fun what_she_holds_at_the_hub_counts_toward_the_cover_suggested() {
+        val fits = fitsFrom(131_071uL, ::fake)
+        // A small coin, 400,000 sat held there unprotected: half again both is past 1,048,575.
+        assertEquals(2_097_151uL, suggestedFit(fits, 300_000uL, missing = 400_000uL)?.cap)
+        assertEquals(1_048_575uL, suggestedFit(fits, 300_000uL)?.cap)
+    }
+
+    private val sizes = listOf(131_071uL, 262_143uL, 524_287uL, 1_048_575uL)
+
+    // 3,000 sat and a sat of interest per 1,000 sat of the hub's part.
+    private fun price(cap: ULong, funded: ULong) = 23_000uL + (cap - funded) / 1_000uL
+
+    @Test
+    fun with_no_coin_she_cashes_out_one_paying_for_what_she_holds() {
+        // 300,000 sat held unprotected: half again is 450,000, the hub funding nearly all of 524,287.
+        val any = { coin: ULong, least: ULong -> ContractFit(cap = least, funded = coin - price(least, FIXED_PART)) }
+        assertEquals(
+            CashOutFirst(524_287uL, price(524_287uL, FIXED_PART) + FIXED_PART),
+            cashOutFirst(sizes, 300_000uL, ::price, any),
+        )
+        // More than the largest: the largest.
+        assertEquals(1_048_575uL, cashOutFirst(sizes, 5_000_000uL, ::price, any)?.cap)
+        // An older hub bounding the cap by 2 times the coin: the largest it takes, else none.
+        val bounded = { coin: ULong, least: ULong -> sizes.firstOrNull { it >= least && it <= 2uL * coin || it == 131_071uL && it >= least }?.let { ContractFit(it, 1uL) } }
+        assertEquals(131_071uL, cashOutFirst(sizes, 300_000uL, ::price, bounded)?.cap)
+        assertNull(cashOutFirst(sizes, 300_000uL, ::price) { _, _ -> null })
+        // Nothing missing there, nothing to protect.
+        assertNull(cashOutFirst(sizes, 0uL, ::price, any))
+        assertNull(cashOutFirst(emptyList(), 300_000uL, ::price, any))
+    }
+
+    @Test
     fun what_protection_asks_says_the_day_it_ends() {
         assertEquals("Open Licash now and then, and before it ends on May 21.", duty("May 21"))
     }

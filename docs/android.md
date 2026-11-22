@@ -337,7 +337,8 @@ recovery should the hub never issue it), the hub charging its interest on its
 own part only. No change comes back from the coin. The sheet shows first
 what the hub would hold protected once it opens (its cover bar, then in
 words), then the cover, chosen first: at first the smallest at least half
-again the smallest coin a contract takes whole, room to be paid more, else
+again the smallest coin a contract takes whole and what is not protected at
+the hub yet, room to be paid more, else
 the largest the hub allows for it (at a hub that lets the wallet choose,
 `--contracts-max-cap`, among its sizes, `2^n - 1` sat; an older hub may
 bound it by the coin paying, as it announces), a slider choosing among every
@@ -349,7 +350,11 @@ of what it asks of her, opening the app now and then and before the day it
 ends. Under More, a slider chooses how long it lasts (at first half a
 year), with the hub's part and the cost itemized.
 With no coin
-on Bitcoin, the sheet says to cash out to the wallet first. Priced live as the
+on Bitcoin paying any, opened from a hub's page, the sheet offers the cover
+the same way for what is not protected there and a coin to cash out to the
+wallet first: its price and a 1,000 sat part, the hub funding the rest of
+the cap (the largest smaller cover a hub bounding it by the coin allows).
+Once the coin arrives, Protect opens on it. Priced live as the
 hub prices it: its cost (the hub's opening fee and its yearly interest on each
 part, itemized on a tap) apart from her reserve, "refundable", each with an
 (i) saying what it is. Its button says "Protect for" the cost, or "Add for"

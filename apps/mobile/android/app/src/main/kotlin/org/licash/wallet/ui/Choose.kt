@@ -31,6 +31,7 @@ import org.licash.core.Holding
 import org.licash.core.contractFee
 import org.licash.core.contractFit
 import org.licash.core.contractPrice
+import org.licash.core.contractSizes
 import org.licash.wallet.Chosen
 import org.licash.wallet.Engine
 import org.licash.wallet.digits
@@ -99,12 +100,14 @@ internal fun fitsFrom(least: ULong, fit: (least: ULong) -> ContractFit?): List<C
 }
 
 /**
- * The contract offered at first of `fits` for a coin of `coin` sat: the
- * smallest covering half again the coin, room to be paid more, else the
- * largest the hub allows for it.
+ * The contract offered at first of `fits` for a coin of `coin` sat, with
+ * `missing` sat at its hub not protected yet: the smallest covering half
+ * again both, room to be paid more, else the largest the hub allows for it.
  */
-internal fun suggestedFit(fits: List<ContractFit>, coin: ULong): ContractFit? =
-    fits.firstOrNull { it.cap >= coin + coin / 2uL } ?: fits.lastOrNull()
+internal fun suggestedFit(fits: List<ContractFit>, coin: ULong, missing: ULong = 0uL): ContractFit? {
+    val both = coin + missing
+    return fits.firstOrNull { it.cap >= both + both / 2uL } ?: fits.lastOrNull()
+}
 
 /** The contract offered at first for `coin`, if one takes it whole. */
 internal fun fitOf(q: ContractQuote, range: ContractRange, blocks: UInt, coin: DepositCoin): ContractFit? =
@@ -121,10 +124,39 @@ internal fun coversOf(fits: List<Pair<DepositCoin, List<ContractFit>>>): List<Pa
         .toSortedMap()
         .map { (cap, coins) -> cap to coins.sortedBy { it.value } }
 
-/** The cover offered at first: the one suggested for the smallest coin a contract takes whole. */
-internal fun suggestedCover(fits: List<Pair<DepositCoin, List<ContractFit>>>): ULong? =
+/**
+ * The cover offered at first: the one suggested for the smallest coin a
+ * contract takes whole, with `missing` sat at its hub not protected yet.
+ */
+internal fun suggestedCover(fits: List<Pair<DepositCoin, List<ContractFit>>>, missing: ULong = 0uL): ULong? =
     fits.filter { it.second.isNotEmpty() }.minByOrNull { it.first.value }
-        ?.let { (coin, its) -> suggestedFit(its, coin.value)?.cap }
+        ?.let { (coin, its) -> suggestedFit(its, coin.value, missing)?.cap }
+
+/** What to cash out to herself to protect what she holds at a hub: a coin of `coin` sat opening `cap`. */
+internal data class CashOutFirst(val cap: ULong, val coin: ULong)
+
+/**
+ * With no coin on Bitcoin that pays for it, the coin to cash out to herself
+ * first to protect the `missing` sat at a hub not protected yet: one paying
+ * the price of the smallest of `sizes` covering half again them (else the
+ * largest) and [FIXED_PART], her part, the hub funding the rest. If a
+ * contract of that cap does not take it whole (`fit` of a coin at a least
+ * cap, as [contractFit]), as an older hub bounding the cap by the coin
+ * refuses, the next smaller that does. None with nothing missing.
+ */
+internal fun cashOutFirst(
+    sizes: List<ULong>,
+    missing: ULong,
+    price: (cap: ULong, funded: ULong) -> ULong,
+    fit: (coin: ULong, least: ULong) -> ContractFit?,
+): CashOutFirst? {
+    if (missing == 0uL) return null
+    val wanted = sizes.firstOrNull { it >= missing + missing / 2uL } ?: sizes.lastOrNull() ?: return null
+    return sizes.filter { it <= wanted }.asReversed().firstNotNullOfOrNull { cap ->
+        val coin = price(cap, FIXED_PART) + FIXED_PART
+        fit(coin, cap)?.takeIf { it.cap == cap }?.let { CashOutFirst(cap, coin) }
+    }
+}
 
 /**
  * Protection of terms chosen within what its hub allows. First what is
@@ -152,6 +184,8 @@ internal fun ChooseSheet(
     title: String = "Protect at $hub",
     verb: String = "Protect",
     decline: (() -> Unit)? = null,
+    // With no coin paying it: cashing out a coin of so many sat to herself first, to pay it.
+    cashOut: ((ULong) -> Unit)? = null,
 ) {
     val colors = MaterialTheme.colorScheme
     val download = android.text.format.Formatter.formatShortFileSize(LocalContext.current, q.download.toLong())
@@ -163,7 +197,7 @@ internal fun ChooseSheet(
     // none does, the one suggested.
     var chosenCap by remember(q) { mutableStateOf<ULong?>(null) }
     var chosenCoin by remember(q) { mutableStateOf<DepositCoin?>(null) }
-    val cap = chosenCap?.takeIf { c -> covers.any { it.first == c } } ?: suggestedCover(fits)
+    val cap = chosenCap?.takeIf { c -> covers.any { it.first == c } } ?: suggestedCover(fits, cover.missing)
     val payers = covers.firstOrNull { it.first == cap }?.second.orEmpty()
     val coin = chosenCoin?.takeIf { it in payers } ?: payers.firstOrNull()
     val fit = coin?.let { c -> fits.first { it.first == c }.second.firstOrNull { it.cap == cap } }
@@ -175,9 +209,25 @@ internal fun ChooseSheet(
     val cost = fee.cost()
     // It stops protecting a little before it ends.
     val protectsFor = if (blocks > q.afterAssert) blocks - q.afterAssert else 0u
+    // None paying it: what she holds here protected by a coin cashed out to herself first.
+    val first = if (fit == null && cashOut != null) {
+        cashOutFirst(
+            contractSizes(range),
+            cover.missing,
+            price = { c, f -> contractPrice(range, c, blocks, f) },
+            fit = { v, least -> contractFit(range, blocks, v, least, q.dust, q.denominations, q.fundedNotes) },
+        )
+    } else {
+        null
+    }
     Sheet(title, dismiss) {
-        if (fit != null) {
-            val after = coverAfter(cover, capped, funded)
+        if (fit != null || first != null) {
+            // Cashed out first, what she holds here less the coin, her part of it back.
+            val after = if (first != null) {
+                coverAfter(cover.copy(held = cover.held - minOf(cover.held, first.coin)), first.cap, FIXED_PART)
+            } else {
+                coverAfter(cover, capped, funded)
+            }
             CoverBar(after, Modifier.padding(top = 4.dp, bottom = 6.dp))
             after.says?.let {
                 Text(
@@ -188,7 +238,7 @@ internal fun ChooseSheet(
                 )
             }
         }
-        Line("Covers up to", sat(capped), tag = "quote-cap")
+        Line("Covers up to", sat(first?.cap ?: capped), tag = "quote-cap")
         // Larger, the hub funds more of it: room to be paid more, at its interest.
         if (fit != null && covers.size > 1) {
             val at = covers.indexOfFirst { it.first == capped }
@@ -230,7 +280,18 @@ internal fun ChooseSheet(
             Line("Into your balance", sat(funded), tag = "contract-funded")
         }
         Line("For", span(protectsFor.toLong(), blockSecs), tag = "quote-for")
-        if (coin == null && coins.isEmpty()) {
+        if (first != null && cashOut != null) {
+            val firstFee = contractFee(range, first.cap, blocks, FIXED_PART)
+            FeeLine(
+                "Cost", firstFee.cost(), first.cap, tag = "quote-price", value = sat(firstFee.cost()),
+                breakdown = contractCost(range, first.cap, firstFee, FIXED_PART),
+            )
+            Line("Reserve, refundable", sat(range.reserve), tag = "contract-reserve")
+            Say(CASH_OUT_FIRST)
+            BigButton("Cash out ${sat(first.coin)} to yourself", Modifier.fillMaxWidth().testTag("cash-out-first")) {
+                cashOut(first.coin)
+            }
+        } else if (coin == null && coins.isEmpty()) {
             Say("Paid from Bitcoin you hold, and you hold none yet. Receive some on Bitcoin, or cash out to yourself, then protect.")
         } else if (fit == null) {
             Text(
@@ -292,6 +353,10 @@ internal fun ChooseSheet(
         }
     }
 }
+
+/** How protecting what she holds is paid for with no coin on Bitcoin: one cashed out to herself, then. */
+internal const val CASH_OUT_FIRST = "None of your bitcoin pays for this. Cash out this much to yourself, then " +
+    "protect with it once it arrives. Beyond the cost and the reserve, it comes back to your balance."
 
 /** Why no coin pays for a contract: each is spent whole, so short of the price or beyond what the largest takes. */
 internal const val NO_FIT = "No contract of this hub takes a coin of yours whole: each is short of the price, " +
