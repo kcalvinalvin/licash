@@ -42,6 +42,24 @@ class ReceiveTest {
             "The payer pays 100,001 sat\nYou get 100,000 sat, the hub's fee taken",
             invoiceWords(100_002u, 100_001u, 100_000u),
         )
+        // Made by a provider where no hub takes Lightning.
+        assertEquals("You get 495 sat, the provider's fee taken", invoiceWords(500u, 500u, 495u, "the provider"))
+    }
+
+    @Test
+    fun lightning_waits_on_the_providers_asked_where_no_hub_takes_it() {
+        assertEquals(
+            listOf(Way.LIGHTNING to "Looking for a provider…"),
+            closedWays(
+                lightning = false,
+                silent = true,
+                donations = true,
+                lookingForDonations = false,
+                lookingForLightning = true,
+            ),
+        )
+        // Found: open, through it.
+        assertEquals(emptyList<Pair<Way, String>>(), closedWays(true, true, true, false, lookingForLightning = true))
     }
 
     @Test

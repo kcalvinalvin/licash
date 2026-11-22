@@ -1607,7 +1607,8 @@ class Engine(context: Context) {
     /**
      * Ask the hub taking it for least for a Lightning invoice asking the
      * payer `amount`, its fee in it: the notes it pays the wallet, less.
-     * Saying `memo` to the payer, if given, which the hub reads too.
+     * Where no hub takes Lightning, a swap provider that does. Saying
+     * `memo` to the payer, if given, which the hub or provider reads too.
      */
     suspend fun askInvoiceFor(amount: ULong, memo: String? = null): Result<LightningInvoice> = io {
         // Not behind a round: each invoice is advanced by one caller at a
@@ -1618,6 +1619,12 @@ class Engine(context: Context) {
         refresh()
         asked
     }
+
+    /**
+     * Whether a swap provider has the wallet paid over Lightning at a hub
+     * it trusts: where no hub does, [askInvoiceFor] asks one.
+     */
+    suspend fun providerTakesLightning(): Result<Boolean> = io { local { it.providerTakesLightning() } }
 
     /** The contacts, by name. */
     suspend fun contacts(): Result<List<Contact>> = io { local { it.contacts() } }

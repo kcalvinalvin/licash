@@ -65,7 +65,7 @@ internal const val COPIED_MS = 2_000L
  * others asked for, `label` naming it and `says` who pays it.
  */
 internal enum class Way(val label: String, val says: String, val tag: String) {
-    /** A Lightning invoice a hub makes, for an amount: any wallet pays it. */
+    /** A Lightning invoice a hub makes, or a provider where none does, for an amount: any wallet pays it. */
     LIGHTNING("Lightning invoice", "Any Lightning wallet, for an amount", "way-lightning"),
 
     /** The wallet's code, paid in notes. */
@@ -102,16 +102,21 @@ internal fun ways(lightning: Boolean, silent: Boolean, donations: Boolean = fals
 
 /**
  * The ways not open to the wallet now, each with why: said grayed out
- * under the others, so none is a mystery. `lookingForDonations` while
- * providers are still asked.
+ * under the others, so none is a mystery. `lookingForDonations` and
+ * `lookingForLightning` while providers are still asked.
  */
 internal fun closedWays(
     lightning: Boolean,
     silent: Boolean,
     donations: Boolean,
     lookingForDonations: Boolean,
+    lookingForLightning: Boolean = false,
 ): List<Pair<Way, String>> = listOfNotNull(
-    (Way.LIGHTNING to "None of your hubs takes Lightning").takeIf { !lightning },
+    when {
+        lightning -> null
+        lookingForLightning -> Way.LIGHTNING to "Looking for a provider…"
+        else -> Way.LIGHTNING to "None of your hubs takes Lightning"
+    },
     (Way.SILENT to "Your hubs don't index silent payments").takeIf { !silent },
     when {
         donations -> null
@@ -151,10 +156,11 @@ internal fun memoOf(typed: String): String? =
 /**
  * What the payer of an invoice asked for an amount pays, and what the
  * wallet gets of it: in words, those differing from the amount only.
+ * `by` made it: the hub, or a provider.
  */
-internal fun invoiceWords(amount: ULong, asks: ULong, gets: ULong): String? = listOfNotNull(
+internal fun invoiceWords(amount: ULong, asks: ULong, gets: ULong, by: String = "the hub"): String? = listOfNotNull(
     "The payer pays ${sat(asks)}".takeIf { asks != amount },
-    "You get ${sat(gets)}, the hub's fee taken".takeIf { gets != asks },
+    "You get ${sat(gets)}, $by's fee taken".takeIf { gets != asks },
 ).joinToString("\n").ifEmpty { null }
 
 /**
@@ -206,7 +212,19 @@ fun Receive(engine: Engine, back: () -> Unit) {
     var copied by remember { mutableStateOf(false) }
     var choosing by rememberSaveable { mutableStateOf(false) }
     val ui by engine.ui.collectAsState()
-    val takesLightning = ui.hubs.any { it.lightning != null }
+    val hubsLightning = ui.hubs.any { it.lightning != null }
+    // Where no hub takes Lightning, a provider's node may make the invoice:
+    // looked for once, out of sight.
+    var providerLightning by remember { mutableStateOf(false) }
+    var lookingForLightning by remember { mutableStateOf(false) }
+    LaunchedEffect(ui.hubs, hubsLightning) {
+        if (hubsLightning) return@LaunchedEffect
+        lookingForLightning = true
+        providerLightning = engine.providerTakesLightning().getOrDefault(false)
+        lookingForLightning = false
+    }
+    val takesLightning = hubsLightning || providerLightning
+    val invoicedBy = if (hubsLightning) "the hub" else "the provider"
     val ways = ways(takesLightning, ui.hubs.any { it.silent }, donations != null)
     // Picked for the amount, unless another way was asked for.
     var chosen by rememberSaveable { mutableStateOf<Way?>(null) }
@@ -390,7 +408,13 @@ fun Receive(engine: Engine, back: () -> Unit) {
                     if (other == Way.LIGHTNING && amount == null) edit() else editing = false
                 }
             }
-            val closed = closedWays(takesLightning, ui.hubs.any { it.silent }, donations != null, lookingForDonations)
+            val closed = closedWays(
+                takesLightning,
+                ui.hubs.any { it.silent },
+                donations != null,
+                lookingForDonations,
+                lookingForLightning,
+            )
             closed.forEach { (other, why) ->
                 Entry(
                     other.label,
@@ -431,7 +455,9 @@ fun Receive(engine: Engine, back: () -> Unit) {
                     Spacer(Modifier.height(32.dp))
                     AmountField(typed, { typed = it }) { done() }
                     Spacer(Modifier.height(16.dp))
-                    if (invoicing && memoTaken(ui.hubs)) MemoField(typedMemo, { typedMemo = it }) { done() }
+                    if (invoicing && (memoTaken(ui.hubs) || !hubsLightning)) {
+                        MemoField(typedMemo, invoicedBy, { typedMemo = it }) { done() }
+                    }
                 }
                 lightning && request != null -> QrCode(request.uppercase())
                 lightning -> if (amount != null && error == null) Waiting()
@@ -489,7 +515,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
             }
             // What the payer pays and the wallet gets, and what the hub is waiting for: nothing else.
             val made = invoice?.takeIf { request != null }
-            val paying = made?.asks?.let { asks -> amount?.let { invoiceWords(it.toULong(), asks, made.amount) } }
+            val paying = made?.asks?.let { asks -> amount?.let { invoiceWords(it.toULong(), asks, made.amount, invoicedBy) } }
             val waits = invoice?.reason?.takeIf { lightning && amount != null && request == null }
             val says = when (way) {
                 Way.SILENT -> "Found once in a block. Each payment lands at an address of its own."
@@ -539,10 +565,11 @@ fun Receive(engine: Engine, back: () -> Unit) {
 
 /**
  * A memo for the invoice, typed under its amount: its payer reads it, and so
- * do the hub and its Lightning node, which the words under it say.
+ * do `by`, the hub or provider making it, and its Lightning node, which the
+ * words under it say.
  */
 @Composable
-private fun MemoField(memo: String, onMemo: (String) -> Unit, done: () -> Unit) {
+private fun MemoField(memo: String, by: String, onMemo: (String) -> Unit, done: () -> Unit) {
     OutlinedTextField(
         value = memo,
         onValueChange = { onMemo(it.take(MAX_MEMO)) },
@@ -558,7 +585,7 @@ private fun MemoField(memo: String, onMemo: (String) -> Unit, done: () -> Unit) 
     )
     Spacer(Modifier.height(4.dp))
     Text(
-        "The payer sees it, and so do the hub and its Lightning node.",
+        "The payer sees it, and so do $by and its Lightning node.",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         textAlign = TextAlign.Center,
