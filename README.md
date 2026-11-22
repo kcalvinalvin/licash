@@ -28,7 +28,8 @@ for day-to-day spending, as a checking account.
   on its own, and you pay out onchain exactly the amount you need. Your
   coins never get spent together, so they can't be clustered.
 - **Lightning without a node.** Pay and receive over Lightning with no
-  channels, no inbound liquidity and no watchtower.
+  channels, no inbound liquidity and no watchtower, through your hub or a
+  swap provider, which can't take the money.
 - **Private payments.** The hub cannot link a note's spending to its
   issuance, and payments leave nothing on Bitcoin.
 - **Receive while offline.** Within a hub, a payer can pay you while your

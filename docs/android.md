@@ -180,7 +180,14 @@ and Receive, given an amount, shows an invoice the hub makes, whose
 notes the app takes once paid. With the amount, a memo may be typed for the
 payer, at a hub that puts one in its invoices (it and its Lightning node
 read it too); the history shows it, as it shows the description of an
-invoice the app paid. Without an amount Receive shows the
+invoice the app paid. Where no hub it trusts takes Lightning, a swap
+provider announced on the hubs' relays that takes payments for wallets
+(`licash-swaps run` with `--lnd` and `--receive`) makes the invoice
+instead, its node holding the payment until the provider locks its notes
+to the app at a hub it trusts, which the app claims as it claims a hub's:
+nothing is trusted to the provider, but it sees the amount, the memo and
+which payments go to one wallet. Receive says the provider's fee taken.
+Without an amount Receive shows the
 wallet's code (its hubs, and its silent payment address); an address on
 Bitcoin any wallet pays, the code alone and the silent payment address
 alone are under Other ways, the address handed out only once asked for.
@@ -193,8 +200,8 @@ are kept and shown again, even unreachable, as an address handed out stays:
 the code while all its hubs are trusted, hubs added since or not; another
 takes its place only once it takes no more donations, or has failed to for a
 week while another can. A way not open says why under Other ways, grayed
-out (no hub taking Lightning or indexing silent payments, no provider
-taking donations, or still looking for one). Tapping a hub in Settings lists its fees. Silent payments
+out (no hub or provider taking Lightning, no hub indexing silent payments,
+no provider taking donations, or still looking for one). Tapping a hub in Settings lists its fees. Silent payments
 before the first block the hub indexed are not found; payments to the
 fallback address are, from the day before the wallet was made.
 
