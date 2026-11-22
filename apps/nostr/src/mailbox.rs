@@ -342,7 +342,7 @@ impl Mailbox {
     }
 
     /// The relays whose answer to the last look asking them was all it
-    /// asks for, [`MAX_MAIL`] gift wraps: anyone may gift wrap to the
+    /// asks for, `MAX_MAIL` gift wraps: anyone may gift wrap to the
     /// mailbox, so newer ones, junk perhaps, may hide an older payment
     /// there. A busy mailbox fills too; a relay answering fewer at most
     /// is not told apart.
