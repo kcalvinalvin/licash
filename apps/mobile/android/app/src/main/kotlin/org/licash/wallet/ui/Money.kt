@@ -82,7 +82,7 @@ fun Money(
         when (at) {
             null -> TopBar("Balance", back)
             ON_BITCOIN -> TopBar("On Bitcoin", back = { go(null) }) {
-                Info("On Bitcoin", "Bitcoin you hold yourself. Protect it to add it to your balance and pay with it.")
+                Info("On Bitcoin", ON_BITCOIN_MEANS)
             }
             else -> TopBar(name(at), back = { go(null) })
         }
@@ -252,7 +252,7 @@ private fun OnBitcoin(engine: Engine, ui: Ui, go: (String?) -> Unit) {
     )
     // What each is called, how much, and its tag for the tests.
     val rows = listOf(
-        Triple("Kept here", b.onchain, "kept"),
+        Triple("In your wallet", b.onchain, "kept"),
         Triple("Being added", b.moving, "moving"),
         Triple("Change coming back", b.opening, "change"),
         Triple("Arriving", coming, "coming"),
@@ -267,7 +267,7 @@ private fun OnBitcoin(engine: Engine, ui: Ui, go: (String?) -> Unit) {
     val offer = ui.offer?.takeIf { ui.opening == null }
     if (offer != null) {
         Spacer(Modifier.height(20.dp))
-        BigButton("Protect and add to balance", Modifier.fillMaxWidth().testTag("offer-protect")) { choosing = true }
+        BigButton("Add to balance, protected", Modifier.fillMaxWidth().testTag("offer-protect")) { choosing = true }
     } else if (b.onchain > 0uL && ui.opening == null) {
         // None offered, perhaps because it is too little for the price: the hub's own page
         // says what protecting costs and what it takes, hub by hub.
@@ -320,3 +320,8 @@ private fun OnBitcoin(engine: Engine, ui: Ui, go: (String?) -> Unit) {
 internal const val UNPROTECTED_MOVE = "In your balance, it is held at your hub: if the hub fails or " +
     "refuses to pay, it is lost. Protection recovers it on Bitcoin instead. Keep it here, or protect it first. " +
     "Your largest coin moves in whole, never joined with another."
+
+/** What money on Bitcoin is, said on its page: safe already, but not spendable in Licash until added. */
+internal const val ON_BITCOIN_MEANS = "Bitcoin you hold yourself: already safe, but paid only on Bitcoin, " +
+    "slowly. Add it to your balance to pay in Licash: protected, through a contract at a hub that " +
+    "covers it, or without protection, on the hub's word."

@@ -43,11 +43,12 @@ it still, and any answer ends the rest.
 Home says when bitcoin paid to the wallet waits outside the balance and no
 protection is offered for it ("N sat on Bitcoin, not in your balance"); it
 opens the page for what is on Bitcoin, which lists each hub's protection to
-open. A payment that finds too little to pay with, and nothing in notes,
-says so in plain words and offers to fix it: "Add to balance" moves the
-largest coin in (unprotected, as it says), "Protect it" opens the
-protection offered for it, if any; a coin still on its way gets no button,
-and with nothing held, Receive. While protection is being set up, Home says
+open. A payment that finds too little to pay with, in notes or none, while
+bitcoin is held or coming, says so in plain words and offers to fix it:
+"Add to balance, protected" opens the protection offered for it, if any,
+and "Add without protection" (or "Add to balance" with none offered) moves
+the largest coin in; a coin still on its way gets no button, and with
+nothing held, Receive. While protection is being set up, Home says
 so instead of how much is protected.
 
 Every tap answers. A button doing work shows it, with the seconds; a sheet
@@ -315,22 +316,29 @@ coin of the wallet's on Bitcoin, spent whole: it pays the reserve and the hub's
 fee, and all the rest of it is the owner's part of the contract, issued back
 to her as notes at that hub once its funding is 3 blocks deep (or claimed by a
 recovery should the hub never issue it), the hub charging its interest on its
-own part only. No change comes back from the coin, so the sheet shows, for the
-coin chosen (at first the smallest that a contract takes), the contract it
-takes: at first the smallest cover at least half again the coin, room to be
-paid more, else the largest the hub allows (at a hub that lets the wallet
-choose, `--contracts-max-cap`, among its sizes, `2^n - 1` sat, at most the
-hub's `--contracts-per-coin` times the coin paying), a slider choosing among
-the covers that take it when several do, the hub's part and hers, and why
-none does, a coin short of the price or beyond what the hub's largest
-contract takes; a slider chooses how long it lasts (at first half a year).
+own part only. No change comes back from the coin. The sheet shows first
+what the hub would hold protected once it opens (its cover bar, then in
+words), then the cover, chosen first: at first the smallest at least half
+again the smallest coin a contract takes whole, room to be paid more, else
+the largest the hub allows for it (at a hub that lets the wallet choose,
+`--contracts-max-cap`, among its sizes, `2^n - 1` sat, at most the hub's
+`--contracts-per-coin` times the coin paying), a slider choosing among every
+cover some coin opens when several do. The cover decides the coins that pay
+it whole, chips when several do, the smallest at first. Then its cost, the
+reserve, and "Into your balance", her part; why no coin pays any, each short
+of the price or beyond what the hub's largest contract takes; and one line
+of what it asks of her, opening the app now and then and before the day it
+ends. Under More, a slider chooses how long it lasts (at first half a
+year), with the hub's part and the cost itemized.
 Covers being powers of two, a hub allowing 2 times the coin leaves most
 coins one. With no coin
 on Bitcoin, the sheet says to cash out to the wallet first. Priced live as the
 hub prices it: its cost (the hub's opening fee and its yearly interest on each
 part, itemized on a tap) apart from her reserve, "refundable", each with an
-(i) saying what it is; how long, the coin and her part are under More. Its
-button says "Waiting for Bitcoin" until the app is caught up, as opening
+(i) saying what it is. Its button says "Protect for" the cost, or "Add for"
+it when offered for a coin on Bitcoin (titled "Add to balance, protected":
+the coin is safe already on Bitcoin, what it gains is being spendable in
+Licash), and "Waiting for Bitcoin" until the app is caught up, as opening
 needs. A hub's "Fees and limits" lists its opening fee, interest, reserve,
 covers and length a short row each. Opening downloads about 100 MB and takes minutes to an hour,
 in the background, one at a time, the step it is at shown; several

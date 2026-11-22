@@ -245,7 +245,8 @@ private fun Offer(engine: Engine, ui: Ui) {
     Spacer(Modifier.height(8.dp))
     Pill(
         icon = Glyphs.shield,
-        text = "Protect ${sat(coin.value)} to pay with it",
+        // Already safe on Bitcoin: what it lacks is being spendable here.
+        text = "Pay with your ${sat(coin.value)} on Bitcoin",
         tint = MaterialTheme.colorScheme.primary,
         tag = "offer",
         onClick = { choosing = true },

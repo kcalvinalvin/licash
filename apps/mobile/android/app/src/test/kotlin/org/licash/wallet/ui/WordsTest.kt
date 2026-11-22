@@ -30,6 +30,8 @@ class WordsTest {
         assertEquals(Lack.OTHER, lack(insufficient = false, noHub = true, notes = 40uL, bitcoin = 100uL, offered = false))
         assertEquals(Lack.OTHER, lack(insufficient = true, noHub = false, notes = 40uL, bitcoin = 0uL, offered = false))
         assertEquals(Lack.OTHER, lack(insufficient = false, noHub = false, notes = 0uL, bitcoin = 100uL, offered = false))
+        // Too little in notes, bitcoin held besides: adding it mends that, notes held or not.
+        assertEquals(Lack.BITCOIN, lack(insufficient = true, noHub = false, notes = 21_000uL, bitcoin = 110_000uL, offered = false))
     }
 
     @Test

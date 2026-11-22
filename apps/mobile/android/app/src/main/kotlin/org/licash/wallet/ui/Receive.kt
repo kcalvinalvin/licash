@@ -493,7 +493,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
             val waits = invoice?.reason?.takeIf { lightning && amount != null && request == null }
             val says = when (way) {
                 Way.SILENT -> "Found once in a block. Each payment lands at an address of its own."
-                Way.BITCOIN -> "Found once in a block. Once paid, the next address shows. Protect it then, to pay with it."
+                Way.BITCOIN -> "Found once in a block. Once paid, the next address shows. Add it to your balance then, to pay with it."
                 Way.DONATIONS -> donations?.let { donationWords(it) }
                 else -> paying ?: waits
             }

@@ -419,14 +419,16 @@ enum class Lack {
 /**
  * Where a payment that failed sends its payer. A contract offered comes
  * first, as it always has, for `insufficient` or an empty balance, whatever
- * else went wrong. Otherwise only a balance too small (`insufficient`, or
- * `noHub`: no hub the code names holds the amount) with no notes at all is
- * told to look at what is `bitcoin` held or coming, or to receive: any
- * other failure is said as it is, and so is one with notes held, which
- * more bitcoin does not mend.
+ * else went wrong. Then a balance too small (`insufficient`) with `bitcoin`
+ * held or coming, notes held or not: adding it mends that. Otherwise only
+ * `noHub` (no hub the code names holds the amount) with no notes at all is
+ * told to look at bitcoin, or to receive: any other failure is said as it
+ * is, and so is `noHub` with notes held elsewhere, which more bitcoin does
+ * not mend.
  */
 fun lack(insufficient: Boolean, noHub: Boolean, notes: ULong, bitcoin: ULong, offered: Boolean): Lack = when {
     offered && (insufficient || notes == 0uL) -> Lack.OFFER
+    insufficient && bitcoin > 0uL -> Lack.BITCOIN
     notes != 0uL || !(insufficient || noHub) -> Lack.OTHER
     bitcoin > 0uL -> Lack.BITCOIN
     else -> Lack.NOTHING

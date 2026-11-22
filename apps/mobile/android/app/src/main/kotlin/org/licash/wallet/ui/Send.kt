@@ -517,13 +517,25 @@ fun Send(
                             is Step.Failed -> Ask(s.title, s.why, "Try again", { step = Step.Looking }, back, failed = true)
                             is Step.AddFirst -> Outcome(
                                 Tone.ASK,
-                                "Your bitcoin isn't in your balance yet",
+                                if (ui.balance.notes > 0uL) "Not enough in your balance" else "Your bitcoin isn't in your balance yet",
                                 "${s.why}\n\n" + addFirst(s.addable, s.offered && offer != null),
                                 detailTag = "ask",
                             ) {
                                 // On its way only: nothing to do but wait.
+                                // Protected first where offered, as on the page for what is on Bitcoin.
+                                val protectable = s.offered && offer != null
+                                if (protectable) {
+                                    BigButton("Add to balance, protected", Modifier.fillMaxWidth().testTag("protect-it")) {
+                                        protecting = true
+                                    }
+                                    Spacer(Modifier.height(12.dp))
+                                }
                                 if (s.addable) {
-                                    BigButton("Add to balance", Modifier.fillMaxWidth().testTag("add-to-balance")) {
+                                    BigButton(
+                                        if (protectable) "Add without protection" else "Add to balance",
+                                        Modifier.fillMaxWidth().testTag("add-to-balance"),
+                                        quiet = protectable,
+                                    ) {
                                         step = Step.Busy
                                         scope.launch {
                                             step = engine.moveLargest().fold(
@@ -531,12 +543,6 @@ fun Send(
                                                 { Step.Failed(explain(it), "Couldn't add it") },
                                             )
                                         }
-                                    }
-                                    Spacer(Modifier.height(12.dp))
-                                }
-                                if (s.offered && offer != null) {
-                                    BigButton("Protect it", Modifier.fillMaxWidth().testTag("protect-it"), quiet = true) {
-                                        protecting = true
                                     }
                                     Spacer(Modifier.height(12.dp))
                                 }
@@ -576,8 +582,8 @@ fun Send(
  */
 internal fun addFirst(addable: Boolean, offered: Boolean): String = when {
     !addable -> "You pay from your balance, and your bitcoin is still on its way to it. Try again once it has arrived."
-    offered -> "You pay from your balance. Add your largest coin to it now, held at your hub without protection, " +
-        "or protect it first: safer, for a fee."
+    offered -> "You pay from your balance. Add your bitcoin to it: protect it first, covered by a contract " +
+        "at your hub, for a fee, or add your largest coin now without protection."
     else -> "You pay from your balance. Add your largest coin to it now, held at your hub without protection."
 }
 
