@@ -42,6 +42,10 @@ pub const HEALTH: &str = "/health";
 /// unavailable at once, rather than queued without bound.
 pub const MAX_SERVING: usize = 256;
 
+/// How long a request's body may take to arrive in [`shed`]: a hub's
+/// largest (1 MiB) at 17 KB/s, a provider's (64 KiB) at 1 KB/s.
+pub const BODY_TIME: Duration = Duration::from_secs(60);
+
 /// A chain source, as the provider reads Bitcoin and broadcasts through it.
 pub struct ChainView(pub Source);
 
@@ -119,6 +123,13 @@ fn routes<T: Transport + 'static, C: Chain + Send + 'static>(
 /// any past them answered unavailable (503) at once. A hub serving the
 /// swaps into it ([`api`]) bounds them with its own.
 pub fn shed(router: Router, most: usize) -> Router {
+    shed_saying(router, most, "the provider is too busy now")
+}
+
+/// [`shed`], answering `busy` past `most`. A request's body still arriving
+/// [`BODY_TIME`] after its head fails, the request refused: a client
+/// stalling its bodies holds its places no longer.
+pub fn shed_saying(router: Router, most: usize, busy: &'static str) -> Router {
     let serving = Arc::new(tokio::sync::Semaphore::new(most));
     router.layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| {
@@ -129,13 +140,35 @@ pub fn shed(router: Router, most: usize) -> Router {
                 }
                 let Ok(_serving) = serving.try_acquire_owned() else {
                     tracing::warn!(path = %request.uri().path(), "too busy to serve");
-                    let busy = Problem::new(Code::Unavailable, "the provider is too busy now");
-                    return Failure(busy).into_response();
+                    return Failure(Problem::new(Code::Unavailable, busy)).into_response();
                 };
-                next.run(request).await
+                next.run(within(request, BODY_TIME)).await
             }
         },
     ))
+}
+
+/// `request`, its body failing if still arriving `time` from now.
+fn within(request: axum::extract::Request, time: Duration) -> axum::extract::Request {
+    use futures_util::StreamExt as _;
+    let until = tokio::time::Instant::now() + time;
+    request.map(|body| {
+        let data = body.into_data_stream();
+        axum::body::Body::from_stream(futures_util::stream::unfold(
+            Some(data),
+            move |data| async move {
+                let mut data = data?;
+                match tokio::time::timeout_at(until, data.next()).await {
+                    Ok(Some(chunk)) => Some((chunk, Some(data))),
+                    Ok(None) => None,
+                    Err(_) => {
+                        let late = axum::Error::new("the request's body came too slowly");
+                        Some((Err(late), None))
+                    }
+                }
+            },
+        ))
+    })
 }
 
 fn paths<T: Transport + 'static, C: Chain + Send + 'static>(

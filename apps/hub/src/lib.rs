@@ -295,38 +295,25 @@ pub fn router(hub: Arc<Hub>, services: Services) -> Router {
                 .with_state(index),
         );
     }
-    if let Some(openings) = contracts {
-        // Its own body limit: an opening's messages are large.
-        api = api.merge(licash_contracts::hub::router(openings));
-    }
     if let Some(swaps) = swaps {
-        // Its own body limit too, of a provider's requests.
+        // Its own body limit, of a provider's requests.
         api = api.merge(swaps);
     }
-    shed(api.layer(DefaultBodyLimit::max(BODY_LIMIT)), MAX_SERVING)
-        .layer(TraceLayer::new_for_http())
+    let mut api = shed(api.layer(DefaultBodyLimit::max(BODY_LIMIT)), MAX_SERVING);
+    if let Some(openings) = contracts {
+        // Its own body limit, budgets and times: an opening's messages are
+        // large, and arrive slowly over Tor.
+        api = api.merge(licash_contracts::hub::router(openings));
+    }
+    api.layer(TraceLayer::new_for_http())
 }
 
 /// `router`, serving at most `most` requests at once but its [`HEALTH`]:
-/// any past them answered unavailable (503) at once.
+/// any past them answered unavailable (503) at once, and any whose body is
+/// still arriving [`licash_swaps_service::BODY_TIME`] after its head
+/// refused.
 pub fn shed(router: Router, most: usize) -> Router {
-    let serving = Arc::new(tokio::sync::Semaphore::new(most));
-    router.layer(axum::middleware::from_fn(
-        move |request: axum::extract::Request, next: axum::middleware::Next| {
-            let serving = serving.clone();
-            async move {
-                if request.uri().path() == HEALTH {
-                    return next.run(request).await;
-                }
-                let Ok(_serving) = serving.try_acquire_owned() else {
-                    tracing::warn!(path = %request.uri().path(), "too busy to serve");
-                    let busy = Problem::new(Code::Unavailable, "the hub is too busy now");
-                    return Failure(busy).into_response();
-                };
-                next.run(request).await
-            }
-        },
-    ))
+    licash_swaps_service::shed_saying(router, most, "the hub is too busy now")
 }
 
 /// A [`Problem`] answered with its status.

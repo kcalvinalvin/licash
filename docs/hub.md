@@ -291,9 +291,11 @@ reservation is not by itself proof that it owns a gateway's existing lock:
 the recorded lock id decides ownership during recovery.
 
 The hub serves at most 256 requests at once (`/health` aside); any past
-them, of its own API, its contracts' or its swaps', receive 503 at once
-rather than wait in a queue. A swap provider serving on its own bounds
-its requests alike.
+them, of its own API or its swaps', receive 503 at once rather than wait
+in a queue. A request whose body is still arriving 60 seconds after its
+head is refused, so stalled uploads keep no place for longer. A swap
+provider serving on its own bounds its requests alike. Contract requests
+are outside those 256, under budgets and times of their own.
 
 Contract HTTP requests have separate admission budgets for new openings,
 progress and instance downloads; excess requests receive 503 before body

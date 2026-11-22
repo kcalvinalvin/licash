@@ -736,3 +736,41 @@ async fn requests_past_the_most_at_once_are_unavailable() {
     let served = app.oneshot(get("/fast")).await.unwrap();
     assert_eq!(served.status(), StatusCode::OK);
 }
+
+/// A body still arriving [`licash_swaps_service::BODY_TIME`] after its
+/// request came is refused, its place freed: requests whose bodies stall
+/// keep no other out for longer. One arriving slowly but in time is served.
+#[tokio::test(start_paused = true)]
+async fn a_body_stalled_past_its_time_frees_its_place() {
+    use axum::body::Bytes;
+    use licash_swaps_service::BODY_TIME;
+    let app = Router::new().route(
+        "/",
+        post(|body: Bytes| async move { body.len().to_string() }),
+    );
+    let app = licash_swaps_service::shed(app, 1);
+    let post = |body: Body| Request::post("/").body(body).unwrap();
+    let stalled =
+        Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+    let stalled = tokio::spawn(app.clone().oneshot(post(stalled)));
+    tokio::time::sleep(BODY_TIME - Duration::from_secs(1)).await;
+    let busy = app.clone().oneshot(post(Body::from("x"))).await.unwrap();
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let refused = tokio::time::timeout(Duration::from_secs(2), stalled).await;
+    let refused = refused.expect("still held").unwrap().unwrap();
+    assert!(refused.status().is_client_error(), "{}", refused.status());
+    let served = app.clone().oneshot(post(Body::from("x"))).await.unwrap();
+    assert_eq!(served.status(), StatusCode::OK);
+    // A chunk every tenth of its time: all of it in time.
+    let slow = futures_util::stream::unfold(0, |sent| async move {
+        if sent == 9 {
+            return None;
+        }
+        tokio::time::sleep(BODY_TIME / 10).await;
+        Some((Ok::<_, std::io::Error>(Bytes::from_static(b"ab")), sent + 1))
+    });
+    let served = app.oneshot(post(Body::from_stream(slow))).await.unwrap();
+    assert_eq!(served.status(), StatusCode::OK);
+    let body = served.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"18");
+}
