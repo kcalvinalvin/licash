@@ -677,7 +677,7 @@ pub enum Evidence {
     /// those inputs alone: whoever signed a spend of her note gave it up,
     /// whatever else the spend took and made, so what it costs to read
     /// does not grow with either. Shown to execute a Plain source it is
-    /// signed for by every input of it ([`void`]).
+    /// signed for by every input of it (`void`).
     ///
     /// Of a granted spend, with what its owners signed of the grant
     /// ([`GrantHead`]) and the unlock, the secret of the key they signed:
