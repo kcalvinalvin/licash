@@ -197,7 +197,7 @@ class WordsTest {
             transferred(Transfer(1_000_000uL, 10uL, 541_000_000uL)),
         )
         assertEquals(
-            "0.1 MB of about 251 MB · 0.0 MB/s · about 33 h left",
+            "0.1 MB of about 251 MB · 2 kB/s · about 33 h left",
             transferred(Transfer(100_000uL, 48uL, 251_000_000uL)),
         )
         // While the wallet prepares the contract itself, its slow start says nothing of the network.

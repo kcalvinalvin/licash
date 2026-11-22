@@ -378,7 +378,8 @@ fun transferred(t: Transfer, busy: Boolean = false): String {
     val parts = mutableListOf("${megabytes(t.bytes)} of about ${megabytes(t.expected)}")
     if (!busy && t.seconds > 0uL && t.bytes > 0uL) {
         val rate = t.bytes / t.seconds
-        parts += "${megabytes(rate)}/s"
+        // Under 0.1 MB/s, as over Tor at times, in kB/s: not 0.0 MB/s.
+        parts += if (rate < 100_000uL) "${rate / 1000uL} kB/s" else "${megabytes(rate)}/s"
         if (t.expected > t.bytes && rate > 0uL) {
             val left = ((t.expected - t.bytes) / rate).toLong()
             parts += when {
