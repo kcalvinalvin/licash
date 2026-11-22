@@ -1802,7 +1802,13 @@ fn a_short_command_collects_in_the_background_for_the_next_history() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let history = ok(wallet(&bob, &["history"], None));
-        if history.contains("received  30 sat") {
+        let unlinked: i64 = rusqlite::Connection::open(&bob)
+            .unwrap()
+            .query_row("SELECT count(*) FROM notes WHERE unlinked = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        if history.contains("received  30 sat") && unlinked > 0 {
             break;
         }
         assert!(std::time::Instant::now() < deadline, "{history}");

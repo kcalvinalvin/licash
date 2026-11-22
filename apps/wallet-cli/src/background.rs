@@ -20,6 +20,7 @@ pub struct Collection {
     wallet: PathBuf,
     tor: bool,
     proxy: Option<String>,
+    renew_ppm: u32,
 }
 
 impl Collection {
@@ -28,6 +29,7 @@ impl Collection {
             wallet,
             tor: cli.tor,
             proxy: cli.proxy.clone(),
+            renew_ppm: cli.renew_ppm,
         }
     }
 
@@ -49,7 +51,7 @@ impl Collection {
             .arg("collect-background")
             .env("LICASH_WALLET_TOR", if self.tor { "true" } else { "false" })
             .env_remove("LICASH_WALLET_PROXY")
-            .env_remove("LICASH_WALLET_RENEW_PPM")
+            .env("LICASH_WALLET_RENEW_PPM", self.renew_ppm.to_string())
             .env_remove("LICASH_WALLET_LOG")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -90,10 +92,21 @@ impl Collection {
 
     /// Explicit collection waits for any pass that already has the wallet.
     /// Watch releases this guard between passes.
-    pub async fn wait_for_turn(&self) -> anyhow::Result<File> {
+    pub async fn wait_for_turn(&self) -> Option<File> {
+        let mut waiting = false;
         loop {
-            if let Some(file) = self.lock(true)? {
-                return Ok(file);
+            match self.lock(true) {
+                Ok(Some(file)) => return Some(file),
+                Ok(None) => {
+                    if !waiting {
+                        eprintln!("Waiting for another collection pass to finish…");
+                        waiting = true;
+                    }
+                }
+                Err(e) => {
+                    warn(&format!("could not coordinate collection ({e:#})"));
+                    return None;
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -107,6 +120,7 @@ impl Collection {
         let collect = async {
             let (http, tor) = transport_at(&self.wallet, self.tor, self.proxy.as_deref())?;
             let wallet = Wallet::open(&self.wallet, http)?;
+            wallet.set_renew_limit(self.renew_ppm);
             if !wallet.hubs()?.is_empty() {
                 let route = route(tor, self.proxy.as_deref())?;
                 let collected = licash_nostr::wallet::collect(&wallet, &route).await?;
@@ -116,6 +130,9 @@ impl Collection {
                         warnings.push('\n');
                     }
                 });
+                if !collected.received.is_empty() {
+                    wallet.unlink().await.context("unlink collected notes")?;
+                }
             }
             anyhow::Ok(())
         };

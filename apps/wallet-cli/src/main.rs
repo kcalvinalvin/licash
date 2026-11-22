@@ -868,8 +868,13 @@ async fn run(cli: Cli, collection: &mut Option<background::Collection>) -> anyho
             }
             show(json, json!({ "codes": rows }), lines.join("\n"));
         }
-        Command::NewCode { label } => {
-            let code = wallet.add_code(&label).await?;
+        Command::NewCode { ref label } => {
+            let code = {
+                let _turn = background::Collection::new(path.clone(), &cli)
+                    .wait_for_turn()
+                    .await;
+                wallet.add_code(label).await?
+            };
             let hubs = contract::code_hubs(&wallet, &path)?;
             let text = match hubs.is_empty() {
                 true => None,
@@ -2047,7 +2052,7 @@ async fn watch(
     let mut kept = None;
     loop {
         let collected = {
-            let _turn = background.wait_for_turn().await?;
+            let _turn = background.wait_for_turn().await;
             licash_nostr::wallet::collect_kept(wallet, route, &mut kept).await
         };
         let received = match collected {
@@ -2158,7 +2163,7 @@ async fn mailbox(
     json: bool,
 ) -> anyhow::Result<()> {
     let collected = {
-        let _turn = background.wait_for_turn().await?;
+        let _turn = background.wait_for_turn().await;
         licash_nostr::wallet::collect(wallet, route).await?
     };
     let (code_rows, code_lines): (Vec<_>, Vec<_>) =

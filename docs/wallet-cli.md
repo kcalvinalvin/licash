@@ -92,6 +92,8 @@ failures on stderr. Use `--no-collect` or
 `LICASH_WALLET_NO_COLLECT=true` to skip the background check. Run `collect`
 to wait for collection to finish now. Keep `watch` running, or schedule
 `deliver`, to send fallback mail while the wallet is otherwise idle.
+Restart an existing `watch` process after upgrading so it shares the
+collection lock with the new CLI.
 `pay` does not mail older receipts:
 a slow relay must not delay a new payment kept at its hub. Its change is
 still unlinked before exit. Payments kept at the hub appear on Nostr only
