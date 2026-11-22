@@ -749,8 +749,25 @@ fn a_phone_refuses_what_it_cannot_do_and_retries_an_uncertain_broadcast() {
         "{down:?}"
     );
     assert!(alice.hubs().unwrap().is_empty());
+    // Not answering, it rests: passed over at once by the app's own
+    // rounds, asked still when the user adds it.
+    assert!(alice.hub_resting_ms("http://127.0.0.1:1".into()).is_some());
+    let passed = alice.relearn_hub("http://127.0.0.1:1".into());
+    assert!(
+        matches!(&passed, Err(LicashError::Unavailable { reason }) if reason.contains("did not answer lately")),
+        "{passed:?}"
+    );
+    let asked = alice.add_hub("http://127.0.0.1:1".into());
+    assert!(
+        matches!(&asked, Err(LicashError::Unavailable { reason }) if !reason.contains("lately")),
+        "{asked:?}"
+    );
+    assert_eq!(alice.hub_answers_ms("http://127.0.0.1:1".into()), None);
     let hub = alice.add_hub(net.url.clone()).unwrap();
     assert!(hub.silent && !hub.mailbox);
+    assert!(alice.hub_answers_ms(net.url.clone()).is_some());
+    assert_eq!(alice.hub_resting_ms(net.url.clone()), None);
+    assert_eq!(alice.relearn_hub(net.url.clone()).unwrap().url, hub.url);
     // A hub naming no relays: no mailbox to look in.
     assert!(alice.collect().unwrap().is_empty());
 

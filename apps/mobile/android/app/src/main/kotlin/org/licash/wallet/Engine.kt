@@ -116,7 +116,7 @@ data class Ui(
     val problem: String? = null,
     /** Whether each hub answered when last asked, by URL: none before it is asked. In memory only. */
     val hubsReached: Map<String, Boolean> = emptyMap(),
-    /** How long each hub reached took to answer what it serves, in milliseconds, by URL. */
+    /** How fast each hub reached answers, in milliseconds, by URL: its fastest answer of the last minutes. */
     val hubsMs: Map<String, Long> = emptyMap(),
     /** Whether the mailbox's relays were reached when last looked in, if looked in. In memory only. */
     val relaysReached: Boolean? = null,
@@ -928,23 +928,24 @@ class Engine(context: Context) {
 
     /** Learn again what each hub trusted serves: it may have changed since added. */
     private suspend fun learnHubs(hubs: List<Hub>) {
-        val reached = mutableMapOf<String, Boolean>()
-        val took = mutableMapOf<String, Long>()
+        val reached = state.value.hubsReached.filterKeys { url -> hubs.any { it.url == url } }.toMutableMap()
+        val took = state.value.hubsMs.filterKeys { url -> hubs.any { it.url == url } }.toMutableMap()
         for (hub in hubs) {
+            // One not answering lately passed over at once, not waited on
+            // again with the wallet held.
             reached[hub.url] = try {
-                // Timed once it has the wallet: not the wait for it.
-                took[hub.url] = locked {
-                    val asked = SystemClock.elapsedRealtime()
-                    it.addHub(hub.url)
-                    SystemClock.elapsedRealtime() - asked
-                }
+                locked { it.relearnHub(hub.url) }
                 true
             } catch (e: LicashException) {
                 AppLog.warn("learning what ${hub.url} serves", e)
                 false
             }
+            // Its fastest answer lately: a round trip, not a circuit built.
+            val ms = local { it.hubAnswersMs(hub.url) }
+            if (ms == null) took.remove(hub.url) else took[hub.url] = ms.toLong()
+            // Said as each answers, or not: not once the slowest has.
+            state.update { it.copy(hubsReached = reached.toMap(), hubsMs = took.toMap()) }
         }
-        state.update { it.copy(hubsReached = reached, hubsMs = took) }
         hubsLearned = true
         hubsLearnedAt = System.currentTimeMillis()
     }
@@ -1432,12 +1433,14 @@ class Engine(context: Context) {
 
     suspend fun addHub(url: String): Result<Hub> = io {
         val hub = locked {
-            val asked = SystemClock.elapsedRealtime()
             it.addHub(url).also { added ->
-                val ms = SystemClock.elapsedRealtime() - asked
                 // Reached: the connections say so before learnHubs asks again.
+                val ms = it.hubAnswersMs(added.url)?.toLong()
                 state.update { s ->
-                    s.copy(hubsReached = s.hubsReached + (added.url to true), hubsMs = s.hubsMs + (added.url to ms))
+                    s.copy(
+                        hubsReached = s.hubsReached + (added.url to true),
+                        hubsMs = if (ms == null) s.hubsMs - added.url else s.hubsMs + (added.url to ms),
+                    )
                 }
             }
         }

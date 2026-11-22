@@ -26,13 +26,19 @@ keeps up with new blocks as usual and only behind once 30 s behind or with
 no node, each hub as it answered when
 last asked, every 5 minutes, and the mailbox's relays as last looked in,
 kept in memory only); tapped, it says each with how long it took to
-answer (Bitcoin's nodes' shortest ping, a hub's info, a look in the
+answer (Bitcoin's nodes' shortest ping, a hub's fastest answer of the last
+minutes, a round trip on a circuit already open, a look in the
 mailbox finding nothing to redeem), lists Bitcoin's steps under it while catching up in advanced
 mode, and offers turning Tor off once Tor keeps the app from Bitcoin for
 3 minutes (not connected, or no node answering through it, not counting
 the minutes importing pinned headers before any node is asked), or says
 it is stuck. Notifications are asked for once a wallet
-is made or restored.
+is made or restored. A hub, or any host, that did not answer is passed
+over by what the app does by itself (looking for payments, finishing what
+is under way, the inbox, learning what each hub serves) for 30 s, then 1,
+2 and 5 minutes while it keeps not answering, rather than waited on again
+for up to two minutes with the wallet held; what the user asks for asks
+it still, and any answer ends the rest.
 
 Home says when bitcoin paid to the wallet waits outside the balance and no
 protection is offered for it ("N sat on Bitcoin, not in your balance"); it

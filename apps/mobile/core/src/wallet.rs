@@ -416,6 +416,33 @@ impl Wallet {
         Ok(hub(&kept.unwrap_or_else(|| url.to_owned()), &info))
     }
 
+    /// [`Wallet::add_hub`] again, for what the hub at `url` serves now,
+    /// as the app asks by itself: not while it did not answer lately
+    /// ([`Wallet::hub_resting_ms`]), unavailable at once instead.
+    pub fn relearn_hub(&self, url: String) -> Result<Hub, LicashError> {
+        if let Some(ms) = self.hub_resting_ms(url.clone()) {
+            return Err(LicashError::Unavailable {
+                reason: format!("it did not answer lately, asked again in {} s", ms.div_ceil(1000)),
+            });
+        }
+        self.add_hub(url)
+    }
+
+    /// How much longer, in ms, what runs by itself passes over the hub at
+    /// `url`, since it did not answer: none if it answered.
+    pub fn hub_resting_ms(&self, url: String) -> Option<u64> {
+        let rest = self.wallet.transport().resting(&url)?;
+        Some(u64::try_from(rest.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    /// How fast the hub at `url` answers, in ms: its fastest answer of the
+    /// last minutes, a round trip on a circuit already open. None if it
+    /// answered none lately.
+    pub fn hub_answers_ms(&self, url: String) -> Option<u64> {
+        let took = self.wallet.transport().answers_in(&url)?;
+        Some(u64::try_from(took.as_millis()).unwrap_or(u64::MAX))
+    }
+
     /// The hubs trusted, by URL.
     pub fn hubs(&self) -> Result<Vec<Hub>, LicashError> {
         let hubs = self.wallet.hubs()?;
@@ -947,6 +974,7 @@ impl Wallet {
     /// way.
     pub fn collect_now(self: Arc<Self>) -> Result<Vec<Activity>, LicashError> {
         let _timed = crate::log::timed("collect_now");
+        let _background = licash_wallet::Background::enter();
         let received = self.collecting()?;
         if !received.is_empty() {
             tracing::info!(payments = received.len(), "received");
@@ -1198,6 +1226,9 @@ impl Wallet {
     /// the payments due to their payees.
     pub fn resume(&self) -> Result<(), LicashError> {
         let _timed = crate::log::timed("resume");
+        // What is left to do retried each round: a hub not answering
+        // lately is not waited on again (as ends, refunds and the like).
+        let _background = licash_wallet::Background::enter();
         let delivering = self.delivering();
         // Moves kept before their hub answered, by earlier versions: none
         // paid them, as no address was named, and a move asks anew.
@@ -1535,6 +1566,7 @@ impl Wallet {
     /// held only.
     pub fn scan(&self, chain: Arc<dyn ChainSource>) -> Result<Scan, LicashError> {
         let _timed = crate::log::timed("scan");
+        let _background = licash_wallet::Background::enter();
         let hubs = self.wallet.hubs()?;
         if hubs.is_empty() {
             return Err(LicashError::invalid(
@@ -1644,6 +1676,7 @@ impl Wallet {
     /// in yet. Shown, never spent: only a scan finds coins.
     pub fn incoming(&self, chain: Arc<dyn ChainSource>) -> Result<Vec<Activity>, LicashError> {
         let _timed = crate::log::timed("incoming");
+        let _background = licash_wallet::Background::enter();
         let mut txs = Vec::new();
         for script in self.wallet.fallback_scripts()? {
             let raw = chain
