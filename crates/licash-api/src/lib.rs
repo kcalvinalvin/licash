@@ -1008,7 +1008,9 @@ pub struct ContractRange {
     pub min_blocks: u32,
     pub max_blocks: u32,
     /// Its cap at most this many times the value of the coin its holder
-    /// deposits.
+    /// deposits: a bound hubs before none was announce and enforce. Hubs
+    /// since announce `u32::MAX`, none, what she pays pricing their part;
+    /// kept for wallets that read it, which need it there.
     pub per_coin: u32,
     /// Her reserve, from her deposit, returned as it closes.
     pub reserve: u64,

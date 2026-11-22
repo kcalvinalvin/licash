@@ -71,9 +71,6 @@ impl Openings {
         };
         // Reject cheap size/collateral and policy failures before node RPC.
         self.timing()
-            .covers(opening.quote.cap, open.coin.value.to_sat())
-            .map_err(Refused::bad)?;
-        self.timing()
             .allows(opening.quote.cap, terms::lock_of(&opening.quote))
             .map_err(Refused::bad)?;
         self.terms_of(&opening.quote, steps).await?;

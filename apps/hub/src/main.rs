@@ -197,17 +197,6 @@ struct Chain {
         requires = "contracts_max_cap"
     )]
     contracts_max_blocks: u32,
-    /// A contract's cap at most this many times the coin its holder
-    /// deposits, with `--contracts-max-cap`: no small coin locks much of
-    /// the hub's.
-    #[arg(
-        long = "contracts-per-coin",
-        value_name = "TIMES",
-        env = "LICASH_HUB_CONTRACTS_PER_COIN",
-        default_value_t = 2,
-        requires = "contracts_max_cap"
-    )]
-    contracts_per_coin: u32,
     /// What a contract costs over the fixed price, in millionths of the
     /// part of its cap the hub funds for each year it lasts (52 560
     /// blocks, Mutinynet's 1 051 200), with `--contracts-max-cap`: 10 000 is 1% a year.
@@ -265,7 +254,6 @@ impl Chain {
             .map(|max_cap| licash_contracts::hub::terms::Range {
                 max_cap,
                 max_blocks: self.contracts_max_blocks,
-                per_coin: self.contracts_per_coin,
                 ppm_year: self.contracts_rate,
                 ppm_year_funded: self.contracts_rate_funded,
             })

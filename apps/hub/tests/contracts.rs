@@ -125,7 +125,6 @@ async fn a_hub_learns_what_its_contracts_wallet_holds() -> Result<()> {
     let range = Range {
         max_cap: licash_contracts::hub::terms::MAX_CAP,
         max_blocks: 5_000,
-        per_coin: 2,
         ppm_year: 10_000,
         ppm_year_funded: 0,
     };
@@ -491,13 +490,12 @@ async fn a_hub_opens_contracts_on_its_newest_lock_checkpoint() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs bitcoind and a release build"]
-async fn a_wallet_opens_a_contract_of_terms_it_chose_on_its_large_coin() -> Result<()> {
+async fn a_wallet_opens_a_contract_of_terms_it_chose_on_a_small_coin() -> Result<()> {
     let rt = Regtest::start_standard()?;
     let dir = tempfile::tempdir()?;
     let range = Range {
         max_cap: 50_000_000,
         max_blocks: 5_000,
-        per_coin: 2,
         ppm_year: 10_000,
         ppm_year_funded: 0,
     };
@@ -517,7 +515,8 @@ async fn a_wallet_opens_a_contract_of_terms_it_chose_on_its_large_coin() -> Resu
     let info = wallet.add_hub(&url).await?;
     let offered = info.contracts.context("no contracts in the hub's info")?;
     let chosen = offered.range.context("no range in the hub's info")?;
-    ensure!((chosen.min_blocks, chosen.max_blocks, chosen.per_coin) == (200, 5_000, 2));
+    // No bound on the cap by her coin, announced as none.
+    ensure!((chosen.min_blocks, chosen.max_blocks, chosen.per_coin) == (200, 5_000, u32::MAX));
     // Its fixed terms priced by the same formula: 1% a year of their cap.
     let fixed_price = chosen.price(131_071, 1_000, 0);
     ensure!(fixed_price == 23_000 + 24, "{fixed_price}");
@@ -539,52 +538,39 @@ async fn a_wallet_opens_a_contract_of_terms_it_chose_on_its_large_coin() -> Resu
     let half = half.map_err(anyhow::Error::msg)?;
     ensure!(half.status == 400, "{}", half.status);
 
-    // Her 1.1 M sat coin, which a contract of the largest size 2^21 - 1 takes
-    // whole, her part of it in the notes a claim names, and a small one.
+    // Two small coins, each paying a price and her part of a contract in
+    // the notes a claim names.
     wallet.watch_silent(None, rt.height()?)?;
-    for sats in [1_100_000, 70_000] {
+    for sats in [70_000, 65_000] {
         let to = wallet.fallback_address()?.script_pubkey();
         rt.fund(&to, Amount::from_sat(sats))?;
     }
     rt.mine(1)?;
-    ensure!(scan(&wallet, &chain).await? == 1_170_000);
+    ensure!(scan(&wallet, &chain).await? == 135_000);
     let small = wallet.silent_coins()?;
     let small = small
         .iter()
         .find(|c| c.value == 70_000)
         .context("no coin")?;
 
-    // 2^21 - 1 sat on her small coin: more than twice it, no contract
-    // absorbs it; nothing kept.
+    // 2^21 - 1 sat on her 70 000 sat coin, 30 times it: the hub funds the
+    // rest, its interest priced on it. F funded whole.
+    let tip = rt.height()?;
     let ask = Ask {
         blocks: 2_000,
         max_price: price,
         cap: Some(2_097_151),
         deposit: Some(small.outpoint),
     };
-    let refused = holder::open(&wallet, &chain, &mine.join("wallet.sqlite"), &url, ask).await;
-    let refused = format!("{:#}", refused.unwrap_err());
-    ensure!(
-        refused.contains("no contract of this hub absorbs it whole"),
-        "{refused}"
-    );
-    ensure!(holder::list(&mine.join("wallet.sqlite"))?.is_empty());
-
-    // On the coin large enough, the smallest that is: F funded whole.
-    let tip = rt.height()?;
-    let ask = Ask {
-        deposit: None,
-        ..ask
-    };
     let first = holder::open(&wallet, &chain, &mine.join("wallet.sqlite"), &url, ask).await?;
     ensure!(first.phase == Phase::Funded, "{first:?}");
-    ensure!(first.cap == 2_097_151 && first.value == 1_100_000);
+    ensure!(first.cap == 2_097_151 && first.value == 70_000);
     // Her part of it, her coin's rest, the hub charges no interest on.
     ensure!(first.price == chosen.price(2_097_151, 2_000, first.funded as u32));
     ensure!(first.price <= price);
     ensure!((first.close_height, first.assert_height) == (tip + 2_000, tip + 1_834));
 
-    // Of the fixed terms beside it, on her small coin, as an app
+    // Of the fixed terms beside it, on her other coin, as an app
     // installed asks.
     let fixed = Ask {
         blocks: 300,
@@ -593,7 +579,7 @@ async fn a_wallet_opens_a_contract_of_terms_it_chose_on_its_large_coin() -> Resu
         deposit: None,
     };
     let second = holder::open(&wallet, &chain, &mine.join("wallet.sqlite"), &url, fixed).await?;
-    ensure!(second.cap == 131_071 && second.value == 70_000);
+    ensure!(second.cap == 131_071 && second.value == 65_000);
     ensure!(second.price == chosen.price(131_071, 300, second.funded as u32));
 
     // Both live; the hub's collateral for hers 2^21 - 1 sat at least.
@@ -1529,7 +1515,6 @@ async fn with_notes<T: licash_wallet::Transport>(seed: [u8; 32], transport: T) -
     let range = Range {
         max_cap: licash_contracts::hub::terms::MAX_CAP,
         max_blocks: 5_000,
-        per_coin: 2,
         ppm_year: 10_000,
         ppm_year_funded: 0,
     };
@@ -2412,7 +2397,6 @@ async fn a_holder_recovers_her_cap_of_notes_beyond_it_from_a_hub_that_answered()
     let range = Range {
         max_cap: 50_000_000,
         max_blocks: 5_000,
-        per_coin: 2,
         ppm_year: 10_000,
         ppm_year_funded: 0,
     };
@@ -2625,7 +2609,6 @@ async fn stale_copy<T: licash_wallet::Transport>(
     let range = Range {
         max_cap: 50_000_000,
         max_blocks: 5_000,
-        per_coin: 2,
         ppm_year: 10_000,
         ppm_year_funded: 0,
     };
@@ -2941,7 +2924,6 @@ async fn a_force_close_claims_an_unsettled_locks_refund_once_expired_at_depth() 
     let range = Range {
         max_cap: 50_000_000,
         max_blocks: 5_000,
-        per_coin: 2,
         ppm_year: 10_000,
         ppm_year_funded: 0,
     };
@@ -3078,7 +3060,6 @@ async fn uncertified_refund(
     let range = Range {
         max_cap: 50_000_000,
         max_blocks: 5_000,
-        per_coin: 2,
         ppm_year: 10_000,
         ppm_year_funded: 0,
     };
@@ -3271,7 +3252,6 @@ async fn a_force_close_claims_the_notes_of_a_payment_its_hub_never_released() ->
     let range = Range {
         max_cap: 50_000_000,
         max_blocks: 5_000,
-        per_coin: 2,
         ppm_year: 10_000,
         ppm_year_funded: 0,
     };
@@ -3388,7 +3368,6 @@ async fn a_force_close_claims_a_lock_paying_her_once_activated_at_depth() -> Res
     let range = Range {
         max_cap: 50_000_000,
         max_blocks: 5_000,
-        per_coin: 2,
         ppm_year: 10_000,
         ppm_year_funded: 0,
     };
@@ -3545,7 +3524,6 @@ async fn an_activation_whose_block_leaves_the_chain_is_found_again_and_claimed()
     let range = Range {
         max_cap: 50_000_000,
         max_blocks: 5_000,
-        per_coin: 2,
         ppm_year: 10_000,
         ppm_year_funded: 0,
     };
@@ -4397,7 +4375,6 @@ async fn hub_taking_deposits(
     let range = Range {
         max_cap: 50_000_000,
         max_blocks: 5_000,
-        per_coin: 2,
         ppm_year: 10_000,
         ppm_year_funded: 0,
     };
@@ -4639,7 +4616,6 @@ async fn her_exit_needs_consent_then_forces_closed_what_it_could_not_pay_out() -
     let range = Range {
         max_cap: 50_000_000,
         max_blocks: 5_000,
-        per_coin: 2,
         ppm_year: 10_000,
         ppm_year_funded: 0,
     };
@@ -4731,7 +4707,6 @@ async fn her_exit_tries_to_pay_out_before_forcing_closed() -> Result<()> {
     let range = Range {
         max_cap: 50_000_000,
         max_blocks: 5_000,
-        per_coin: 2,
         ppm_year: 10_000,
         ppm_year_funded: 0,
     };

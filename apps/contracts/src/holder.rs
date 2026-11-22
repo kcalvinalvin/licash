@@ -1535,7 +1535,6 @@ mod tests {
         let range = Range {
             max_cap: 100_000_000,
             max_blocks: 26_280,
-            per_coin: 2,
             ppm_year: 10_000,
             ppm_year_funded: 0,
         };

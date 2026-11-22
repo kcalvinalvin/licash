@@ -227,7 +227,8 @@ pub struct ContractRange {
     /// Blocks from opening one to its close: at least, at most.
     pub min_blocks: u32,
     pub max_blocks: u32,
-    /// Its cap at most this many times the coin paying for it.
+    /// Its cap at most this many times the coin paying for it: of hubs
+    /// before none was, which enforce it; `u32::MAX`, none, of those since.
     pub per_coin: u32,
     /// Its holder's reserve, in sat, paid back as it closes.
     pub reserve: u64,

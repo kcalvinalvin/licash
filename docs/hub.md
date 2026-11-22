@@ -322,8 +322,9 @@ pays to open one and the blocks to its close (1,000); the openings take
 contract's cap up to that and how long it lasts up to
 `--contracts-max-blocks` (`/v1/contracts/quote?cap=SAT&blocks=N`), its cap
 one of the sizes (`2^n - 1` sat, 131,071 to 2,147,483,647; the operator's
-largest rounded down to one) and at most `--contracts-per-coin` times (2 by
-default) the coin the wallet deposits, at the reserve and opening fee plus
+largest rounded down to one) whatever the coin the wallet deposits (any
+coin paying the price, the hub funding the rest of the cap), at the reserve
+and opening fee plus
 `--contracts-rate` millionths of the part of the cap the hub funds a year
 (of its network's blocks, 52,560 or Mutinynet's 1,051,200; 10,000, 1% a
 year, by default). A wallet funds part of the cap itself

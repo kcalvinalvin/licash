@@ -95,9 +95,6 @@ pub struct Range {
     pub max_cap: u32,
     /// The most blocks one lasts: [`LOCK`] at least.
     pub max_blocks: u32,
-    /// A contract's cap at most this many times the coin its holder
-    /// deposits, at least once: no small coin locks much of the hub's.
-    pub per_coin: u32,
     /// Millionths of the part of its cap the hub funds a contract costs
     /// for each year it lasts, over the fixed price
     /// ([`licash_api::rate`]), of the fixed terms too.
@@ -182,7 +179,6 @@ impl Timing {
                 "contracts of {} blocks at most: not {lock} at least",
                 r.max_blocks
             );
-            ensure!(r.per_coin >= 1, "a contract's cap of no times her coin");
         }
         let range = range.map(|r| Range {
             max_cap: licash_api::size_at_most(u64::from(r.max_cap)).unwrap_or(CAP),
@@ -261,7 +257,9 @@ impl Timing {
             max_cap: r.max_cap,
             min_blocks: self.min_blocks(),
             max_blocks: r.max_blocks,
-            per_coin: r.per_coin,
+            // No bound on the cap by her coin: what she pays prices the hub's
+            // part. Announced as none for wallets that read it as a bound.
+            per_coin: u32::MAX,
             reserve: RESERVE_ALICE,
             fee: OPENING_FEE * u64::from(self.surcharge()),
             ppm_year: r.ppm_year.saturating_mul(self.surcharge()),
@@ -311,22 +309,6 @@ impl Timing {
             "{blocks} blocks: not {} to {}",
             range.min_blocks,
             range.max_blocks
-        );
-        Ok(())
-    }
-
-    /// Refused unless a contract of `cap` sat may be paid from a coin of
-    /// `coin` sat: of the fixed terms' cap, the least, any coin paying its
-    /// price does.
-    pub fn covers(&self, cap: u32, coin: u64) -> Result<()> {
-        if cap == CAP {
-            return Ok(());
-        }
-        let per_coin = self.range.map_or(1, |r| r.per_coin);
-        let most = coin.saturating_mul(u64::from(per_coin));
-        ensure!(
-            u64::from(cap) <= most,
-            "a cap of {cap} sat on a coin of {coin}: {per_coin} times it at most"
         );
         Ok(())
     }
@@ -594,12 +576,10 @@ mod tests {
         }
     }
 
-    /// Up to 100 M sat (67 108 863, a size) over half a year, twice her
-    /// coin, at 1% a year.
+    /// Up to 100 M sat (67 108 863, a size) over half a year, at 1% a year.
     const RANGE: Range = Range {
         max_cap: 100_000_000,
         max_blocks: 26_280,
-        per_coin: 2,
         ppm_year: 10_000,
         ppm_year_funded: 0,
     };
@@ -778,23 +758,22 @@ mod tests {
     }
 
     #[test]
-    fn holders_choose_within_the_hubs_range_and_their_coin() {
+    fn holders_choose_within_the_hubs_range_whatever_their_coin() {
         let fixed = Timing::of(ChainProfile::Core30Signet, None).unwrap();
         assert!(fixed.range().is_none());
         assert!(fixed.allows(CAP, LOCK).is_ok());
         let error = fixed.allows(CAP, LOCK - 1).unwrap_err();
         assert!(error.to_string().contains("only"), "{error}");
-        // Of the fixed terms, any coin paying their price.
-        assert!(fixed.covers(CAP, 23_000).is_ok());
 
         let timing = Timing::of(ChainProfile::Core30Signet, Some(RANGE)).unwrap();
         let range = timing.range().unwrap();
         // Its largest cap the operator's, down to a size.
         assert_eq!((range.min_cap, range.max_cap), (CAP, 67_108_863));
         assert_eq!((range.min_blocks, range.max_blocks), (576, 26_280));
+        // No bound by her coin: announced as none, for wallets that read one.
         assert_eq!(
             (range.per_coin, range.reserve, range.fee, range.ppm_year),
-            (2, 20_000, 3_000, 10_000)
+            (u32::MAX, 20_000, 3_000, 10_000)
         );
         assert!(timing.allows(CAP, LOCK).is_ok());
         assert!(timing.allows(67_108_863, 26_280).is_ok());
@@ -810,9 +789,6 @@ mod tests {
         ] {
             assert!(timing.allows(cap, blocks).is_err(), "{cap} {blocks}");
         }
-        assert!(timing.covers(CAP, 23_000).is_ok());
-        assert!(timing.covers(16_777_215, 8_388_608).is_ok());
-        assert!(timing.covers(16_777_215, 8_388_607).is_err());
 
         // Out of bounds, refused as the hub starts.
         let wider = |r: Range| Timing::of(ChainProfile::Core30Signet, Some(r)).is_err();
@@ -826,10 +802,6 @@ mod tests {
         }));
         assert!(wider(Range {
             max_blocks: LOCK - 1,
-            ..RANGE
-        }));
-        assert!(wider(Range {
-            per_coin: 0,
             ..RANGE
         }));
     }

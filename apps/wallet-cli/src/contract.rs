@@ -186,10 +186,14 @@ pub fn terms(
             .iter()
             .map(|&s| crate::say::grouped(s.into()))
             .collect();
+        // A bound by the coin paying, of hubs before none was: none said of those since.
+        let per_coin = match range.per_coin {
+            u32::MAX => String::new(),
+            times => format!(", at most {times} times the coin paying it"),
+        };
         lines.push_str(&format!(
-            "\nsizes        {} sat, at most {} times the coin paying it\nblocks       {} to {}",
+            "\nsizes        {} sat{per_coin}\nblocks       {} to {}",
             sizes.join(", "),
-            range.per_coin,
             crate::say::grouped(range.min_blocks.into()),
             crate::say::grouped(range.max_blocks.into()),
         ));

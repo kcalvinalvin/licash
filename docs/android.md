@@ -339,8 +339,8 @@ what the hub would hold protected once it opens (its cover bar, then in
 words), then the cover, chosen first: at first the smallest at least half
 again the smallest coin a contract takes whole, room to be paid more, else
 the largest the hub allows for it (at a hub that lets the wallet choose,
-`--contracts-max-cap`, among its sizes, `2^n - 1` sat, at most the hub's
-`--contracts-per-coin` times the coin paying), a slider choosing among every
+`--contracts-max-cap`, among its sizes, `2^n - 1` sat; an older hub may
+bound it by the coin paying, as it announces), a slider choosing among every
 cover some coin opens when several do. The cover decides the coins that pay
 it whole, chips when several do, the smallest at first. Then its cost, the
 reserve, and "Into your balance", her part; why no coin pays any, each short
@@ -348,8 +348,7 @@ of the price or beyond what the hub's largest contract takes; and one line
 of what it asks of her, opening the app now and then and before the day it
 ends. Under More, a slider chooses how long it lasts (at first half a
 year), with the hub's part and the cost itemized.
-Covers being powers of two, a hub allowing 2 times the coin leaves most
-coins one. With no coin
+With no coin
 on Bitcoin, the sheet says to cash out to the wallet first. Priced live as the
 hub prices it: its cost (the hub's opening fee and its yearly interest on each
 part, itemized on a tap) apart from her reserve, "refundable", each with an
