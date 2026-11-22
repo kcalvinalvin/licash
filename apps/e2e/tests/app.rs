@@ -1218,11 +1218,15 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         "{:?} on Home with a contract protecting",
         share.text
     );
-    // Its price in the history, as paid once its funding confirmed: not
-    // her part, which is still hers.
+    // What it took from her Bitcoin in the history, as paid once its
+    // funding confirmed: its cost and its reserve, refundable, itemized
+    // below; not her part, which is still hers.
     opened(phone, "Protection").await?;
     let shown = amount(&phone.by_id("amount", 10).await?.text);
-    ensure!(shown == paid, "{shown} paid for it in the history");
+    ensure!(
+        shown == paid + RESERVE,
+        "{shown} paid for it in the history, of a cost of {paid} and a reserve of {RESERVE}"
+    );
     phone.tagged("state", "Set up", 30).await?;
     phone.by_id("at", 10).await?;
     phone.tagged("paid-from", "Your Bitcoin", 10).await?;
