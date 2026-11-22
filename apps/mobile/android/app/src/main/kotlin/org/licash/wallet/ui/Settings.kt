@@ -365,10 +365,13 @@ private fun TorPage(engine: Engine, ui: Ui) {
  * How far the app follows Bitcoin, in a word, and what there is to add:
  * in advanced mode, the block it is at and the nodes it hears from.
  */
-private fun status(ui: Ui, developer: Boolean): Pair<String, String?> {
+internal fun status(ui: Ui, developer: Boolean): Pair<String, String?> {
     val chain = ui.chain
     val nodes = "${chain.peers} " + if (chain.peers == 1L) "node" else "nodes"
     return when {
+        // The pinned headers come first, from no node: said as on Home.
+        chain.importing in 0..99 -> "Downloading" to null
+        chain.importing >= 100 -> "Setting up" to null
         chain.peers == 0L -> "Connecting" to null
         !chain.synced -> "Catching up" to "Block ${chain.height}, $nodes".takeIf { developer }
         ui.scan != null && ui.scan.next.toInt() <= chain.height ->

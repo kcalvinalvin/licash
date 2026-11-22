@@ -53,6 +53,13 @@ class SyncTest {
     }
 
     @Test
+    fun settings_says_the_pinned_headers_download_and_set_up_not_connecting() {
+        assertEquals("Downloading", status(Ui(chain = ChainStatus(importing = 42)), developer = false).first)
+        assertEquals("Setting up", status(Ui(chain = ChainStatus(importing = 100)), developer = false).first)
+        assertEquals("Connecting", status(Ui(chain = ChainStatus()), developer = false).first)
+    }
+
+    @Test
     fun the_pinned_headers_download_before_any_node_is_looked_for() {
         val ui = Ui(chain = ChainStatus(importing = 42), hubs = listOf(hub()))
         val stages = stages(ui)

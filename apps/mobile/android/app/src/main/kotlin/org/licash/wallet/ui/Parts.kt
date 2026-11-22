@@ -338,11 +338,12 @@ fun Entry(
 @Composable
 fun Line(label: String, value: String, modifier: Modifier = Modifier, tag: String? = null, share: String? = null, onClick: (() -> Unit)? = null) {
     Row(modifier.fillMaxWidth().then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier).padding(vertical = 12.dp)) {
-        Text(label, style = MaterialTheme.typography.bodyLarge)
+        // On one line of text, though the amount's type is not the label's.
+        Text(label, Modifier.alignByBaseline(), style = MaterialTheme.typography.bodyLarge)
         Spacer(Modifier.width(16.dp))
         Text(
             value,
-            modifier = Modifier.weight(1f).then(if (tag != null) Modifier.testTag(tag) else Modifier),
+            modifier = Modifier.weight(1f).alignByBaseline().then(if (tag != null) Modifier.testTag(tag) else Modifier),
             style = Amounts,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.End,
@@ -350,7 +351,7 @@ fun Line(label: String, value: String, modifier: Modifier = Modifier, tag: Strin
         if (share != null) {
             Text(
                 " · $share",
-                modifier = if (tag != null) Modifier.testTag("$tag-share") else Modifier,
+                modifier = Modifier.alignByBaseline().then(if (tag != null) Modifier.testTag("$tag-share") else Modifier),
                 style = Amounts,
                 color = MaterialTheme.colorScheme.outline,
             )
