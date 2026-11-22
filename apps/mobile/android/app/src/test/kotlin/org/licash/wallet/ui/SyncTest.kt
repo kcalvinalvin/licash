@@ -126,7 +126,7 @@ class SyncTest {
         val nodes = stages(Ui(chain = ChainStatus())).first()
         assertEquals("Looking for Bitcoin nodes", said(nodes, developer = false))
         val hub = stages(Ui(chain = caughtUp, hubs = listOf(hub()), scan = scan(800u, 896u, 895u))).last()
-        assertEquals("Waiting for your hub to catch up", said(hub, developer = false))
+        assertEquals("Waiting for the newest block's silent payment index", said(hub, developer = false))
     }
 
     @Test
@@ -245,7 +245,7 @@ class SyncTest {
         val ui = Ui(chain = caughtUp, hubs = listOf(hub()), scan = scan(from = 800u, next = 896u, height = 895u))
         val payments = stages(ui).last()
         assertEquals(Progress.DOING, payments.state)
-        assertEquals("Waiting for the hub's index of block 896", payments.detail)
+        assertEquals("Checked to block 895, waiting for the silent payment index of block 896", payments.detail)
     }
 
     @Test

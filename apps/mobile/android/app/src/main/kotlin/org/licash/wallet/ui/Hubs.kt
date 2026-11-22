@@ -49,7 +49,8 @@ import org.licash.wallet.sat
  */
 
 /** What a hub is, said where one is chosen. */
-const val HUB_MEANS = "A hub holds your balance and moves it for you. Choose one you trust: you can add more later."
+const val HUB_MEANS = "A hub holds your balance and moves it for you. Up to what you protect, you can take it back " +
+    "on Bitcoin without the hub. You can add more hubs later."
 
 /** A hub in a line under its name: its fee on a payment, and what else it does. */
 internal fun about(hub: Hub): String = listOfNotNull(
@@ -338,7 +339,7 @@ internal fun FoundHubs(engine: Engine, ui: Ui, auto: Boolean) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Line("Paying", paying(f.hub))
-            Say("Add it only if you trust who runs it.")
+            Say("Up to what you protect, your balance here can be taken back on Bitcoin without the hub. Above it, it rests on the hub's word.")
             // Stays here while it is added, which asks the hub a few times:
             // closed once it is, or why not said under the button.
             BigButton(

@@ -184,7 +184,7 @@ private fun Summary(
     }
     adding?.let { url ->
         Sheet(name(url), dismiss = { adding = null; joinError = null }, dismissable = !joining) {
-            Say("Left over from paying someone at this hub. Add the hub to use it: only if you trust who runs it.")
+            Say("Left over from paying someone at this hub. Add the hub to use it.")
             // Stays while the hub is added; closed once it is, else why not under it.
             BigButton(
                 if (joining) "Adding…" else "Add hub",

@@ -149,11 +149,12 @@ fun stages(ui: Ui): List<Stage> {
     val next = scan.next.toLong()
     val reachable = scan.height.toLong()
     val from = scan.from.toLong().takeIf { it in 1..next } ?: next
-    // The hubs index the blocks after the light client has them.
+    // Silent payments are found from each block's index, made by the hubs
+    // from the full block once the light client has it, so a little later.
     val lagging = reachable < filters
     val looked = next > reachable
     val doing = when {
-        looked && lagging -> "Waiting for the hub's index of block ${block(reachable + 1)}"
+        looked && lagging -> "Checked to block ${block(reachable)}, $INDEX_WAIT ${block(reachable + 1)}"
         else -> "Block ${block(next)} of ${block(reachable)}, ${block(reachable - next + 1)} to go" +
             shown(fraction(from, next, reachable + 1))
     }
@@ -172,6 +173,7 @@ internal const val TOR = "Tor"
 internal const val HEADERS_DOWNLOAD = "Block headers download"
 internal const val NODES = "Bitcoin nodes"
 internal const val PAYMENTS = "Your payments"
+private const val INDEX_WAIT = "waiting for the silent payment index of block"
 
 /**
  * A step under way in a few plain words: in advanced mode, its name and
@@ -187,7 +189,7 @@ internal fun said(stage: Stage, developer: Boolean): String = when {
         else -> "Downloading block headers" + shown(stage.fraction)
     }
     stage.name == NODES -> "Looking for Bitcoin nodes"
-    stage.name == PAYMENTS && stage.detail.startsWith("Waiting") -> "Waiting for your hub to catch up"
+    stage.name == PAYMENTS && stage.detail.contains(INDEX_WAIT) -> "Waiting for the newest block's silent payment index"
     stage.name == PAYMENTS -> "Looking for your payments" + shown(stage.fraction)
     else -> "Catching up with Bitcoin" + shown(stage.fraction)
 }

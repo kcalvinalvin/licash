@@ -1244,7 +1244,10 @@ async fn found_hubs(phone: &Phone) -> anyhow::Result<()> {
     let url = phone.by_id("found-url", 10).await?;
     ensure!(url.text.contains("://"), "{:?} for its address", url.text);
     phone
-        .wait("Add it only if you trust who runs it", 10)
+        .wait(
+            "Up to what you protect, your balance here can be taken back",
+            10,
+        )
         .await?;
     phone.by_id("add-hub", 10).await?;
     // Not now: paid there first, below.
