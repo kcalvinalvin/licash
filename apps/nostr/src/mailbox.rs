@@ -146,6 +146,9 @@ pub struct Mailbox {
     arrived: Arc<tokio::sync::Notify>,
     /// Taking in what the relays push, until closed.
     listening: tokio::task::JoinHandle<()>,
+    /// The relays whose answer to the last look asking them filled all it
+    /// asks for: [`Mailbox::full`].
+    full: Mutex<Vec<String>>,
 }
 
 /// The mail a mailbox kept is pushed between its looks.
@@ -231,6 +234,7 @@ impl Mailbox {
             pushed,
             arrived,
             listening,
+            full: Mutex::default(),
         })
     }
 
@@ -323,14 +327,27 @@ impl Mailbox {
                 if !pushing {
                     // Kept by the client, asked again as the relay reconnects.
                     relay.subscribe(new).await?;
-                    lock(&pushed).relays.insert(url);
+                    lock(&pushed).relays.insert(url.clone());
                 }
-                Ok(relay.fetch_events(all).timeout(timeout).await?)
+                Ok((url, relay.fetch_events(all).timeout(timeout).await?))
             }
         })
         .await?;
         self.pushed().asked = Some(asked);
-        Ok(fetched.into_iter().flatten().collect())
+        *lock(&self.full) = (fetched.iter())
+            .filter(|(_, events)| events.len() >= MAX_MAIL)
+            .map(|(url, _)| url.to_string())
+            .collect();
+        Ok(fetched.into_iter().flat_map(|(_, events)| events).collect())
+    }
+
+    /// The relays whose answer to the last look asking them was all it
+    /// asks for, [`MAX_MAIL`] gift wraps: anyone may gift wrap to the
+    /// mailbox, so newer ones, junk perhaps, may hide an older payment
+    /// there. A busy mailbox fills too; a relay answering fewer at most
+    /// is not told apart.
+    pub fn full(&self) -> Vec<String> {
+        lock(&self.full).clone()
     }
 
     fn pushed(&self) -> MutexGuard<'_, Pushed> {

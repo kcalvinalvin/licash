@@ -1993,6 +1993,12 @@ fn collection_warnings(collected: &licash_nostr::wallet::Collected, mut warn: im
     for (id, reason) in &collected.skipped {
         warn(format!("{id} in the mailbox {}", say::terminal(reason)));
     }
+    for relay in &collected.full {
+        warn(format!(
+            "mailbox relay {} answered all the mail asked for: newer mail, junk perhaps, may hide an older payment to you there",
+            say::terminal(relay)
+        ));
+    }
     for (at, reason) in &collected.failed {
         let at = match at.as_str() {
             licash_nostr::wallet::MAILBOX => "the mailbox".to_owned(),

@@ -25,7 +25,9 @@ the connections stand (Tor if on, Bitcoin, up once caught up while it
 keeps up with new blocks as usual and only behind once 30 s behind or with
 no node, each hub as it answered when
 last asked, every 5 minutes, and the mailbox's relays as last looked in,
-kept in memory only); tapped, it says each with how long it took to
+a problem if one answered the 500 messages a look asks for, since newer
+mail, junk anyone can send, can then hide an older payment, all kept in
+memory only); tapped, it says each with how long it took to
 answer (Bitcoin's nodes' shortest ping, a hub's fastest answer of the last
 minutes, a round trip on a circuit already open, a look in the
 mailbox finding nothing to redeem), lists Bitcoin's steps under it while catching up in advanced

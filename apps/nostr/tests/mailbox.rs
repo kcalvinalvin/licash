@@ -249,3 +249,49 @@ async fn mail_done_with_is_not_returned_again_by_the_mailbox_kept() {
     assert_eq!(all.unwrap(), mail);
     kept.close().await;
 }
+
+/// A relay whose answer is all a look asks for is said full: newer mail,
+/// junk anyone may gift wrap, may hide an older payment there. One holding
+/// less is not.
+#[tokio::test]
+async fn a_relay_answering_all_the_mail_a_look_asks_for_is_said_full() {
+    use nostr_sdk::prelude::{LocalRelay, RateLimit, Tag};
+    let relay = LocalRelay::builder()
+        .rate_limit(RateLimit {
+            max_reqs: 500,
+            notes_per_minute: 10_000,
+        })
+        .build();
+    relay.run().await.unwrap();
+    let relays = [relay.url().await.to_string()];
+    let alice = [1; 32];
+    let to = mailbox(alice);
+    mailbox::send(&to, r#"{"paid":1}"#, &relays, &Route::Direct)
+        .await
+        .unwrap();
+    let kept = mailbox::Mailbox::open(&alice, &relays, &Route::Direct)
+        .await
+        .unwrap();
+    assert_eq!(kept.fetch().await.unwrap().len(), 1);
+    assert!(kept.full().is_empty());
+    kept.close().await;
+
+    let client = Client::default();
+    client.add_relay(&relays[0]).await.unwrap();
+    client.connect().and_wait(Duration::from_secs(5)).await;
+    let to = Keys::new(SecretKey::from_slice(&alice).unwrap()).public_key();
+    for _ in 0..500 {
+        let junk = EventBuilder::new(Kind::GiftWrap, "junk")
+            .tag(Tag::public_key(to))
+            .finalize(&Keys::generate())
+            .unwrap();
+        client.send_event(&junk).await.unwrap();
+    }
+    let kept = mailbox::Mailbox::open(&alice, &relays, &Route::Direct)
+        .await
+        .unwrap();
+    // The payment among the newest 500 no longer: hidden, and said so.
+    assert!(kept.fetch().await.unwrap().is_empty());
+    assert_eq!(kept.full().len(), 1, "{:?}", kept.full());
+    kept.close().await;
+}

@@ -179,6 +179,10 @@ class SyncTest {
         val mail = ui.copy(hubs = listOf(hub().copy(mailbox = true)), hubsReached = mapOf("https://hub.example" to true))
         assertEquals(Reach.GOING, links(mail).last().reach)
         assertEquals(Link(RELAYS, Reach.UP, "Reached"), links(mail.copy(relaysReached = true)).last())
+        // Full of mail, junk perhaps: a payment may be hidden there.
+        val full = links(mail.copy(relaysReached = true, relaysFull = true)).last()
+        assertEquals(Reach.DOWN, full.reach)
+        assertTrue(full.detail.contains("may hide a payment"), full.detail)
         assertEquals(Reach.DOWN, links(mail.copy(relaysReached = false)).maxOf { it.reach })
     }
 

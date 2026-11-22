@@ -123,6 +123,12 @@ data class Ui(
     val hubsMs: Map<String, Long> = emptyMap(),
     /** Whether the mailbox's relays were reached when last looked in, if looked in. In memory only. */
     val relaysReached: Boolean? = null,
+    /**
+     * Whether a relay's answer was all a look in the mailbox asks for when
+     * last looked in: newer mail, junk perhaps, may hide an older payment
+     * there. In memory only.
+     */
+    val relaysFull: Boolean = false,
     /** How long looking in the mailbox's relays took when they answered, in milliseconds. */
     val relaysMs: Long? = null,
     /** The recovery contracts with hubs, the newest first. */
@@ -831,7 +837,12 @@ class Engine(context: Context) {
                 failed("the mailbox", e)
                 false
             }
-            state.update { it.copy(relaysReached = reached, relaysMs = collectedMs.takeIf { reached }) }
+            // Full: newer mail, junk anyone may send, may hide a payment there.
+            val full = reached && locked { it.mailboxFull() }.isNotEmpty()
+            if (full) AppLog.info("a mailbox relay answered all the mail asked for: a payment may be hidden")
+            state.update {
+                it.copy(relaysReached = reached, relaysFull = full, relaysMs = collectedMs.takeIf { reached })
+            }
         }
         // Only with every coin found: a partial look could move part.
         if (caughtUp) {

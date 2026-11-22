@@ -243,7 +243,10 @@ fun links(ui: Ui, stale: Boolean = true): List<Link> {
     // Only a wallet with a mailbox looks in one.
     if (ui.hubs.any { it.mailbox }) {
         out += when (ui.relaysReached) {
-            true -> Link(RELAYS, Reach.UP, "Reached", ui.relaysMs)
+            true -> when (ui.relaysFull) {
+                false -> Link(RELAYS, Reach.UP, "Reached", ui.relaysMs)
+                true -> Link(RELAYS, Reach.DOWN, "Full of mail: newer mail may hide a payment to you", ui.relaysMs)
+            }
             false -> Link(RELAYS, Reach.DOWN, "None reached: payments to you wait there until one is")
             null -> Link(RELAYS, Reach.GOING, "Not looked in yet")
         }

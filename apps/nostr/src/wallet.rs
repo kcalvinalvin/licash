@@ -830,6 +830,9 @@ pub struct Collected {
     /// What the wallet's extra codes were paid, and paid on to it: taken
     /// among [`Collected::received`] ([`licash_wallet::Inboxed::codes`]).
     pub codes: licash_wallet::CodesCollected,
+    /// The mailbox relays whose answer was all a look asks for, where
+    /// newer mail may hide an older payment ([`mailbox::Mailbox::full`]).
+    pub full: Vec<String>,
 }
 
 /// Where [`Collected::failed`] names the mailbox.
@@ -842,7 +845,10 @@ pub const MAILBOX: &str = "mailbox";
 pub async fn collect<T: Transport>(wallet: &Wallet<T>, route: &Route) -> anyhow::Result<Collected> {
     let fetch = async {
         let relays = mailbox_relays(wallet)?;
-        mailbox::fetch(&wallet.mailbox_secret(), &relays, route).await
+        let mailbox = mailbox::Mailbox::open(&wallet.mailbox_secret(), &relays, route).await?;
+        let mail = mailbox.fetch().await.map(|mail| (mail, mailbox.full()));
+        mailbox.close().await;
+        mail
     };
     let (inboxed, mail) = join(wallet.collect_inbox(), fetch).await;
     collected(wallet, inboxed?, mail, |_| {})
@@ -862,9 +868,9 @@ pub async fn collect_kept<T: Transport>(
         let relays = mailbox_relays(wallet)?;
         let secret = wallet.mailbox_secret();
         let fetched = match kept.as_ref().filter(|m| m.is(&secret, &relays)) {
-            Some(mailbox) => mailbox.fetch().await.map_err(|e| {
-                tracing::info!("the mailbox kept, opened anew: {e:#}");
-            }),
+            Some(mailbox) => (mailbox.fetch().await)
+                .map(|mail| (mail, mailbox.full()))
+                .map_err(|e| tracing::info!("the mailbox kept, opened anew: {e:#}")),
             None => Err(()),
         };
         match fetched {
@@ -874,7 +880,8 @@ pub async fn collect_kept<T: Transport>(
                     old.close().await;
                 }
                 let mailbox = kept.insert(mailbox::Mailbox::open(&secret, &relays, route).await?);
-                mailbox.fetch().await
+                let mail = mailbox.fetch().await?;
+                Ok((mail, mailbox.full()))
             }
         }
     };
@@ -892,7 +899,7 @@ pub async fn collect_kept<T: Transport>(
 fn collected<T: Transport>(
     wallet: &Wallet<T>,
     inboxed: licash_wallet::Inboxed,
-    mail: anyhow::Result<Vec<mailbox::Mail>>,
+    mail: anyhow::Result<(Vec<mailbox::Mail>, Vec<String>)>,
     done: impl FnMut(&str),
 ) -> anyhow::Result<Collected> {
     let mut collected = Collected {
@@ -900,9 +907,13 @@ fn collected<T: Transport>(
         skipped: Vec::new(),
         failed: inboxed.failed,
         codes: inboxed.codes,
+        full: Vec::new(),
     };
     match mail {
-        Ok(mail) => take(wallet, mail, done, &mut collected),
+        Ok((mail, full)) => {
+            collected.full = full;
+            take(wallet, mail, done, &mut collected)
+        }
         Err(e) if inboxed.served == 0 => return Err(e),
         Err(e) => collected.failed.push((MAILBOX.into(), format!("{e:#}"))),
     }

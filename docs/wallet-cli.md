@@ -83,8 +83,10 @@ does not keep is sent there at once. A code naming no mailbox has its
 payment printed to hand over as well, as has one no relay took: a payment
 of many notes can be larger than the 64 KB relays commonly take, which
 the warning then says. `mailbox` (or `collect`) receives
-what the hubs keep for the wallet and what was sent to its mailbox; `watch`
-keeps receiving and delivering, every `--every` seconds (60), until
+what the hubs keep for the wallet and what was sent to its mailbox (the
+newest 500 messages on each relay: a relay answering that many is warned
+of, since anyone can send to a mailbox and newer junk can hide an older
+payment there); `watch` keeps receiving and delivering, every `--every` seconds (60), until
 stopped. Other commands that open an existing wallet start a one-shot
 collection as they exit, with one collection pass per wallet at a time.
 The next command can see any receipts it collected and reports collection

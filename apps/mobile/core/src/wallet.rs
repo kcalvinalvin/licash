@@ -1227,6 +1227,16 @@ impl Wallet {
         Ok(received)
     }
 
+    /// The mailbox relays whose answer to the last look asking them was
+    /// all a look asks for, where newer mail, junk anyone may send, may
+    /// hide an older payment: none before a look, or with no mailbox kept.
+    pub fn mailbox_full(&self) -> Vec<String> {
+        let kept = self.mailbox.lock().unwrap_or_else(PoisonError::into_inner);
+        kept.as_ref()
+            .map(|mailbox| mailbox.full())
+            .unwrap_or_default()
+    }
+
     /// How many payments made are still on their way to their payees:
     /// kept at their hubs, not yet collected, or to send to their
     /// mailboxes. While any are, [`Wallet::resume`] is called now and
