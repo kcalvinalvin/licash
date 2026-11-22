@@ -122,8 +122,11 @@ fn programs() -> Vec<String> {
 
 /// The probe's report: `device` ("cuda" or "cpu"), `programs` (image
 /// ids), `memory` (bytes, if known) and `problems`, what keeps it from
-/// proving: none when ready.
-pub fn probe() -> Value {
+/// proving: none when ready. With `program`, installed, a problem too if
+/// it doesn't prove the benchmark's input, made by this build's library,
+/// as the library does: built before a change of format, it would prove
+/// nothing of a contract opened under it.
+pub fn probe(program: Option<&str>) -> Value {
     let device = match gpu_usable() {
         true => "cuda",
         false => "cpu",
@@ -146,6 +149,14 @@ pub fn probe() -> Value {
             "no programs in {}",
             share().join("programs").display()
         ));
+    }
+    if let Some(program) = program.filter(|p| programs.iter().any(|q| q == p)) {
+        if let Err(e) = crate::reads::proves_bench(program) {
+            problems.push(format!(
+                "the program {program} does not prove the statement this build makes \
+                 ({e:#}): install the program of this build (docs/r0.md)"
+            ));
+        }
     }
     let memory = memory();
     if memory.is_some_and(|m| m < MIN_MEMORY) {

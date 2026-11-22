@@ -40,7 +40,7 @@ pub const CPU_PO2: u32 = 19;
 /// chained contract's input, with the chain program its own receipt's journal
 /// names: the guest is built with one id, and refuses an input whose receipt
 /// is of another, which the library does not (so `hp-exec` says so).
-fn expected(bytes: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn expected(bytes: &[u8]) -> Result<Vec<u8>> {
     let input = HubInput::from_bytes(bytes)?;
     match &input.chain {
         None => Ok(licash_hp::check(&input)?.to_vec()),
@@ -91,7 +91,15 @@ pub fn exec(path: &str, program: Option<&str>, assume: &[String]) -> Result<()> 
                 s.segments.len()
             );
         }
-        (Err(_), Err(e)) => println!("{NAME}: no proof, as the library refuses: {e}"),
+        (Err(g), Err(e)) => {
+            // Refused once read, not for want of reading it.
+            let why = format!("{g:#}");
+            ensure!(
+                why.contains(crate::reads::REFUSED),
+                "the guest does not read what the library reads: {why}"
+            );
+            println!("{NAME}: no proof, as the library refuses: {e}")
+        }
         (Ok(_), Err(e)) => bail!("the guest proved what the library refuses: {e}"),
         (Err(e), Ok(_)) => bail!("the guest refused what the library proves: {e}"),
     }

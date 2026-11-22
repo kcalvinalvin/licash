@@ -31,7 +31,7 @@ impl SegmentRef for Unused {
 
 /// The kept input: the statement's tests' answered claim
 /// (`export_inputs`, docs/r0.md).
-fn input() -> Result<Vec<u8>> {
+pub(crate) fn input() -> Result<Vec<u8>> {
     let installed = probe::share().join("bench.bin");
     let path = match installed.exists() {
         true => installed,
@@ -166,6 +166,15 @@ mod tests {
         let input = licash_hp::HubInput::from_bytes(&bytes).expect("it decodes");
         assert!(input.chain.is_none(), "a program of any graph reads it");
         licash_hp::check(&input).expect("it is proven");
+    }
+
+    /// And it is as this library writes it: a change of format that still
+    /// reads it, but writes another, fails here (and it is made again).
+    #[test]
+    fn the_benchmarks_input_is_as_the_library_writes_it() {
+        let bytes = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("bench.bin")).unwrap();
+        let input = licash_hp::HubInput::from_bytes(&bytes).unwrap();
+        assert!(input.to_bytes() == bytes, "written otherwise");
     }
 
     #[test]

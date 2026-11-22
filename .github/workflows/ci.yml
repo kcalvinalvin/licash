@@ -80,7 +80,11 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: r0/host
+          # regtest/: its tests export the inputs r0/host's run the pinned
+          # program on.
+          workspaces: |
+            r0/host
+            regtest
       - run: cargo fmt -- --check
       - run: cargo clippy --locked --release --all-targets -- -D warnings
       - run: cargo test --locked --release

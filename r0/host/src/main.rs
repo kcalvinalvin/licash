@@ -8,7 +8,10 @@
 //!   licash-r0 hp-prove <input.bin> <work-dir> [program]
 //!                                          prove, wrap in Groth16, verify and export to
 //!                                          work-dir/proof.json, carried on across runs
-//!   licash-r0 probe                        what this machine proves with, as JSON
+//!   licash-r0 probe [program]              what this machine proves with, as JSON; with a
+//!                                          program, whether it proves the benchmark's input
+//!   licash-r0 hp-reads <base.bin> [program]
+//!                                          whether a program reads a statement's input of a Base
 //!   licash-r0 bench <out.json> [program]   how fast it proves, as JSON
 //!
 //! A program is a packed guest's path, or an image id kept in the programs
@@ -27,6 +30,7 @@ mod chain;
 mod groth16;
 mod hp;
 mod probe;
+mod reads;
 mod resumable;
 
 use std::fs::{read, write};
@@ -207,13 +211,16 @@ fn main() -> Result<()> {
             let po2 = segment_limit(Some(po2))?.context("a segment size")?;
             bench::stark(dir.as_ref(), po2, program.first().copied()).map(drop)
         }
-        ["probe"] => {
-            println!("{}", serde_json::to_string(&probe::probe())?);
+        ["hp-reads", base, program @ ..] if program.len() <= 1 => {
+            reads::reads(base, program.first().copied())
+        }
+        ["probe", program @ ..] if program.len() <= 1 => {
+            println!("{}", serde_json::to_string(&probe::probe(program.first().copied()))?);
             Ok(())
         }
         // The CUDA build's own check of its GPU, for the CPU build's probe.
         ["probe-gpu"] => probe::gpu(),
-        _ => bail!("usage: licash-r0 pack <elf> <out.bin> | id <program.bin> | hp-exec <input.bin> [program] [--assume <receipt>].. | hp-prove <input.bin> <work-dir> [program] [--assume <receipt>].. | chain-prove <batch.bin> <work-dir> [--assume <receipt>] | probe | bench <out.json> [program]"),
+        _ => bail!("usage: licash-r0 pack <elf> <out.bin> | id <program.bin> | hp-exec <input.bin> [program] [--assume <receipt>].. | hp-prove <input.bin> <work-dir> [program] [--assume <receipt>].. | chain-prove <batch.bin> <work-dir> [--assume <receipt>] | hp-reads <base.bin> [program] | probe [program] | bench <out.json> [program]"),
     }
 }
 
