@@ -901,6 +901,97 @@ async fn a_claim_made_is_kept_across_a_restart_until_it_confirms() {
     assert_eq!(eco.follow(&payout).await.unwrap().state, PayoutState::Done);
 }
 
+/// That `claim` spends `coin`, worth `value` and paying `htlc`, by its
+/// claim leaf: the leaf committed to in the coin's output key, signed by
+/// its claim key.
+fn spends_by(htlc: &Htlc, claim: &Transaction, coin: OutPoint, value: u64) {
+    use bitcoin::{
+        secp256k1::{schnorr, Message, Secp256k1, XOnlyPublicKey},
+        sighash::{Prevouts, SighashCache},
+        taproot::{ControlBlock, LeafVersion},
+        TapLeafHash, TapSighashType,
+    };
+    assert!(htlc.claimed_by(claim, coin));
+    let index = claim
+        .input
+        .iter()
+        .position(|i| i.previous_output == coin)
+        .unwrap();
+    let witness: Vec<&[u8]> = claim.input[index].witness.iter().collect();
+    let script = htlc.claim_script();
+    let (control, leaf) = (witness[witness.len() - 1], witness[witness.len() - 2]);
+    assert_eq!(leaf, script.as_bytes());
+    let secp = Secp256k1::verification_only();
+    let output = htlc.script_pubkey();
+    let output_key = XOnlyPublicKey::from_slice(&output.as_bytes()[2..]).unwrap();
+    let control = ControlBlock::decode(control).unwrap();
+    assert!(control.verify_taproot_commitment(&secp, output_key, &script));
+    let prevout = TxOut {
+        value: Amount::from_sat(value),
+        script_pubkey: output,
+    };
+    let sighash = SighashCache::new(claim)
+        .taproot_script_spend_signature_hash(
+            index,
+            &Prevouts::All(&[prevout]),
+            TapLeafHash::from_script(&script, LeafVersion::TapScript),
+            TapSighashType::Default,
+        )
+        .unwrap();
+    let message = Message::from_digest(sighash.to_byte_array());
+    let signature = schnorr::Signature::from_slice(witness[0]).unwrap();
+    secp.verify_schnorr(&signature, &message, &htlc.claim)
+        .unwrap();
+}
+
+/// A provider of a version before payout coins were sized locks its coin
+/// to the payout's terms unsized: the wallet claims it as it pays, by the
+/// unsized claim leaf, and follows that claim across a restart, made again
+/// at a higher fee as the timeout nears, until it confirms.
+#[tokio::test]
+async fn a_coin_locked_unsized_by_a_provider_before_sized_coins_is_claimed_as_it_pays() {
+    let eco = Eco::new().await;
+    let payout = eco.pay_out(1000).await;
+    let legacy = Htlc {
+        sized: false,
+        ..eco.desk.with(|t| t.htlc)
+    };
+    let value = payout.amount + payout.budget;
+    let coin = eco.desk.fund(None, Some(legacy.script_pubkey()));
+    let claimed = eco.follow(&payout).await.unwrap();
+    assert_eq!(
+        (claimed.state, claimed.funding),
+        (PayoutState::Claimed, Some(coin))
+    );
+    let first = eco.client.payout_claims().unwrap().remove(0);
+    spends_by(&legacy, &first, coin, value);
+    let Eco {
+        net,
+        desk,
+        dir,
+        client,
+        view,
+    } = eco;
+    drop(client);
+    let client = Eco::client(&net, &desk, &dir, false).await;
+    let eco = Eco {
+        net,
+        desk,
+        dir,
+        client,
+        view,
+    };
+    // Fewer than CLAIM_ROOM blocks left: made again, by the same leaf.
+    eco.mine_to(eco.timeout() - CLAIM_ROOM + 1);
+    pending(eco.follow(&payout).await, "not confirmed yet");
+    let again = eco.client.payout_claims().unwrap().remove(0);
+    assert_ne!(again, first);
+    spends_by(&legacy, &again, coin, value);
+    eco.net.confirm(A, vec![again.clone()]);
+    assert_eq!(eco.follow(&payout).await.unwrap().state, PayoutState::Done);
+    eco.desk.settle(&again, coin).await;
+}
+
 #[tokio::test]
 async fn a_claim_in_no_block_as_the_timeout_nears_pays_more_the_payee_paid_less() {
     let eco = Eco::new().await;

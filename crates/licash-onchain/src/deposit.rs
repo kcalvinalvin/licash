@@ -209,6 +209,13 @@ impl Htlc {
             .expect("a complete tree")
     }
 
+    /// These terms sized, then not: of a payout's coin, which providers
+    /// made unsized before payout coins were sized, the one its coin pays
+    /// or its claim spends by, which it is claimed and taken back as.
+    pub fn sized_or_not(self) -> [Self; 2] {
+        [true, false].map(|sized| Self { sized, ..self })
+    }
+
     /// The output script it is paid to.
     pub fn script_pubkey(&self) -> ScriptBuf {
         ScriptBuf::new_p2tr_tweaked(self.spend_info().output_key())

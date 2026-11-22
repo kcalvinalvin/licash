@@ -274,19 +274,33 @@ impl Record {
         SecretKey::from_slice(&self.claim_key).map_err(invalid)
     }
 
-    /// The coin's terms, once the provider named its own.
+    /// The coin's terms, once the provider named its own: sized, as a
+    /// coin found is claimed only if it pays them or, from a provider
+    /// before sized coins, them unsized ([`Wallet::claim_payout`]); once
+    /// claimed, those its claim spends it by.
     fn htlc(&self) -> Result<Option<Htlc>, Error> {
         let Some((refund, timeout)) = self.refund else {
             return Ok(None);
         };
-        Ok(Some(Htlc {
+        let htlc = Htlc {
             hash: lock_hash(&self.preimage),
             claim: x_only(&self.claim_key()?),
             refund: XOnlyPublicKey::from_slice(&refund).map_err(invalid)?,
             timeout,
             wait: None,
             sized: true,
-        }))
+        };
+        let (Some(claim), Some((funding, _, _))) = (&self.claim, self.funding) else {
+            return Ok(Some(htlc));
+        };
+        let claim: Transaction = deserialize(claim).map_err(invalid)?;
+        let claimed = htlc
+            .sized_or_not()
+            .into_iter()
+            .find(|h| h.claimed_by(&claim, funding));
+        claimed
+            .map(Some)
+            .ok_or_else(|| invalid("a payout's claim of other terms than its coin's"))
     }
 }
 
@@ -941,13 +955,18 @@ impl<T: Transport> Wallet<T> {
             return Err(pending(reason));
         }
         let block = block_at(chain, hint.height).await?;
-        let output = block
+        // Paying its terms, or them unsized, as providers paid before sized
+        // coins: claimed and followed as it pays.
+        let found = block
             .txdata
             .iter()
             .find(|tx| tx.compute_txid() == txid)
             .and_then(|tx| tx.output.get(hint.vout as usize))
-            .filter(|o| o.script_pubkey == htlc.script_pubkey());
-        let Some(output) = output else {
+            .and_then(|o| {
+                let mut terms = htlc.sized_or_not().into_iter();
+                Some((o, terms.find(|h| h.script_pubkey() == o.script_pubkey)?))
+            });
+        let Some((output, htlc)) = found else {
             let reason = format!(
                 "the provider's coin is not in block {} as it says",
                 hint.height
