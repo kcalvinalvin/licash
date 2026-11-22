@@ -71,6 +71,9 @@ class SyncTest {
     fun downloaded_the_pinned_headers_are_prepared_for_a_time_untold() {
         val stage = stages(Ui(chain = ChainStatus(importing = 100), hubs = listOf(hub()))).first()
         assertEquals(PREPARING, stage.detail)
+        // Downloaded: no longer named a download.
+        assertEquals(HEADERS_SETUP, stage.name)
+        assertEquals(PREPARING, said(stage, developer = false))
         assertNull(stage.fraction)
         assertTrue(stage.timed)
         assertFalse(stages(Ui(chain = ChainStatus(importing = 99))).first().timed)

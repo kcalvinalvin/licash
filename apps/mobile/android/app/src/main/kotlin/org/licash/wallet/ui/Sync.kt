@@ -112,8 +112,9 @@ fun stages(ui: Ui): List<Stage> {
         val stored = chain.storing.takeIf { it >= 0 }?.let { it / 100f }
         when {
             chain.importing < 100 -> add(HEADERS_DOWNLOAD, false, "Downloading" + shown(f), "", f)
-            stored != null -> add(HEADERS_DOWNLOAD, false, STORING + shown(stored), "", stored)
-            else -> add(HEADERS_DOWNLOAD, false, PREPARING, "")
+            // Downloaded: named for what it does now, not a download.
+            stored != null -> add(HEADERS_SETUP, false, STORING + shown(stored), "", stored)
+            else -> add(HEADERS_SETUP, false, PREPARING, "")
         }
     }
     val nodes = "${chain.peers} " + if (chain.peers == 1L) "node" else "nodes"
@@ -171,6 +172,7 @@ fun firstCatchingUp(ui: Ui): Boolean = !ui.caughtUp && ui.history.isEmpty() && c
 
 internal const val TOR = "Tor"
 internal const val HEADERS_DOWNLOAD = "Block headers download"
+internal const val HEADERS_SETUP = "Block headers setup"
 internal const val NODES = "Bitcoin nodes"
 internal const val PAYMENTS = "Your payments"
 private const val NEXT_BLOCK = "checking block"
@@ -189,7 +191,7 @@ internal fun said(stage: Stage, developer: Boolean): String = when {
     developer -> "${stage.name}: ${stage.detail}"
     stage.state == Progress.WAITING -> "Waiting for Tor"
     stage.name == TOR -> stage.detail
-    stage.name == HEADERS_DOWNLOAD -> when {
+    stage.name == HEADERS_DOWNLOAD || stage.name == HEADERS_SETUP -> when {
         stage.detail == PREPARING -> PREPARING
         stage.detail.startsWith(STORING) -> "Storing block headers" + shown(stage.fraction)
         else -> "Downloading block headers" + shown(stage.fraction)
