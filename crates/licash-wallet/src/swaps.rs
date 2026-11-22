@@ -135,6 +135,35 @@ impl<T: Transport> Wallet<T> {
         amount: u64,
         limits: SwapLimits,
     ) -> Result<Swap, Error> {
+        self.swap_within(provider, from, to, amount, limits, None)
+            .await
+    }
+
+    /// [`Wallet::swap`], refused as [`Error::FeeRose`], nothing locked, if
+    /// the provider's fee and the hub's at `from` on the lock, as it signs
+    /// it, come to more than `costs`: what was quoted in all.
+    pub async fn swap_within(
+        &self,
+        provider: &str,
+        from: &str,
+        to: &str,
+        amount: u64,
+        limits: SwapLimits,
+        costs: Option<u64>,
+    ) -> Result<Swap, Error> {
+        // Boxed: a swap's future is deep, and nested in its callers'.
+        Box::pin(self.swapping(provider, from, to, amount, limits, costs)).await
+    }
+
+    async fn swapping(
+        &self,
+        provider: &str,
+        from: &str,
+        to: &str,
+        amount: u64,
+        limits: SwapLimits,
+        costs: Option<u64>,
+    ) -> Result<Swap, Error> {
         let provider = hub_url(provider)?;
         let (from, to) = (hub_url(from)?, hub_url(to)?);
         if amount == 0 {
@@ -188,6 +217,18 @@ impl<T: Transport> Wallet<T> {
             .prepare_lock(at, &offer.address, total, hash, Some(expiry), Pays::Nothing)
             .await
         {
+            // Its fee as the hub's lock signs it, not as quoted.
+            Ok(prepared) if costs.is_some_and(|most| fee.saturating_add(prepared.fee) > most) => {
+                let (agreed, asked) = (costs.unwrap_or_default(), fee.saturating_add(prepared.fee));
+                Err(Error::FeeRose {
+                    who: provider.clone(),
+                    agreed,
+                    asked,
+                    reason: format!(
+                        "provider {provider} and hub {from} ask {asked} sat to swap {amount}, more than {agreed}"
+                    ),
+                })
+            }
             Ok(prepared) => self
                 .store
                 .write(|tx| {

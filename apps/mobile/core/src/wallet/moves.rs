@@ -96,12 +96,14 @@ impl Wallet {
                 fee: offer.fee.saturating_sub(offer.lock_fee),
                 margin: offer.margin,
             };
-            let moving = self.wallet.swap(
+            // Held to what was confirmed in all, the hub's lock fee too.
+            let moving = self.wallet.swap_within(
                 &offer.provider,
                 &offer.from,
                 &offer.to,
                 offer.amount,
                 limits,
+                Some(most),
             );
             match self.operation(moving) {
                 Ok(swap) => return Ok(activity(&swap, self.swap_lock_fee(&swap)?)),

@@ -364,7 +364,7 @@ pub async fn pay<T: Transport>(
     let Some(hub) = hub else {
         return Err(unpayable(code, amount));
     };
-    send(wallet, code, hub, amount, note).await
+    send(wallet, code, hub, amount, note, None).await
 }
 
 /// How [`pay_planned`] pays a payment code in notes.
@@ -645,7 +645,10 @@ pub async fn pay_planned<T: Transport>(
             fee: quote.fee,
             margin: quote.margin,
         };
-        let swapped = wallet.swap(&provider.url, &swap.from, hub, quote.amount, limits);
+        // Held to what was quoted in all: the hub's lock fee included.
+        let costs = Some(quote.fee.saturating_add(swap.lock_fee));
+        let swapped =
+            wallet.swap_within(&provider.url, &swap.from, hub, quote.amount, limits, costs);
         let swapped = swapped.await.map_err(|e| match e {
             Error::Pending { reason, .. } => under_way(hub, Some(&reason)),
             e => e.into(),
@@ -668,7 +671,16 @@ pub async fn pay_planned<T: Transport>(
             plan.fee
         );
     }
-    send(wallet, code, plan.hub.clone(), amount, &note).await
+    // Held to its fee as planned, whatever fees the hub learns of refusing.
+    send(
+        wallet,
+        code,
+        plan.hub.clone(),
+        amount,
+        &note,
+        Some(plan.fee),
+    )
+    .await
 }
 
 /// Whether a swap to the hub at `hub` is under way.
@@ -719,19 +731,22 @@ fn unpayable(code: &PaymentCode, amount: u64) -> anyhow::Error {
 }
 
 /// Pay `amount` to the wallet of `code` at `hub`, kept there for the
-/// payee if the hub does, with `note`.
+/// payee if the hub does, with `note`, its fee at most `max_fee` if given.
 async fn send<T: Transport>(
     wallet: &Wallet<T>,
     code: &PaymentCode,
     hub: String,
     amount: u64,
     note: &PaymentNote,
+    max_fee: Option<u64>,
 ) -> anyhow::Result<CodePaid> {
     let Some(licash) = &code.licash else {
         return Err(unpayable(code, amount));
     };
     let started = Instant::now();
-    let paid = wallet.pay_code_saying(&hub, licash, amount, note).await?;
+    let paid = wallet
+        .pay_code_within(&hub, licash, amount, note, max_fee)
+        .await?;
     tracing::info!(
         hub = %hub,
         took = ?started.elapsed(),

@@ -43,22 +43,24 @@ impl Wallet {
     }
 
     /// Pay the Lightning invoice `text` through the swap provider at
-    /// `provider`, from notes at `hub`, its fee at most `max_fee`, as
-    /// [`Wallet::invoice_offers`] quoted it: under way until
-    /// [`Wallet::resume`] finds its lock paid, or refunded once expired
-    /// if the payment failed.
+    /// `provider`, from notes at `hub`, its fee at most `max_fee` and the
+    /// hub's on the lock at most `lock_fee` more in all, as
+    /// [`Wallet::invoice_offers`] quoted them ([`crate::ViaProvider`]):
+    /// under way until [`Wallet::resume`] finds its lock paid, or refunded
+    /// once expired if the payment failed.
     pub fn pay_invoice_via(
         &self,
         text: String,
         hub: String,
         provider: String,
         max_fee: u64,
+        lock_fee: u64,
     ) -> Result<Activity, LicashError> {
         let _timed = crate::log::timed("pay_invoice_via");
         let invoice = self.wallet.read_invoice(&text)?;
-        let pay = self
-            .wallet
-            .pay_invoice_via(&provider, &hub, &invoice.request, max_fee);
+        let costs = Some(max_fee.saturating_add(lock_fee));
+        let pay =
+            (self.wallet).pay_invoice_via_within(&provider, &hub, &invoice.request, max_fee, costs);
         let lock = self.operation(pay)?;
         Ok(super::lightning_activity(&lock, &invoice.request))
     }

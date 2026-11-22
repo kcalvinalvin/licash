@@ -552,6 +552,34 @@ impl<T: Transport> Wallet<T> {
         request: &str,
         max_fee: u64,
     ) -> Result<Lock, Error> {
+        self.pay_invoice_via_within(provider, url, request, max_fee, None)
+            .await
+    }
+
+    /// [`Wallet::pay_invoice_via`], refused as [`Error::FeeRose`], nothing
+    /// locked, if the provider's fee and the hub's on the lock, as it signs
+    /// it, come to more than `costs`: what was quoted in all
+    /// ([`ViaQuote::costs`]).
+    pub async fn pay_invoice_via_within(
+        &self,
+        provider: &str,
+        url: &str,
+        request: &str,
+        max_fee: u64,
+        costs: Option<u64>,
+    ) -> Result<Lock, Error> {
+        // Boxed: a lock's future is deep, and nested in its callers'.
+        Box::pin(self.paying_via(provider, url, request, max_fee, costs)).await
+    }
+
+    async fn paying_via(
+        &self,
+        provider: &str,
+        url: &str,
+        request: &str,
+        max_fee: u64,
+        costs: Option<u64>,
+    ) -> Result<Lock, Error> {
         let provider = hub_url(provider)?;
         let url = hub_url(url)?;
         let invoice = decode(request)?;
@@ -570,7 +598,7 @@ impl<T: Transport> Wallet<T> {
                     )));
                 }
                 let at = (url.as_str(), &info);
-                let (amount, _, expiry) =
+                let (amount, fee, expiry) =
                     via_terms(&provider, &offer, at, &invoice, msat, max_fee)?;
                 tracing::info!(%url, %provider, msat, amount, expiry, "paying an invoice through a provider");
                 let at = (url.as_str(), hub, &info);
@@ -578,8 +606,23 @@ impl<T: Transport> Wallet<T> {
                     provider: &provider,
                     invoice: &request,
                 };
-                self.lock_paying(at, &offer.address, amount, hash, Some(expiry), pays)
-                    .await?
+                let prepared = self
+                    .prepare_lock(at, &offer.address, amount, hash, Some(expiry), pays)
+                    .await?;
+                // Its fee as the hub's lock signs it, not as quoted.
+                let asked = fee.saturating_add(prepared.fee);
+                if let Some(agreed) = costs.filter(|most| asked > *most) {
+                    return Err(Error::FeeRose {
+                        who: provider.clone(),
+                        agreed,
+                        asked,
+                        reason: format!(
+                            "provider {provider} and hub {url} ask {asked} sat to pay the invoice, more than {agreed}"
+                        ),
+                    });
+                }
+                self.store.write(|tx| prepared.record(tx))?;
+                self.send_lock(&url, &prepared).await?
             }
         };
         match lock.state {

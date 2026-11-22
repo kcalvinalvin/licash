@@ -848,6 +848,7 @@ fn a_phone_pays_an_invoice_through_a_provider_when_no_hub_pays_it() {
             quote.hub.clone(),
             provider.url.clone(),
             provider.fee,
+            provider.lock_fee,
         )
         .unwrap();
     assert_eq!(
@@ -888,7 +889,8 @@ fn a_phone_pays_an_invoice_through_a_provider_when_no_hub_pays_it() {
         other => panic!("{other:?}"),
     }
     // Paid through the provider: not again through it, nor anyone else.
-    let again = phone.pay_invoice_via(request, quote.hub, provider.url, provider.fee);
+    let (fee, lock_fee) = (provider.fee, provider.lock_fee);
+    let again = phone.pay_invoice_via(request, quote.hub, provider.url, fee, lock_fee);
     assert_eq!(again.unwrap().id, paid.id);
 }
 

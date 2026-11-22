@@ -192,7 +192,7 @@ impl<T: Transport> Wallet<T> {
     /// the mailbox the code names, if any, unless the payee says it has it
     /// within [`ACK_WITHIN`], or at once if the hub does not keep it.
     pub async fn pay_code(&self, url: &str, code: &LicashCode, amount: u64) -> Result<Paid, Error> {
-        self.send_with(url, &code.address, amount, Some(code.mailbox), None)
+        self.send_with(url, &code.address, amount, Some(code.mailbox), None, None)
             .await
     }
 
@@ -209,10 +209,25 @@ impl<T: Transport> Wallet<T> {
         amount: u64,
         note: &PaymentNote,
     ) -> Result<Paid, Error> {
+        self.pay_code_within(url, code, amount, note, None).await
+    }
+
+    /// [`Wallet::pay_code_saying`], refused as [`Error::FeeRose`], nothing
+    /// paid, if its hub's fee would pass `max_fee`, as quoted: the fees
+    /// it learns from a hub refusing the first offer included.
+    pub async fn pay_code_within(
+        &self,
+        url: &str,
+        code: &LicashCode,
+        amount: u64,
+        note: &PaymentNote,
+        max_fee: Option<u64>,
+    ) -> Result<Paid, Error> {
         let url = crate::hub_url(url)?;
         let note = self.note_for(&url, note).await?;
         let mailbox = Some(code.mailbox);
-        (self.send_with(&url, &code.address, amount, mailbox, Some(&note))).await
+        let address = &code.address;
+        (self.send_with(&url, address, amount, mailbox, Some(&note), max_fee)).await
     }
 
     /// [`Wallet::pay_code`] under `key`, once: no other payment is ever
@@ -239,7 +254,7 @@ impl<T: Transport> Wallet<T> {
             )));
         }
         let mailbox = Some(code.mailbox);
-        (self.send_once(&url, &code.address, amount, mailbox, Some(key), None)).await
+        (self.send_once(&url, &code.address, amount, mailbox, Some(key), None, None)).await
     }
 
     /// The payments to mail to their payees' mailboxes now: those whose

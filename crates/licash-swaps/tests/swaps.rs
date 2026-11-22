@@ -667,6 +667,36 @@ async fn a_client_locks_nothing_for_a_swap_the_provider_would_decline() {
     assert_eq!(held(&eco.client, A), 100);
 }
 
+/// A swap whose lock, as the hub's fee on it signs it, costs more than was
+/// quoted in all locks nothing: a hub raising its fee after the quote is
+/// not paid it. Within the quote, it is swapped.
+#[tokio::test]
+async fn a_client_locks_nothing_for_a_swap_whose_lock_fee_passes_what_was_quoted_in_all() {
+    let eco = Eco::new(60).await;
+    let limits = SwapLimits::usual(20);
+    let (fee, _) = costs(20);
+    let lock_fee = eco.client.lock_fee(A, 20 + fee).unwrap();
+    assert!(lock_fee > 0);
+    let all = fee + lock_fee;
+    let refused = (eco.client).swap_within(PROVIDER, A, B, 20, limits, Some(all - 1));
+    match refused.await {
+        Err(Error::FeeRose { agreed, asked, .. }) => assert_eq!((agreed, asked), (all - 1, all)),
+        other => panic!("{other:?}"),
+    }
+    let swaps = eco.client.swaps().unwrap();
+    assert!(
+        matches!(&swaps[..], [s] if matches!(s.state, SwapState::Failed(_))),
+        "{swaps:?}"
+    );
+    assert!(eco.client.locks().unwrap().is_empty());
+    assert_eq!(held(&eco.client, A), 100);
+    assert!(eco.provider().records(10).unwrap().is_empty());
+
+    let swap = (eco.client).swap_within(PROVIDER, A, B, 20, limits, Some(all));
+    assert_eq!(swap.await.unwrap().fee, fee);
+    assert_eq!(eco.client.locks().unwrap()[0].fee, lock_fee);
+}
+
 #[tokio::test]
 async fn a_client_locks_nothing_for_a_swap_costing_more_than_it_allows() {
     let eco = Eco::new(60).await;

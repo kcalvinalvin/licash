@@ -1318,12 +1318,14 @@ impl<T: Transport> Wallet<T> {
     /// top. A hub that refuses the fee it advertised is asked again for its
     /// fees, and paid them, once.
     pub async fn send(&self, url: &str, payee: &Address, amount: u64) -> Result<Paid, Error> {
-        self.send_with(url, payee, amount, None, None).await
+        self.send_with(url, payee, amount, None, None, None).await
     }
 
     /// [`Wallet::send`], its hub asked to keep the payment for its payee if
     /// `delivered`, then mailed to the payee's mailbox it holds, if any,
     /// unless the payee collects it ([`delivery`]), with `note` if any.
+    /// Refused as [`Error::FeeRose`], nothing paid, if its fee would pass
+    /// `max_fee`, the new fees of a hub refusing the first included.
     pub(crate) async fn send_with(
         &self,
         url: &str,
@@ -1331,25 +1333,25 @@ impl<T: Transport> Wallet<T> {
         amount: u64,
         delivered: Option<Option<[u8; 32]>>,
         note: Option<&PaymentNote>,
+        max_fee: Option<u64>,
     ) -> Result<Paid, Error> {
         let url = hub_url(url)?;
         if amount == 0 {
             return Err(Error::Invalid("nothing to pay".into()));
         }
-        match self
-            .send_once(&url, payee, amount, delivered, None, note)
-            .await
-        {
+        let once = || self.send_once(&url, payee, amount, delivered, None, note, max_fee);
+        match once().await {
             Err(Error::Refused { problem, .. }) if problem.code == Code::Fee => {
                 tracing::info!(%url, %problem, "fees changed, paying the new ones");
                 self.refresh(&url).await?;
-                (self.send_once(&url, payee, amount, delivered, None, note)).await
+                once().await
             }
             sent => sent,
         }
     }
 
-    /// One payment, under `key` if given, recorded with it. One to a code
+    /// One payment, under `key` if given, recorded with it, refused if its
+    /// fee passes `max_fee`. One to a code
     /// (`delivered`) goes with a note, sealed to the size of any other and
     /// saying `note` if any, unless the wallet's file keeps another
     /// version of notes: kept by its hub with it too if the hub says it
@@ -1362,12 +1364,22 @@ impl<T: Transport> Wallet<T> {
         delivered: Option<Option<[u8; 32]>>,
         key: Option<[u8; 32]>,
         note: Option<&PaymentNote>,
+        max_fee: Option<u64>,
     ) -> Result<Paid, Error> {
         let (hub, info) = self.hub(url)?;
         let noted = delivered.is_some() && self.notes_on()?;
         let fees = self.agreed_fees(hub, url, &info)?;
         let (keyset, plan) = self.payment_plan(hub, amount, &fees)?;
         let selection = plan.selection;
+        if let Some(agreed) = max_fee.filter(|most| selection.fee > *most) {
+            let asked = selection.fee;
+            return Err(Error::FeeRose {
+                who: url.to_owned(),
+                agreed,
+                asked,
+                reason: format!("hub {url} asks {asked} sat to pay {amount}, more than {agreed}"),
+            });
+        }
         let inputs = self.notes_of(&keyset, &selection.inputs)?;
         let me = self.address();
         let ephemeral = Ephemeral::random();

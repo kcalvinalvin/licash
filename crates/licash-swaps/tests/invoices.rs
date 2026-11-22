@@ -686,6 +686,37 @@ async fn a_wallet_locks_nothing_for_a_provider_asking_too_much() {
     assert!(node.sent().is_empty());
 }
 
+/// A payment through a provider whose lock, as its hub's fee on it signs
+/// it, costs more than was quoted in all locks nothing: its hub raising its
+/// fee after the quote is not paid it. Within the quote, it is paid.
+#[tokio::test]
+async fn a_wallet_locks_nothing_for_a_lock_fee_past_what_was_quoted_in_all() {
+    let (_net, _dir, node, _provider, client) = via().await;
+    let request = node.invoice(1_000_000, lock_hash(&[6; 32]), DELTA, Outcome::Hang);
+    let quote = client
+        .invoice_quote_via(PROVIDER, A, &request, 100)
+        .await
+        .unwrap();
+    assert!(quote.lock_fee > 0, "{quote:?}");
+    let all = quote.costs();
+    let refused = client
+        .pay_invoice_via_within(PROVIDER, A, &request, 100, Some(all - 1))
+        .await;
+    match refused {
+        Err(Error::FeeRose { agreed, asked, .. }) => assert_eq!((agreed, asked), (all - 1, all)),
+        other => panic!("{other:?}"),
+    }
+    assert!(client.locks().unwrap().is_empty());
+    assert!(node.sent().is_empty());
+    assert_eq!(client.balance().unwrap()[0].available, HELD);
+
+    let lock = client
+        .pay_invoice_via_within(PROVIDER, A, &request, 100, Some(all))
+        .await
+        .unwrap();
+    assert_eq!(lock.fee, quote.lock_fee);
+}
+
 #[tokio::test]
 async fn a_payment_the_provider_never_heard_of_is_asked_for_again() {
     let (net, dir, node, provider, client) = via().await;

@@ -758,8 +758,8 @@ pub struct ViaProvider {
     pub url: String,
     pub name: Option<String>,
     /// The parts of the quote's fee: the provider's, routing included,
-    /// which [`crate::Wallet::pay_invoice_via`] pays at most, and the
-    /// hub's on the lock.
+    /// and the hub's on the lock, which [`crate::Wallet::pay_invoice_via`]
+    /// pays at most, the first alone and both together.
     pub fee: u64,
     pub lock_fee: u64,
     /// Blocks until a failed payment's notes return, as its lock expires.

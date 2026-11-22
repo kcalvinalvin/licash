@@ -1604,13 +1604,14 @@ class Engine(context: Context) {
     /**
      * Pay the Lightning invoice `text` as `quote` says: through its hub's
      * gateway, or through its provider for a lock of notes at its hub, for
-     * no more than the provider quoted. Done, or under way.
+     * no more than the provider and the hub's lock fee quoted. Done, or
+     * under way.
      */
     suspend fun payInvoice(text: String, quote: InvoiceQuote): Result<Activity> = io {
         val provider = quote.provider
         val paid = locked {
             if (provider == null) it.payInvoiceWithin(text, quote.hub, quote.fee)
-            else it.payInvoiceVia(text, quote.hub, provider.url, provider.fee)
+            else it.payInvoiceVia(text, quote.hub, provider.url, provider.fee, provider.lockFee)
         }
         refresh()
         poke()

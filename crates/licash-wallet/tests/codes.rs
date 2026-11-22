@@ -253,3 +253,35 @@ async fn each_payment_is_taken_and_paid_on_in_a_lane_of_its_own_and_feeds_in_non
         "a payment on in a take's lane: {all:?}"
     );
 }
+
+/// A hub refusing the fee it advertised is paid its new one only within
+/// the fee its payer approved: past it, nothing is paid, and within it the
+/// payment goes through as before.
+#[tokio::test]
+async fn a_hub_raising_its_fee_past_what_was_approved_is_paid_nothing() {
+    let net = Net::new();
+    net.start(HUB, Fee { base: 3, ppm: 0 });
+    net.conduct(HUB, Conduct::Keeps);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, bob) = (wallet(&net, &dir, "alice", 1), wallet(&net, &dir, "bob", 2));
+    // Free as Alice added it, then 3 a spend.
+    *net.stale.lock().unwrap() = Some(Fee { base: 0, ppm: 0 });
+    alice.add_hub(HUB).await.unwrap();
+    *net.stale.lock().unwrap() = None;
+    bob.add_hub(HUB).await.unwrap();
+    alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    let to = bob.payment_code(&[HUB.into()]).unwrap().licash.unwrap();
+    let blank = PaymentNote::default();
+
+    let refused = alice.pay_code_within(HUB, &to, 20, &blank, Some(2)).await;
+    match refused {
+        Err(Error::FeeRose { agreed, asked, .. }) => assert_eq!((agreed, asked), (2, 3)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(held(&alice), 100, "nothing paid");
+    assert!(alice.sends().unwrap().iter().all(|s| s.fee == 0));
+
+    let paid = alice.pay_code_within(HUB, &to, 20, &blank, Some(3)).await;
+    assert!(paid.unwrap().kept);
+    assert_eq!(held(&alice), 77);
+}
