@@ -1610,7 +1610,9 @@ class Engine(context: Context) {
      * Saying `memo` to the payer, if given, which the hub reads too.
      */
     suspend fun askInvoiceFor(amount: ULong, memo: String? = null): Result<LightningInvoice> = io {
-        val asked = locked { it.askInvoiceFor(amount, memo) }
+        // Not behind a round: each invoice is advanced by one caller at a
+        // time in the core, and asking makes one of its own.
+        val asked = local { it.askInvoiceFor(amount, memo) }
         // Perhaps paid out of sight: looked for now and then for a while.
         prefs.askedAt = System.currentTimeMillis() / 1000
         refresh()
@@ -1631,7 +1633,7 @@ class Engine(context: Context) {
 
     /** Where the invoice of `hash` stands: its notes taken once it is paid. */
     suspend fun followInvoice(hash: String): Result<LightningInvoice> = io {
-        val followed = locked { it.followInvoice(hash) }
+        val followed = local { it.followInvoice(hash) }
         if (followed.state != State.PENDING) refresh()
         followed
     }
