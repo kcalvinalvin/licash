@@ -231,7 +231,7 @@ services:
         --nostr-relay ws://relay:8080 --announce-url http://127.0.0.1:${LICASH_E2E_SWAPS:-38340}
         --announce-name swaps --name swaps --notify gotify://gotify/$$(cat /notify/token)
         --no-contracts --lnd https://swaps-ln:8080
-        --lnurl-url http://127.0.0.1:${LICASH_E2E_SWAPS:-38340}
+        --lnurl-url http://127.0.0.1:${LICASH_E2E_SWAPS:-38340} --receive
     environment:
       LICASH_SWAPS_LND_MACAROON: /lnd/data/chain/bitcoin/regtest/admin.macaroon
       LICASH_SWAPS_LND_CERT: /lnd/tls.cert

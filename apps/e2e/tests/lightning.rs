@@ -603,3 +603,62 @@ async fn a_static_lnurl_takes_donations_for_a_wallet_offline() -> anyhow::Result
     assert_eq!(refused["status"], "ERROR", "{refused}");
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "needs the stack of apps/e2e/run.sh"]
+async fn a_provider_has_a_wallet_paid_over_lightning_at_a_hub() -> anyhow::Result<()> {
+    let eco = Eco::up().await?;
+    let hub2 = eco.hub(2);
+    eco.stock(20_000).await?;
+    let rose = eco.wallet("rose")?;
+    rose.add_hub(hub2).await?;
+    let provider = eco.swaps_info().await?;
+    let terms = provider.receive.expect("receipts taken");
+
+    // The provider's node makes the invoice under Rose's hash, asking the
+    // amount and its fee exactly.
+    let invoice = rose
+        .invoice_through(eco.swaps(), hub2, 5_000, Some("Tea"))
+        .await?;
+    let request = invoice.request.as_deref().expect("an invoice");
+    let decoded = eco.lncli(OUTSIDE, &["decodepayreq", request]).await?;
+    assert_eq!(decoded["num_satoshis"], terms.asks(5_000).to_string());
+    assert_eq!(decoded["payment_hash"], invoice.hash);
+    assert_eq!(decoded["description"], "Tea");
+    let node = eco.lncli(SWAPS_LN, &["getinfo"]).await?;
+    assert_eq!(decoded["destination"], node["identity_pubkey"]);
+    // Held long enough for the provider to force the preimage out on
+    // Bitcoin, should hub2 keep it: past its window, its margins and
+    // Rose's time to claim.
+    let window = eco
+        .info(hub2)
+        .await?
+        .locks
+        .expect("hub2 takes locks")
+        .window;
+    let cltv: u32 = decoded["cltv_expiry"].as_str().unwrap().parse()?;
+    assert!(
+        cltv >= window + 18 + 12 + 3,
+        "{cltv} for a window of {window}"
+    );
+
+    // Paid from outside: locked to Rose at hub2, claimed, then settled.
+    let paying = eco.pay(OUTSIDE, request);
+    assert_eq!(
+        received(&rose, &invoice.hash).await?,
+        InvoiceState::Received
+    );
+    assert_eq!(available_at(&rose, hub2), 5_000);
+    assert!(paying.await??, "the outside node's payment failed");
+    let status = eco
+        .get_json(&format!(
+            "{}{}",
+            eco.swaps(),
+            licash_api::swaps::receive_state(&hex_32(&invoice.hash))
+        ))
+        .await?;
+    assert_eq!(status["state"], "settled", "{status}");
+    let (state, _) = eco.invoice_state(SWAPS_LN, &invoice.hash).await?;
+    assert_eq!(state, "SETTLED");
+    Ok(())
+}
