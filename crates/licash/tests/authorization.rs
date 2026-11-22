@@ -618,3 +618,163 @@ fn malformed_public_artifacts_are_not_owner_authorization() {
         .is_err());
     }
 }
+
+/// A note opened from a grant, with the keyset it verifies under.
+fn opened() -> (Keyset, Note) {
+    let (keys, keyset, notes, proposal) = fixture();
+    let prepared = PreparedGrant::new(&keys, &proposal).unwrap();
+    let signed = SignedProposal::sign(
+        &keyset,
+        proposal,
+        &notes,
+        Authorization::Granted(Box::new(prepared.offer())),
+        &owners(),
+    )
+    .unwrap();
+    let unlock = prepared.release(&keyset, &notes, &signed).unwrap();
+    let note = signed
+        .open_granted_output(&keyset, &notes, 0, &derive(10), &unlock)
+        .unwrap();
+    (keyset, note)
+}
+
+/// An opened note's proof holds for what it was sealed with and nothing
+/// else: its answers, the output's blinding, the hub's unlink commitment
+/// (which the proof vouches for, so no holder can change it), the unlock
+/// and the mask base. Whoever is shown the note checks all of them.
+#[test]
+fn an_opened_notes_evidence_binds_each_of_its_fields() {
+    let (keyset, note) = opened();
+    let Evidence::Granted {
+        seal,
+        blinding,
+        commit,
+        unlock,
+        mask,
+    } = *note.evidence()
+    else {
+        panic!("an opened note shows its packet's proof");
+    };
+    let with = |evidence| {
+        Note::from_parts(
+            &keyset,
+            *keyset.id(),
+            note.message().clone(),
+            note.signature(),
+            evidence,
+        )
+    };
+    let granted = |seal, blinding, commit, unlock, mask| Evidence::Granted {
+        seal,
+        blinding,
+        commit,
+        unlock,
+        mask,
+    };
+    assert_eq!(
+        with(granted(seal, blinding, commit, unlock, mask)).unwrap(),
+        note
+    );
+    let other = crypto::ScalarBytes::from_scalar(&Scalar::from(97u64));
+    for (field, changed) in [
+        (
+            "e",
+            granted(
+                crypto::Seal { e: other, ..seal },
+                blinding,
+                commit,
+                unlock,
+                mask,
+            ),
+        ),
+        (
+            "s_k",
+            granted(
+                crypto::Seal { s_k: other, ..seal },
+                blinding,
+                commit,
+                unlock,
+                mask,
+            ),
+        ),
+        (
+            "s_t",
+            granted(
+                crypto::Seal { s_t: other, ..seal },
+                blinding,
+                commit,
+                unlock,
+                mask,
+            ),
+        ),
+        ("blinding", granted(seal, other, commit, unlock, mask)),
+        (
+            "commit r1",
+            granted(
+                seal,
+                blinding,
+                crypto::DleqCommit {
+                    r1: point(89),
+                    ..commit
+                },
+                unlock,
+                mask,
+            ),
+        ),
+        (
+            "commit r2",
+            granted(
+                seal,
+                blinding,
+                crypto::DleqCommit {
+                    r2: point(89),
+                    ..commit
+                },
+                unlock,
+                mask,
+            ),
+        ),
+        ("unlock", granted(seal, blinding, commit, other, mask)),
+        ("mask", granted(seal, blinding, commit, unlock, point(89))),
+    ] {
+        assert!(with(changed).is_err(), "a changed {field} verifies");
+    }
+    // Nor does it pass for a proof of another kind on the same note.
+    assert!(with(Evidence::Linked {
+        dleq: crypto::Dleq {
+            e: seal.e,
+            s: seal.s_k
+        },
+        blinding,
+        commit,
+    })
+    .is_err());
+}
+
+/// An opened note is read back from its bytes, whole and compact, as it
+/// was, and from no other framing of them.
+#[test]
+fn an_opened_note_roundtrips_whole_and_compact() {
+    let (keyset, note) = opened();
+    let bytes = note.to_bytes();
+    assert_eq!(Note::from_bytes(&keyset, &bytes).unwrap(), note);
+    let compact = note.to_compact_bytes();
+    assert!(compact.len() < bytes.len());
+    let read = |b: &[u8]| Note::from_compact_bytes(&keyset, note.message().clone(), b);
+    assert_eq!(read(&compact).unwrap(), note);
+    for n in 0..bytes.len() {
+        assert!(Note::from_bytes(&keyset, &bytes[..n]).is_err(), "{n} bytes");
+    }
+    for n in 0..compact.len() {
+        assert!(read(&compact[..n]).is_err(), "{n} compact bytes");
+    }
+    assert!(Note::from_bytes(&keyset, &[&bytes[..], &[0]].concat()).is_err());
+    assert!(read(&[&compact[..], &[0]].concat()).is_err());
+    // Every byte after the message is the note's point or its evidence.
+    let tail = bytes.len() - compact.len();
+    for at in (tail..bytes.len()).step_by(7) {
+        let mut b = bytes.clone();
+        b[at] ^= 1;
+        assert!(Note::from_bytes(&keyset, &b).is_err(), "byte {at}");
+    }
+}
