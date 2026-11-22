@@ -426,7 +426,8 @@ internal fun ProtectSheet(q: ContractQuote, open: () -> Unit, cashOutFirst: () -
         if (coin != null) {
             // The coin is spent whole: the price, and the rest is hers, issued back as notes.
             val part = if (coin > q.price) coin - q.price else 0uL
-            Line("You fund", sat(part), tag = "contract-funded")
+            Line("Paid with", "${sat(coin)} on Bitcoin", tag = "contract-paid-with")
+            Line("Into your balance", sat(part), tag = "contract-funded")
             BigButton(
                 "Protect for ${sat(q.price)}",
                 Modifier.fillMaxWidth().testTag("protect"),

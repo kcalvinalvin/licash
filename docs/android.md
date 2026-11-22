@@ -43,7 +43,9 @@ it still, and any answer ends the rest.
 Home says when bitcoin paid to the wallet waits outside the balance and no
 protection is offered for it ("N sat on Bitcoin, not in your balance"); it
 opens the page for what is on Bitcoin, which lists each hub's protection to
-open. A payment that finds too little to pay with, in notes or none, while
+open. That page is always one tap from the balance: its row says "Add it
+to your balance, protected or not" while bitcoin is held and nothing is
+being added, and the Bitcoin address in Receive points there. A payment that finds too little to pay with, in notes or none, while
 bitcoin is held or coming, says so in plain words and offers to fix it:
 "Add to balance, protected" opens the protection offered for it, if any,
 and "Add without protection" (or "Add to balance" with none offered) moves

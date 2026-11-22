@@ -181,7 +181,14 @@ private fun Summary(
             CoverBar(cover, Modifier.padding(bottom = 12.dp))
             Divider()
         }
-        Entry("On Bitcoin", value = sat(b.onchain + b.moving + b.opening), tag = "onchain", onClick = { go(ON_BITCOIN) })
+        // Where bitcoin held is added to the balance: said, since nothing else leads here.
+        Entry(
+            "On Bitcoin",
+            value = sat(b.onchain + b.moving + b.opening),
+            sub = ADD_ONCHAIN.takeIf { b.onchain > 0uL && b.moving == 0uL && ui.opening == null },
+            tag = "onchain",
+            onClick = { go(ON_BITCOIN) },
+        )
     }
     if (visited.isNotEmpty()) {
         Group("Not in your balance") {
@@ -226,6 +233,9 @@ private fun Summary(
         }
     }
 }
+
+/** What the On Bitcoin page does with bitcoin held, said under its row. */
+internal const val ADD_ONCHAIN = "Add it to your balance, protected or not"
 
 internal fun noteCount(notes: List<Notes>): ULong = notes.sumOf { it.count.toULong() }
 
