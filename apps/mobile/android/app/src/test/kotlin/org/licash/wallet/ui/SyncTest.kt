@@ -126,7 +126,7 @@ class SyncTest {
         val nodes = stages(Ui(chain = ChainStatus())).first()
         assertEquals("Looking for Bitcoin nodes", said(nodes, developer = false))
         val hub = stages(Ui(chain = caughtUp, hubs = listOf(hub()), scan = scan(800u, 896u, 895u))).last()
-        assertEquals("Waiting for the newest block's silent payment index", said(hub, developer = false))
+        assertEquals("Checking the newest block", said(hub, developer = false))
     }
 
     @Test
@@ -245,21 +245,30 @@ class SyncTest {
         val ui = Ui(chain = caughtUp, hubs = listOf(hub()), scan = scan(from = 800u, next = 896u, height = 895u))
         val payments = stages(ui).last()
         assertEquals(Progress.DOING, payments.state)
-        assertEquals("Checked to block 895, waiting for the silent payment index of block 896", payments.detail)
+        assertEquals("Checked to block 895, checking block 896", payments.detail)
     }
 
     @Test
-    fun the_index_a_block_or_two_behind_is_up_to_date() {
-        for (behind in 1..INDEX_SLACK) {
-            val height = (900 - behind).toUInt()
-            val ui = Ui(chain = caughtUp, hubs = listOf(hub()), scan = scan(from = 800u, next = height + 1u, height = height))
-            assertEquals(Progress.DONE, stages(ui).last().state)
-            assertEquals("Up to date", stages(ui).last().detail)
-            assertFalse(catchingUp(ui))
-        }
-        val height = (900 - INDEX_SLACK - 1).toUInt()
-        val further = Ui(chain = caughtUp, hubs = listOf(hub()), scan = scan(from = 800u, next = height + 1u, height = height))
-        assertEquals(Progress.DOING, stages(further).last().state)
+    fun caught_up_once_bitcoin_stays_up_while_keeping_up_with_new_blocks() {
+        // A block come since the last look: looked in next round.
+        val ui = Ui(chain = caughtUp, hubs = listOf(hub()), scan = scan(from = 800u, next = 900u, height = 899u))
+        assertEquals(Progress.DOING, stages(ui).last().state)
+        assertEquals("Checked to block 899, checking block 900", stages(ui).last().detail)
+        assertEquals("Checking the newest block", said(stages(ui).last(), developer = false))
+        assertTrue(bitcoinBehind(ui))
+        fun bitcoin(ui: Ui, stale: Boolean) = links(ui, stale).first { it.name == BITCOIN }
+        // Before the wallet first caught up: said at once.
+        assertEquals(Reach.GOING, bitcoin(ui, stale = false).reach)
+        // Since: up, as usual, until behind STALE_MS.
+        val since = ui.copy(caughtUp = true)
+        assertEquals(Link(BITCOIN, Reach.UP, "Up to date"), bitcoin(since, stale = false))
+        assertEquals(Reach.GOING, bitcoin(since, stale = true).reach)
+        // No node: the same, up for a while, then said.
+        val noNodes = since.copy(chain = caughtUp.copy(peers = 0))
+        assertEquals(Reach.UP, bitcoin(noNodes, stale = false).reach)
+        assertEquals(Link(BITCOIN, Reach.GOING, "Looking for Bitcoin nodes"), bitcoin(noNodes, stale = true))
+        // Up to date: not behind.
+        assertFalse(bitcoinBehind(ui.copy(scan = scan(from = 800u, next = 901u, height = 900u))))
     }
 
     @Test

@@ -21,7 +21,9 @@ wallet first catches up with Bitcoin, Home says the step under way in
 plain words and how far (each step, block numbers and all, in advanced
 mode), the headers this release pins counted as downloaded, then as
 stored; once caught up, never again. A dot beside the network shows how
-the connections stand (Tor if on, Bitcoin, each hub as it answered when
+the connections stand (Tor if on, Bitcoin, up once caught up while it
+keeps up with new blocks as usual and only behind once 30 s behind or with
+no node, each hub as it answered when
 last asked, every 5 minutes, and the mailbox's relays as last looked in,
 kept in memory only); tapped, it says each with how long it took to
 answer (Bitcoin's nodes' shortest ping, a hub's info, a look in the

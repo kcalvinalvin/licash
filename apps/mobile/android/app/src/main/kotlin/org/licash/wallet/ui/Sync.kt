@@ -149,19 +149,17 @@ fun stages(ui: Ui): List<Stage> {
     val next = scan.next.toLong()
     val reachable = scan.height.toLong()
     val from = scan.from.toLong().takeIf { it in 1..next } ?: next
-    // Silent payments are found from each block's index, made by the hubs
-    // from the full block once the light client has it, so a little later:
-    // up to INDEX_SLACK blocks behind is the usual wait after a block, up
-    // to date, not catching up.
-    val lagging = filters - reachable > INDEX_SLACK
+    // Looked in up to the block the light client had then: a block come
+    // since is looked in at the wallet's next round.
+    val newer = filters > reachable
     val looked = next > reachable
     val doing = when {
-        looked && lagging -> "Checked to block ${block(reachable)}, $INDEX_WAIT ${block(reachable + 1)}"
+        looked && newer -> "Checked to block ${block(reachable)}, $NEXT_BLOCK ${block(reachable + 1)}"
         else -> "Block ${block(next)} of ${block(reachable)}, ${block(reachable - next + 1)} to go" +
             shown(fraction(from, next, reachable + 1))
     }
     val finished = "Up to date" + if (scan.tweaks) "" else ", fallback addresses only"
-    add(PAYMENTS, looked && !lagging, doing, finished, fraction(from, next, reachable + 1).takeIf { !looked })
+    add(PAYMENTS, looked && !newer, doing, finished, fraction(from, next, reachable + 1).takeIf { !looked })
     return out
 }
 
@@ -175,8 +173,13 @@ internal const val TOR = "Tor"
 internal const val HEADERS_DOWNLOAD = "Block headers download"
 internal const val NODES = "Bitcoin nodes"
 internal const val PAYMENTS = "Your payments"
-private const val INDEX_WAIT = "waiting for the silent payment index of block"
-internal const val INDEX_SLACK = 2
+private const val NEXT_BLOCK = "checking block"
+
+/**
+ * How long Bitcoin may be behind, once caught up, before its dot says so:
+ * a block arriving is looked in within a round or two, as usual, not a wait.
+ */
+internal const val STALE_MS = 30_000L
 
 /**
  * A step under way in a few plain words: in advanced mode, its name and
@@ -192,7 +195,7 @@ internal fun said(stage: Stage, developer: Boolean): String = when {
         else -> "Downloading block headers" + shown(stage.fraction)
     }
     stage.name == NODES -> "Looking for Bitcoin nodes"
-    stage.name == PAYMENTS && stage.detail.contains(INDEX_WAIT) -> "Waiting for the newest block's silent payment index"
+    stage.name == PAYMENTS && stage.detail.contains(NEXT_BLOCK) -> "Checking the newest block"
     stage.name == PAYMENTS -> "Looking for your payments" + shown(stage.fraction)
     else -> "Catching up with Bitcoin" + shown(stage.fraction)
 }
@@ -206,8 +209,10 @@ data class Link(val name: String, val reach: Reach, val detail: String, val ms: 
 /**
  * The app's connections: Tor if on, then Bitcoin, up once caught up (a
  * wallet with no hub yet does not look for payments, and is not behind).
+ * Once the wallet has caught up, Bitcoin stays up while it keeps up with
+ * new blocks as usual: behind only once `stale`, [STALE_MS] behind.
  */
-fun links(ui: Ui): List<Link> {
+fun links(ui: Ui, stale: Boolean = true): List<Link> {
     val out = mutableListOf<Link>()
     val tor = ui.torStatus
     if (ui.tor) {
@@ -217,13 +222,15 @@ fun links(ui: Ui): List<Link> {
             else -> Link(TOR, Reach.GOING, "Connecting" + (tor?.let { " (${it.percent}%)" } ?: ""))
         }
     }
-    val step = stages(ui).firstOrNull {
-        it.state != Progress.DONE && it.name != TOR && !(it.name == PAYMENTS && ui.hubs.isEmpty())
-    }
+    val step = bitcoinStep(ui)
     val chain = ui.chain
     val up = "Up to date" + if (ui.developer) ", block ${block(chain.height.toLong())}, ${chain.peers} nodes" else ""
     val ping = chain.pingMs.toLong().takeIf { it > 0 && chain.peers > 0 }
-    out += Link(BITCOIN, if (step == null) Reach.UP else Reach.GOING, step?.let { said(it, ui.developer) } ?: up, ping)
+    val keepingUp = step != null && ui.caughtUp && !stale
+    out += when {
+        step == null || keepingUp -> Link(BITCOIN, Reach.UP, up, ping)
+        else -> Link(BITCOIN, Reach.GOING, said(step, ui.developer), ping)
+    }
     for (hub in ui.hubs) {
         out += when (ui.hubsReached[hub.url]) {
             true -> Link(name(hub.url), Reach.UP, "Reached", ui.hubsMs[hub.url])
@@ -241,6 +248,14 @@ fun links(ui: Ui): List<Link> {
     }
     return out
 }
+
+/** The step of catching up with Bitcoin under way, if any: not Tor's, nor looking for payments with no hub. */
+internal fun bitcoinStep(ui: Ui): Stage? = stages(ui).firstOrNull {
+    it.state != Progress.DONE && it.name != TOR && !(it.name == PAYMENTS && ui.hubs.isEmpty())
+}
+
+/** Whether Bitcoin is behind now, as its connection says once [STALE_MS] long. */
+internal fun bitcoinBehind(ui: Ui): Boolean = bitcoinStep(ui) != null
 
 /** Bitcoin, as a connection is named. */
 internal const val BITCOIN = "Bitcoin"
@@ -326,7 +341,16 @@ fun CatchingUp(engine: Engine, ui: Ui) {
  */
 @Composable
 fun Connections(engine: Engine, ui: Ui) {
-    val links = links(ui)
+    // Bitcoin behind since when: said once it lasts STALE_MS.
+    val behind = rememberWait(bitcoinBehind(ui))
+    var stale by remember { mutableStateOf(false) }
+    LaunchedEffect(behind.since) {
+        stale = false
+        val since = behind.since ?: return@LaunchedEffect
+        delay((since + STALE_MS - SystemClock.elapsedRealtime()).coerceAtLeast(0L))
+        stale = true
+    }
+    val links = links(ui, stale)
     val worst = links.maxOf { it.reach }
     // Counted while closed too: how long Tor has been in the way.
     val stuck = rememberWait(torInTheWay(ui))
