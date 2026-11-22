@@ -3311,7 +3311,12 @@ async fn a_force_close_claims_the_notes_of_a_payment_its_hub_never_released() ->
     ensure!(available(&wallet)? == 4_096);
     while !watch::step(&hub, &source).await? {}
 
-    let rate = bitcoin::FeeRate::from_sat_per_vb(2).context("a rate")?;
+    // A rate her reserve affords whatever the payment's shape: its filing
+    // carries the payment's signed spend, grant and all, whose size varies
+    // with the outputs its change was shaped into (at 2 sat/vB, near the
+    // reserve's 17,658 sat, some shapes outgrew it and asked her to allow
+    // more).
+    let rate = bitcoin::FeeRate::from_sat_per_vb(1).context("a rate")?;
     let forced = recovery::force_close(
         &wallet,
         &chain,
