@@ -24,6 +24,7 @@ use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
+mod background;
 mod cold;
 mod contract;
 mod onchain;
@@ -54,6 +55,10 @@ struct Cli {
     #[arg(long, global = true, env = "LICASH_WALLET_TOR", conflicts_with = "proxy",
           value_parser = clap::builder::BoolishValueParser::new())]
     tor: bool,
+    /// Skip opportunistic collection for this command.
+    #[arg(long, global = true, env = "LICASH_WALLET_NO_COLLECT",
+          value_parser = clap::builder::BoolishValueParser::new())]
+    no_collect: bool,
     /// Print results as JSON.
     #[arg(long, global = true)]
     json: bool,
@@ -81,6 +86,8 @@ enum Log {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    CollectBackground,
     /// Create a wallet, with a new seed. Back up its file: the seed alone
     /// does not restore its notes.
     Init {
@@ -645,7 +652,13 @@ fn main() -> ExitCode {
         .enable_all()
         .build()
         .expect("a runtime");
-    match runtime.block_on(run(cli)) {
+    let mut collection = None;
+    let result = runtime.block_on(run(cli, &mut collection));
+    drop(runtime);
+    if let Some(collection) = collection {
+        collection.start();
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let pending = matches!(e.downcast_ref(), Some(Error::Pending { .. }));
@@ -688,22 +701,33 @@ fn logging(format: Option<Log>) {
     }
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
-    let path = match cli.wallet {
-        Some(path) => path,
+fn transport_at(
+    path: &Path,
+    use_tor: bool,
+    proxy: Option<&str>,
+) -> anyhow::Result<(Http, Option<licash_tor::Tor>)> {
+    let tor = if use_tor {
+        let dir = path.parent().unwrap_or(Path::new(".")).join("tor");
+        Some(licash_tor::Tor::for_wallet(&dir).context("a Tor client")?)
+    } else {
+        None
+    };
+    let http = match &tor {
+        Some(tor) => Http::tor(tor.clone()),
+        None => Http::new(proxy)?,
+    };
+    Ok((http, tor))
+}
+
+async fn run(cli: Cli, collection: &mut Option<background::Collection>) -> anyhow::Result<()> {
+    let path = match cli.wallet.as_ref() {
+        Some(path) => path.clone(),
         None => default_path()?,
     };
-    let tor = match cli.tor {
-        true => {
-            let dir = path.parent().unwrap_or(Path::new(".")).join("tor");
-            Some(licash_tor::Tor::for_wallet(&dir).context("a Tor client")?)
-        }
-        false => None,
-    };
-    let transport = match &tor {
-        Some(tor) => Http::tor(tor.clone()),
-        None => Http::new(cli.proxy.as_deref())?,
-    };
+    if matches!(cli.command, Command::CollectBackground) {
+        return background::Collection::new(path, &cli).work().await;
+    }
+    let (transport, tor) = transport_at(&path, cli.tor, cli.proxy.as_deref())?;
     let json = cli.json;
     match cli.command {
         Command::Init { network } => return init(&path, network, transport, json),
@@ -730,10 +754,19 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         );
     }
     let wallet = Wallet::open(&path, transport)?;
+    if !cli.no_collect {
+        let background = background::Collection::new(path.clone(), &cli);
+        background.report();
+        if !matches!(cli.command, Command::Mailbox | Command::Watch { .. }) {
+            *collection = Some(background);
+        }
+    }
     wallet.set_renew_limit(cli.renew_ppm);
     contract::agree(&wallet, &path);
     match cli.command {
-        Command::Init { .. } | Command::Discover { .. } => unreachable!("handled above"),
+        Command::Init { .. } | Command::Discover { .. } | Command::CollectBackground => {
+            unreachable!("handled above")
+        }
         Command::Address { qr } => {
             let address = encode(&wallet.address());
             show_qr(qr && !json, &address);
@@ -855,7 +888,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Mailbox => {
             let route = route(tor.clone(), cli.proxy.as_deref())?;
-            mailbox(&wallet, &route, json).await?;
+            let background = background::Collection::new(path.clone(), &cli);
+            mailbox(&wallet, &route, &background, json).await?;
         }
         Command::Deliver => {
             let route = route(tor.clone(), cli.proxy.as_deref())?;
@@ -863,7 +897,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Watch { every } => {
             let route = route(tor.clone(), cli.proxy.as_deref())?;
-            watch(&wallet, &route, every, json).await?;
+            let background = background::Collection::new(path.clone(), &cli);
+            watch(&wallet, &route, &background, every, json).await?;
         }
         Command::AddHub { url } => {
             let info = wallet.add_hub(&url).await?;
@@ -1934,26 +1969,30 @@ async fn pay(
 
 /// The payments `collected` took, warned of what it did not look through
 /// or take.
-fn collected_said(collected: licash_nostr::wallet::Collected) -> Vec<licash_wallet::Received> {
+fn collection_warnings(collected: &licash_nostr::wallet::Collected, mut warn: impl FnMut(String)) {
     for (index, reason) in &collected.codes.failed {
-        eprintln!(
-            "warning: extra code {index} not collected ({}): again next time",
+        warn(format!(
+            "extra code {index} not collected ({}): again next time",
             say::terminal(reason)
-        );
+        ));
     }
     for (id, reason) in &collected.skipped {
-        eprintln!("warning: {id} in the mailbox {}", say::terminal(reason));
+        warn(format!("{id} in the mailbox {}", say::terminal(reason)));
     }
     for (at, reason) in &collected.failed {
         let at = match at.as_str() {
             licash_nostr::wallet::MAILBOX => "the mailbox".to_owned(),
             hub => format!("the payments kept at {hub}"),
         };
-        eprintln!(
-            "warning: {at} not looked through ({}): looked through again next time",
+        warn(format!(
+            "{at} not looked through ({}): looked through again next time",
             say::terminal(reason)
-        );
+        ));
     }
+}
+
+fn collected_said(collected: licash_nostr::wallet::Collected) -> Vec<licash_wallet::Received> {
+    collection_warnings(&collected, |warning| eprintln!("warning: {warning}"));
     collected.received
 }
 
@@ -1998,11 +2037,20 @@ async fn deliver(wallet: &Wallet<Http>, route: &Route, json: bool) -> anyhow::Re
 /// Receive and deliver every `every` seconds, until stopped: the payments
 /// the wallet's hubs keep for it and those in its mailbox taken, its
 /// relays kept connected between looks, and the payments due mailed.
-async fn watch(wallet: &Wallet<Http>, route: &Route, every: u64, json: bool) -> anyhow::Result<()> {
+async fn watch(
+    wallet: &Wallet<Http>,
+    route: &Route,
+    background: &background::Collection,
+    every: u64,
+    json: bool,
+) -> anyhow::Result<()> {
     let mut kept = None;
     loop {
-        let collect = licash_nostr::wallet::collect_kept(wallet, route, &mut kept);
-        let received = match collect.await {
+        let collected = {
+            let _turn = background.wait_for_turn().await?;
+            licash_nostr::wallet::collect_kept(wallet, route, &mut kept).await
+        };
+        let received = match collected {
             Ok(collected) => {
                 for (row, line) in at_codes(wallet, &collected.codes) {
                     show(json, json!({ "received_at_code": row }), line);
@@ -2103,8 +2151,16 @@ fn not_mailed(id: &str, why: &str) {
 /// Receive the payments the wallet's hubs keep for it, and those in its
 /// mailbox, on the relays its hubs name: each once, of hubs it trusts
 /// only. Then mail the payments due to their payees.
-async fn mailbox(wallet: &Wallet<Http>, route: &Route, json: bool) -> anyhow::Result<()> {
-    let collected = licash_nostr::wallet::collect(wallet, route).await?;
+async fn mailbox(
+    wallet: &Wallet<Http>,
+    route: &Route,
+    background: &background::Collection,
+    json: bool,
+) -> anyhow::Result<()> {
+    let collected = {
+        let _turn = background.wait_for_turn().await?;
+        licash_nostr::wallet::collect(wallet, route).await?
+    };
     let (code_rows, code_lines): (Vec<_>, Vec<_>) =
         at_codes(wallet, &collected.codes).into_iter().unzip();
     let swept: Vec<String> = (collected.codes.swept.iter())

@@ -1783,6 +1783,90 @@ fn a_wallet_watching_collects_what_it_is_paid_and_mails_what_is_due() {
     assert_eq!(available(&bob), (30, 0));
 }
 
+#[test]
+fn a_short_command_collects_in_the_background_for_the_next_history() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (_relay, relay) = support::relay(&runtime);
+    let hub = Server::keeping(FEE, vec![relay]);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, alice_address) = party(dir.path(), "alice", Some(&hub));
+    let (bob, _) = party(dir.path(), "bob", Some(&hub));
+    let funding = serde_json::to_string(&hub.pay(&address(&alice_address), 100)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funding)));
+    let code = json(&bob, &["code"])["code"].as_str().unwrap().to_owned();
+    assert_eq!(json(&alice, &["pay", &code, "30"])["kept"], true);
+    assert_eq!(json(&bob, &["received"]), serde_json::json!([]));
+
+    let result = support::wallet_command(&bob, &["--json", "address"], None, true);
+    assert!(serde_json::from_str::<Value>(&ok(result)).unwrap()["address"].is_string());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let history = ok(wallet(&bob, &["history"], None));
+        if history.contains("received  30 sat") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{history}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_background_collection_failure_is_warned_on_the_next_command() {
+    let hub = Server::start(FEE);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _) = party(dir.path(), "alice", Some(&hub));
+    ok(support::wallet_command(&alice, &["history"], None, true));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Use the opt-in helper only after the detached worker has written its
+    // warning, so a second background run cannot mask the first one's result.
+    let status = alice.with_extension("sqlite.collect");
+    let saved = || {
+        std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&status)
+            .is_ok_and(|file| file.try_lock().is_ok() && file.metadata().is_ok_and(|m| m.len() > 0))
+    };
+    while !saved() {
+        assert!(std::time::Instant::now() < deadline, "no saved warning");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let result = support::wallet_command(&alice, &["collect"], None, true);
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("warning: background collection failed"),
+        "{:?}",
+        result.stderr
+    );
+}
+
+#[test]
+fn a_foreground_command_skips_a_busy_collector() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _) = party(dir.path(), "alice", None);
+    let status = alice.with_extension("sqlite.collect");
+    let mut options = std::fs::File::options();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(status).unwrap();
+    lock.try_lock().unwrap();
+
+    let (sent, received) = std::sync::mpsc::channel();
+    let command = std::thread::spawn(move || {
+        let output = support::wallet_command(&alice, &["--json", "address"], None, true);
+        sent.send(output).ok();
+    });
+    let output = received.recv_timeout(std::time::Duration::from_secs(5));
+    drop(lock);
+    command.join().unwrap();
+    let result = output.expect("the foreground command waited for the collector");
+    assert!(result.stderr.is_empty(), "{:?}", result.stderr);
+    assert!(serde_json::from_str::<Value>(&ok(result)).unwrap()["address"].is_string());
+}
+
 /// The fallback and silent payment addresses of `file`'s code.
 fn on_bitcoin(file: &Path) -> (String, String, String) {
     let text = json(file, &["code", "--onchain"])["code"]

@@ -564,12 +564,21 @@ fn mint(keys: &IssuerKeys, keyset: &Keyset, to: &Address, denom: u64) -> (Note, 
 
 /// `licash-wallet --wallet <wallet> <args>`, `input` on its stdin.
 pub fn wallet(wallet: &Path, args: &[&str], input: Option<&str>) -> Output {
+    wallet_command(wallet, args, input, false)
+}
+
+pub fn wallet_command(wallet: &Path, args: &[&str], input: Option<&str>, collect: bool) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_licash-wallet"));
     command
         .arg("--wallet")
         .arg(wallet)
         .args(args)
         .env_remove("LICASH_WALLET_PROXY")
+        .env_remove("LICASH_WALLET_TOR")
+        .env(
+            "LICASH_WALLET_NO_COLLECT",
+            if collect { "false" } else { "true" },
+        )
         .env_remove("LICASH_WALLET_CHAIN")
         .env_remove("LICASH_WALLET_RENEW_PPM")
         .env_remove("LICASH_WALLET_LOG")

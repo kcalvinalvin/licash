@@ -31,6 +31,9 @@ tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 licash-contracts = { path = "../contracts", features = ["testing"] }
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }

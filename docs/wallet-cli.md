@@ -85,8 +85,14 @@ of many notes can be larger than the 64 KB relays commonly take, which
 the warning then says. `mailbox` (or `collect`) receives
 what the hubs keep for the wallet and what was sent to its mailbox; `watch`
 keeps receiving and delivering, every `--every` seconds (60), until
-stopped. Keep `watch` running, or schedule `deliver`, to send fallback mail
-while the wallet is otherwise idle. `pay` does not mail older receipts:
+stopped. Other commands that open an existing wallet start a one-shot
+collection as they exit, with one collection pass per wallet at a time.
+The next command can see any receipts it collected and reports collection
+failures on stderr. Use `--no-collect` or
+`LICASH_WALLET_NO_COLLECT=true` to skip the background check. Run `collect`
+to wait for collection to finish now. Keep `watch` running, or schedule
+`deliver`, to send fallback mail while the wallet is otherwise idle.
+`pay` does not mail older receipts:
 a slow relay must not delay a new payment kept at its hub. Its change is
 still unlinked before exit. Payments kept at the hub appear on Nostr only
 if they missed the hour. `pay --note TEXT` tells the payee TEXT (its words
