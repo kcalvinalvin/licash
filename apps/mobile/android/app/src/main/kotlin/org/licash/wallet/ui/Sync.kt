@@ -240,8 +240,13 @@ internal const val RELAYS = "Mailbox relays"
 /** How long Tor may not get through before turning it off is offered: a first start takes a minute or two. */
 internal const val TOR_PATIENCE_MS = 180_000L
 
-/** Whether Tor keeps the app from Bitcoin now: on, and not connected or no node reached through it. */
-internal fun torInTheWay(ui: Ui): Boolean = ui.tor && (ui.torStatus?.ready != true || ui.chain.peers == 0L)
+/**
+ * Whether Tor keeps the app from Bitcoin now: on, and not connected, or no
+ * node reached through it while the light client looks for some (not while
+ * it imports the headers this release pins, minutes with no node asked).
+ */
+internal fun torInTheWay(ui: Ui): Boolean =
+    ui.tor && (ui.torStatus?.ready != true || (ui.chain.peers == 0L && ui.chain.importing < 0))
 
 /**
  * Whether turning Tor off is offered, it in the way for `stuckMs` (null if
@@ -250,9 +255,11 @@ internal fun torInTheWay(ui: Ui): Boolean = ui.tor && (ui.torStatus?.ready != tr
 internal fun offerTorOff(ui: Ui, stuckMs: Long?): Boolean =
     torInTheWay(ui) && (ui.torStatus?.blocked != null || (stuckMs ?: 0L) >= TOR_PATIENCE_MS)
 
-/** What turning Tor off means, said beside the button. */
-internal const val TOR_OFF_MEANS = "Tor is not getting through. Without it the app connects directly: " +
-    "faster, but hubs, relays and Bitcoin nodes see your IP address. You can turn it on again in Settings."
+/** What turning Tor off means, said beside the button: what is wrong, Tor connected or not. */
+internal fun torOffMeans(ui: Ui): String =
+    (if (ui.torStatus?.ready == true) "No Bitcoin node answers through Tor. " else "Tor is not getting through. ") +
+        "Without it the app connects directly: faster, but hubs, relays and Bitcoin nodes see your IP address. " +
+        "You can turn it on again in Settings."
 
 /** The app's state kept fresh every two seconds while shown. */
 @Composable
@@ -343,7 +350,7 @@ fun Connections(engine: Engine, ui: Ui) {
         val since = stuck.since
         if (offerTorOff(ui, since?.let { SystemClock.elapsedRealtime() - it })) {
             Spacer(Modifier.height(8.dp))
-            Say(TOR_OFF_MEANS)
+            Say(torOffMeans(ui))
             OutlinedButton(
                 onClick = { scope.launch { engine.setTor(false).onFailure { error = explain(it) } } },
                 modifier = Modifier.fillMaxWidth().testTag("tor-off"),

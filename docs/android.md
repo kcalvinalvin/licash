@@ -27,7 +27,9 @@ kept in memory only); tapped, it says each with how long it took to
 answer (Bitcoin's nodes' shortest ping, a hub's info, a look in the
 mailbox), lists Bitcoin's steps under it while catching up in advanced
 mode, and offers turning Tor off once Tor keeps the app from Bitcoin for
-3 minutes, or says it is stuck. Notifications are asked for once a wallet
+3 minutes (not connected, or no node answering through it, not counting
+the minutes importing pinned headers before any node is asked), or says
+it is stuck. Notifications are asked for once a wallet
 is made or restored.
 
 Home says when bitcoin paid to the wallet waits outside the balance and no

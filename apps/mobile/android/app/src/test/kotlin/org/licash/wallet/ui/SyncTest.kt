@@ -187,6 +187,17 @@ class SyncTest {
         assertTrue(offerTorOff(tor.copy(torStatus = stuck), null))
         // Off, nothing to offer.
         assertFalse(offerTorOff(noNodes.copy(tor = false), TOR_PATIENCE_MS))
+        // Importing the pinned headers, no node asked yet: Tor not in the way.
+        for (importing in listOf(0, 42, 100)) {
+            val importingNoNodes = noNodes.copy(chain = ChainStatus(importing = importing))
+            assertFalse(torInTheWay(importingNoNodes))
+            assertFalse(offerTorOff(importingNoNodes, TOR_PATIENCE_MS))
+            // Unless Tor itself is not connected.
+            assertTrue(torInTheWay(importingNoNodes.copy(torStatus = stuck.copy(blocked = null))))
+        }
+        // Said as it is: Tor connected, no node through it; or Tor not getting through.
+        assertTrue(torOffMeans(noNodes).startsWith("No Bitcoin node answers through Tor."))
+        assertTrue(torOffMeans(tor.copy(torStatus = stuck)).startsWith("Tor is not getting through."))
     }
 
     @Test
