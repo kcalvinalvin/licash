@@ -769,10 +769,14 @@ class Engine(context: Context) {
                     hubsLearned = false
                     break
                 }
-                state.update { it.copy(scan = scan) }
+                // The balance shown with the coins found, not after the rest
+                // of the round (the mailbox alone can take half a minute):
+                // caught up showing 0 would look like nothing was found.
                 if (scan.found > 0u) {
                     AppLog.info("found ${scan.found} coins of ${scan.foundValue} sat to block ${scan.next - 1u}")
+                    refresh()
                 }
+                state.update { it.copy(scan = scan) }
                 if (scan.next > scan.height) {
                     caughtUp = true
                     if (!prefs.caughtUp) prefs.caughtUp = true
