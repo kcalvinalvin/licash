@@ -439,7 +439,13 @@ jobs:
           notes="Built from $GITHUB_SHA on main, once CI passed. Replaced on each push to main."
           if gh release view main-build >/dev/null 2>&1; then
             gh release upload main-build "$APK" SHA256SUMS --clobber
-            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/main-build" -f sha="$GITHUB_SHA" -F force=true >/dev/null
+            # The tag follows main when GitHub lets this token move it: it
+            # refuses (HTTP 403) a ref pointed at a commit that changes
+            # workflow files, as the commits since the tag did, and a token
+            # of a job can never have that permission. The assets are what
+            # users download, and the notes say which commit they are from.
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/main-build" -f sha="$GITHUB_SHA" -F force=true >/dev/null ||
+              echo "::warning::main-build was not moved to $GITHUB_SHA (a commit since it changed workflows?): its assets are of $GITHUB_SHA all the same."
             gh release edit main-build --notes "$notes"
           else
             gh release create main-build --prerelease --target "$GITHUB_SHA" --title "main (rolling)" \
