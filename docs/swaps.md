@@ -98,6 +98,13 @@ terms; `status` shows the coins, and an alert says when they pay out less
 than `--payout-min`, once a start until they pay enough again. A provider
 with payouts under way refuses to start without `--chain`.
 
+The coin's claim script checks that the preimage is 32 bytes
+(`OP_SIZE 32 OP_EQUALVERIFY`), as every lock's preimage is. Without that
+check a client, who chose the hash, could claim the coin with a longer
+preimage of it that no lock takes, keeping both the coin and its notes.
+Wallets and providers from before the check do not pay out with those
+after it: upgrade both, a provider with no payouts open.
+
 A client who never claims its coin costs the provider the fees of that coin
 and of its refund, and holds the coin until it times out, while its own
 lock simply expires back to it. So the provider bounds what such payouts can
