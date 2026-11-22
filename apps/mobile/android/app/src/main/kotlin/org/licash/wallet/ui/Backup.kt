@@ -113,6 +113,7 @@ private fun AutoBackupSheet(engine: Engine, ui: Ui, dismiss: () -> Unit) {
         }
         Spacer(Modifier.height(8.dp))
         BigButton("Another folder", Modifier.fillMaxWidth(), quiet = true, enabled = !busy) { choosing.launch(null) }
+        Spacer(Modifier.height(8.dp))
         BigButton("Turn off", Modifier.fillMaxWidth().testTag("backup-off"), quiet = true, enabled = !busy) {
             engine.stopBackups()
         }
@@ -149,6 +150,9 @@ private fun Phrase(engine: Engine, dismiss: () -> Unit) {
                 Say("Write it down with the words: restoring looks for your coins from there, much faster.")
             }
             Spacer(Modifier.height(4.dp))
+            if (copied) Say("Paste them where you keep them safe, then copy something else over them.")
+            BigButton("Done", Modifier.fillMaxWidth().testTag("words-done"), onClick = dismiss)
+            Spacer(Modifier.height(8.dp))
             BigButton(
                 if (copied) "Copied" else "Copy words",
                 Modifier.fillMaxWidth().testTag("copy-words"),
@@ -157,8 +161,6 @@ private fun Phrase(engine: Engine, dismiss: () -> Unit) {
                 scope.launch { clipboard.setClipEntry(ClipEntry(secret("Recovery words", shown.joinToString(" ")))) }
                 copied = true
             }
-            if (copied) Say("Paste them where you keep them safe, then copy something else over them.")
-            BigButton("Done", Modifier.fillMaxWidth().testTag("words-done"), onClick = dismiss)
         }
     }
 }
