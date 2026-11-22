@@ -46,8 +46,9 @@ class SyncTest {
         )
         assertEquals("Block 400 of 800 (50%)", stages[1].detail)
         assertEquals(0.5f, stages[1].fraction!!, 0.0001f)
-        // Waiting: no fraction shown.
+        // Waiting: no fraction shown, nor where it would be.
         assertNull(stages[2].fraction)
+        assertEquals(listOf("Waiting", "Waiting"), stages.drop(2).map { it.detail })
         assertTrue(catchingUp(ui))
     }
 

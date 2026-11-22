@@ -80,13 +80,19 @@ private fun block(n: Long): String = digits(n.toULong())
 fun stages(ui: Ui): List<Stage> {
     val out = mutableListOf<Stage>()
     var before = true
-    fun add(name: String, done: Boolean, doing: String, finished: String, fraction: Float? = null) {
+    // A step waiting says so, not where it would be (no block 0 of 0).
+    fun add(name: String, done: Boolean, doing: String, finished: String, fraction: Float? = null, waiting: String = "Waiting") {
         val state = when {
             !before -> Progress.WAITING
             done -> Progress.DONE
             else -> Progress.DOING
         }
-        out += Stage(name, state, if (state == Progress.DONE) finished else doing, fraction.takeIf { state == Progress.DOING })
+        val detail = when (state) {
+            Progress.DONE -> finished
+            Progress.DOING -> doing
+            Progress.WAITING -> waiting
+        }
+        out += Stage(name, state, detail, fraction.takeIf { state == Progress.DOING })
         before = before && done
     }
     val tor = ui.torStatus
@@ -132,7 +138,7 @@ fun stages(ui: Ui): List<Stage> {
         fraction(0, filters, headers),
     )
     if (ui.hubs.isEmpty()) {
-        add(PAYMENTS, false, "Choose a hub first", "")
+        add(PAYMENTS, false, "Choose a hub first", "", waiting = "Choose a hub first")
         return out
     }
     val scan = ui.scan
@@ -339,9 +345,10 @@ fun Connections(engine: Engine, ui: Ui) {
         KeptFresh(engine)
         val preparing = rememberWait(ui.chain.importing >= 100)
         for (link in links) {
-            LinkRow(link)
-            // In advanced mode, Bitcoin's steps while catching up, under it.
-            if (link.name == BITCOIN && ui.developer && link.reach != Reach.UP) {
+            // In advanced mode, Bitcoin's steps while catching up, under it, not said twice.
+            val steps = link.name == BITCOIN && ui.developer && link.reach != Reach.UP
+            LinkRow(if (steps) link.copy(detail = "Catching up") else link)
+            if (steps) {
                 Column(Modifier.padding(start = 22.dp).testTag("bitcoin-steps")) {
                     for (stage in stages(ui)) if (stage.name != TOR) StageRow(stage, preparing)
                 }

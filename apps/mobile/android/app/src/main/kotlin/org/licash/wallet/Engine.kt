@@ -1423,7 +1423,16 @@ class Engine(context: Context) {
     }
 
     suspend fun addHub(url: String): Result<Hub> = io {
-        val hub = locked { it.addHub(url) }
+        val hub = locked {
+            val asked = SystemClock.elapsedRealtime()
+            it.addHub(url).also { added ->
+                val ms = SystemClock.elapsedRealtime() - asked
+                // Reached: the connections say so before learnHubs asks again.
+                state.update { s ->
+                    s.copy(hubsReached = s.hubsReached + (added.url to true), hubsMs = s.hubsMs + (added.url to ms))
+                }
+            }
+        }
         refresh()
         poke()
         hub
