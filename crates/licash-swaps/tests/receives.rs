@@ -7,17 +7,21 @@
 #[path = "../../licash-wallet/tests/net/mod.rs"]
 mod net;
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use bitcoin::hashes::Hash;
 use licash::spend::{lock_hash, ChainProfile};
+use licash_api::{swaps, Problem, Receiving};
 use licash_api::{swaps::ReceiveRequest, Code, Fee, Hex, ReceiveState};
 use licash_lightning::{fake::Fake, HeldState};
 use licash_swaps::{
     Config, DonationTerms, Notice, Provider, ReceiptState, ReceiveTerms, RECEIVE_BLOCKS,
     SETTLE_MARGIN,
 };
-use licash_wallet::Wallet;
+use licash_wallet::{InvoiceState, Response, Transport, Wallet};
 use lightning_invoice::Bolt11Invoice;
 use net::{Fault, Link, Net};
 
@@ -31,15 +35,16 @@ const TERMS: ReceiveTerms = ReceiveTerms {
 };
 /// What the provider holds at A to start with.
 const HELD: u64 = 1_000;
-/// Blocks the payer's HTLCs outlive the provider's lock by, at least: the refund request's confirmation (36), A's window
-/// (20), reading the preimage, the provider's margin (12) and one.
+/// Blocks the payer's HTLCs outlive the provider's lock by, at least: the
+/// refund request's confirmation (36), A's window (20), reading the
+/// preimage, the provider's margin (12) and one.
 const LEAD: u32 = 36 + 20 + 1 + 12 + 1;
 
 struct Eco {
     net: Arc<Net>,
     dir: tempfile::TempDir,
     node: Arc<Fake>,
-    provider: Option<Provider<Link>>,
+    provider: Option<Arc<Provider<Link>>>,
     payee: Wallet<Link>,
 }
 
@@ -78,7 +83,7 @@ impl Eco {
             net,
             dir,
             node,
-            provider: Some(provider),
+            provider: Some(Arc::new(provider)),
             payee,
         };
         eco.mine(0).await;
@@ -86,7 +91,7 @@ impl Eco {
     }
 
     fn provider(&self) -> &Provider<Link> {
-        self.provider.as_ref().unwrap()
+        self.provider.as_deref().unwrap()
     }
 
     fn path(&self) -> std::path::PathBuf {
@@ -101,7 +106,7 @@ impl Eco {
             .unwrap()
             .take_receives(self.node.clone(), TERMS)
             .unwrap();
-        self.provider = Some(provider);
+        self.provider = Some(Arc::new(provider));
     }
 
     /// Hub A's address, as the provider knows it.
@@ -486,4 +491,161 @@ async fn a_file_of_an_older_provider_opens_and_takes_receipts_once_asked() {
         assert!(provider.info().unwrap().receive.is_some());
     }
     assert_eq!(tables(&path), 1);
+}
+
+/// Where a wallet reaches the provider.
+const PROVIDER: &str = "http://provider.test";
+
+/// A wallet's way to the hubs and the provider, which answers `lie`, once
+/// set, to the next request for an invoice, and loses the next one while
+/// `lose`.
+#[derive(Clone)]
+struct Client {
+    net: Arc<Net>,
+    provider: Arc<Provider<Link>>,
+    lie: Arc<Mutex<Option<Receiving>>>,
+    lose: Arc<AtomicBool>,
+}
+
+impl Client {
+    async fn serve(&self, path: &str, body: Option<Vec<u8>>) -> Result<Vec<u8>, Problem> {
+        let provider = &self.provider;
+        match (path, body) {
+            (swaps::SWAPS_INFO, None) => Ok(json(&provider.info().unwrap())),
+            (swaps::RECEIVES, Some(body)) => {
+                let request: ReceiveRequest = serde_json::from_slice(&body).unwrap();
+                let receiving = provider.receive(&request).await?;
+                Ok(json(&self.lie.lock().unwrap().take().unwrap_or(receiving)))
+            }
+            (path, None) => {
+                let hash = licash_api::hash_of(&path[swaps::RECEIVES.len() + 1..])?;
+                match provider.receive_status(&hash).unwrap() {
+                    Some(status) => Ok(json(&status)),
+                    None => Err(Problem::new(Code::UnknownLock, "no receipt")),
+                }
+            }
+            _ => Err(Problem::invalid("no such route")),
+        }
+    }
+}
+
+fn json(value: &impl serde::Serialize) -> Vec<u8> {
+    serde_json::to_vec(value).unwrap()
+}
+
+impl Transport for Client {
+    fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
+        let (client, url) = (self.clone(), url.to_owned());
+        async move {
+            let Some(path) = url.strip_prefix(PROVIDER) else {
+                return client.net.serve(&url, body);
+            };
+            if path == swaps::RECEIVES && client.lose.swap(false, Ordering::Relaxed) {
+                return Err("connection refused".into());
+            }
+            Ok(match client.serve(path, body).await {
+                Ok(body) => Response { status: 200, body },
+                Err(problem) => Response {
+                    status: problem.code.status(),
+                    body: serde_json::to_vec(&problem).unwrap(),
+                },
+            })
+        }
+    }
+}
+
+impl Eco {
+    /// A wallet at A reaching the provider at [`PROVIDER`].
+    async fn client(&self, seed: u8) -> (Wallet<Client>, Client) {
+        let client = Client {
+            net: self.net.clone(),
+            provider: self.provider.clone().unwrap(),
+            lie: Arc::default(),
+            lose: Arc::default(),
+        };
+        let wallet = Wallet::create(
+            &self.dir.path().join(format!("client-{seed}.sqlite")),
+            &[seed; 32],
+            ChainProfile::Core30DefaultRegtest,
+            client.clone(),
+        )
+        .unwrap();
+        wallet.add_hub(A).await.unwrap();
+        (wallet, client)
+    }
+}
+
+#[tokio::test]
+async fn a_wallet_at_a_hub_without_a_gateway_is_paid_through_a_provider() {
+    let eco = Eco::new().await;
+    let (wallet, _) = eco.client(0x61).await;
+    let offer = wallet.receive_offer(PROVIDER, A).await.unwrap();
+    assert_eq!((offer.terms.min, offer.max), (10, 500));
+    let invoice = wallet
+        .invoice_through(PROVIDER, A, 100, Some("Lunch"))
+        .await
+        .unwrap();
+    assert_eq!(invoice.state, InvoiceState::Open);
+    assert_eq!(invoice.memo.as_deref(), Some("Lunch"));
+    // What the provider asks exactly: the amount and its fee.
+    let request: Bolt11Invoice = invoice.request.unwrap().parse().unwrap();
+    assert_eq!(request.amount_milli_satoshis(), Some(102_000));
+    let hash: [u8; 32] = request.payment_hash().to_byte_array();
+    // Unpaid, nothing to claim yet.
+    let open = wallet.follow_invoice(&invoice.hash).await.unwrap();
+    assert_eq!((open.state, open.lock), (InvoiceState::Open, None));
+    eco.pay(hash, CLTV);
+    eco.follow().await;
+    assert_eq!(eco.state(&hash), ReceiptState::Locked);
+    // The wallet claims the provider's lock, which settles the invoice.
+    let paid = wallet.follow_invoice(&invoice.hash).await.unwrap();
+    assert_eq!(paid.state, InvoiceState::Received, "{paid:?}");
+    assert!(paid.lock.is_some());
+    let balance = wallet.balance().unwrap();
+    assert_eq!(balance[0].available, 100);
+    eco.follow().await;
+    assert_eq!(eco.state(&hash), ReceiptState::Settled);
+    assert_eq!(eco.node.held(hash), Some((HeldState::Settled, 102_000)));
+}
+
+#[tokio::test]
+async fn an_invoice_asked_of_a_provider_is_resumed_and_checked_as_offered() {
+    let eco = Eco::new().await;
+    let (wallet, client) = eco.client(0x62).await;
+    // Beyond what it takes: refused, nothing asked.
+    let refused = wallet.invoice_through(PROVIDER, A, 501, None).await;
+    assert!(refused.is_err());
+    assert_eq!(eco.provider().open_receives().unwrap(), 0);
+    // The provider answering an invoice of another payment: dropped,
+    // never handed out.
+    let other = eco.provider().receive(&eco.request(100, 9)).await.unwrap();
+    *client.lie.lock().unwrap() = Some(other);
+    let lied = wallet
+        .invoice_through(PROVIDER, A, 100, None)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&lied.state, InvoiceState::Canceled(why) if why.contains("another payment")),
+        "{lied:?}"
+    );
+    assert!(lied.request.is_none());
+    // Its request lost: pending, made on resuming.
+    let before = eco.provider().open_receives().unwrap();
+    client.lose.store(true, Ordering::Relaxed);
+    let pending = wallet.invoice_through(PROVIDER, A, 50, None).await;
+    assert!(
+        matches!(pending, Err(licash_wallet::Error::Pending { .. })),
+        "{pending:?}"
+    );
+    assert_eq!(eco.provider().open_receives().unwrap(), before);
+    wallet.resume().await.unwrap();
+    let invoices = wallet.invoices().unwrap();
+    let resumed = invoices.iter().find(|i| i.amount == 50).unwrap();
+    assert!(resumed.request.is_some(), "{resumed:?}");
+    assert_eq!(resumed.state, InvoiceState::Open);
+    assert_eq!(eco.provider().open_receives().unwrap(), before + 1);
 }

@@ -21,6 +21,14 @@
 //! it asks for, then asks the hub for an invoice under its hash. Once the
 //! invoice is paid, the hub locks notes of its own to the wallet, which
 //! claims them with the preimage: that settles the invoice.
+//!
+//! Or getting paid through a swap provider ([`Wallet::invoice_through`]),
+//! at a hub with no gateway: the provider's node makes the invoice under
+//! the wallet's hash, asking exactly the amount and its fee, and once it is
+//! paid locks notes of its own to the wallet at the hub, which the wallet
+//! claims as it claims a hub's. The provider is recorded beside the
+//! invoice, in a table made when first used: a wallet's file of an older
+//! version holds hub invoices alone, followed as they were.
 
 use licash::{
     address::Ephemeral,
@@ -28,7 +36,7 @@ use licash::{
     spend::{lock_hash, ProposalId},
 };
 use licash_api::{
-    swaps::{self, LightningRequest, LightningSwap},
+    swaps::{self, LightningRequest, LightningSwap, ReceiveRequest},
     Lightning, Pay, PayState, Paying, Receive, ReceiveState, ReceiveStatus, Receiving,
 };
 use lightning_invoice::Bolt11Invoice;
@@ -657,6 +665,131 @@ impl<T: Transport> Wallet<T> {
     }
 }
 
+/// The component of the providers of invoices ([`Wallet::invoice_through`]),
+/// and its version.
+const VIA_COMPONENT: &str = "invoice_providers";
+const VIA_VERSION: i64 = 1;
+const VIA_SCHEMA: &str = "
+-- The swap provider asked for an invoice in place of its hub, by the
+-- invoice's hash: `asks`, what its invoice asks exactly, in sat.
+CREATE TABLE invoice_providers (
+    hash BLOB PRIMARY KEY REFERENCES invoices (hash),
+    provider TEXT NOT NULL,
+    asks INTEGER NOT NULL CHECK (asks > 0)
+) STRICT;
+";
+
+/// The provider asked for the invoice of `hash`, and what it asks, if one
+/// was: none in a file whose wallet never asked one.
+fn via(c: &rusqlite::Connection, hash: &[u8; 32]) -> Result<Option<(String, u64)>, Error> {
+    let kept = licash_store::component_version(c, VIA_COMPONENT)
+        .map_err(|e| Error::Setup(e.to_string()))?;
+    if kept.is_none() {
+        return Ok(None);
+    }
+    Ok(c.query_row(
+        "SELECT provider, asks FROM invoice_providers WHERE hash = ?1",
+        [hash],
+        |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)),
+    )
+    .optional()?)
+}
+
+/// What a swap provider takes to have the wallet paid over Lightning at a
+/// hub ([`Wallet::receive_offer`]).
+#[derive(Clone, Debug)]
+pub struct ReceiveOffer {
+    pub info: swaps::Info,
+    pub terms: swaps::Receives,
+    /// The most it takes there now: its terms, and what it holds there.
+    pub max: u64,
+}
+
+/// Getting paid over Lightning through a swap provider.
+impl<T: Transport> Wallet<T> {
+    /// What the provider at `provider` takes to have the wallet paid over
+    /// Lightning at the hub at `hub`, trusted: refused if it takes no such
+    /// payments, or none there now.
+    pub async fn receive_offer(&self, provider: &str, hub: &str) -> Result<ReceiveOffer, Error> {
+        let provider = hub_url(provider)?;
+        let url = hub_url(hub)?;
+        let (_, hub_info) = self.hub(&url)?;
+        let info: swaps::Info = self.get(&provider, swaps::SWAPS_INFO).await?;
+        let terms = info.receive.ok_or_else(|| {
+            Error::Invalid(format!(
+                "provider {provider} takes no payments over Lightning"
+            ))
+        })?;
+        let max = match info.hub(&hub_info.address) {
+            Some(at) => terms.max.min(at.max),
+            None => 0,
+        };
+        if max < terms.min {
+            return Err(Error::Invalid(format!(
+                "provider {provider} takes no payments over Lightning at hub {url} now"
+            )));
+        }
+        Ok(ReceiveOffer { info, terms, max })
+    }
+
+    /// Ask the provider at `provider` for an invoice paying this wallet
+    /// `amount` at the hub at `url`, its fee on top, saying `memo` to its
+    /// payer, if given: in its description, which the provider and its
+    /// node see too, as they see each payment's amount and the wallet's
+    /// address. [`Wallet::follow_invoice`] claims the payment once made.
+    pub async fn invoice_through(
+        &self,
+        provider: &str,
+        url: &str,
+        amount: u64,
+        memo: Option<&str>,
+    ) -> Result<Invoice, Error> {
+        let memo = memo
+            .map(licash_api::memo)
+            .transpose()
+            .map_err(|p| Error::Invalid(p.message))?;
+        let provider = hub_url(provider)?;
+        let url = hub_url(url)?;
+        self.not_visited(&url)?;
+        let (hub, info) = self.refresh(&url).await?;
+        let offer = self.receive_offer(&provider, &url).await?;
+        if amount < offer.terms.min || amount > offer.max {
+            return Err(Error::Invalid(format!(
+                "provider {provider} takes {} to {} over Lightning at hub {url}",
+                offer.terms.min, offer.max
+            )));
+        }
+        let asks = offer.terms.asks(amount);
+        let mut preimage = [0; 32];
+        OsRng.fill_bytes(&mut preimage);
+        let hash = lock_hash(&preimage);
+        let body = ReceiveRequest {
+            hub: info.address,
+            address: self.address(),
+            amount,
+            hash: licash_api::Hex(hash.to_vec()),
+            memo,
+        };
+        let body = serde_json::to_string(&body).map_err(invalid)?;
+        self.store.write(|tx| {
+            licash_store::component_in(tx, VIA_COMPONENT, VIA_VERSION, VIA_SCHEMA)
+                .map_err(|e| Error::Setup(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO invoices (hash, hub, preimage, amount, body, created_at, protected)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                params![hash, hub, preimage, sql(amount)?, body, now()],
+            )?;
+            tx.execute(
+                "INSERT INTO invoice_providers (hash, provider, asks) VALUES (?1, ?2, ?3)",
+                params![hash, provider, sql(asks)?],
+            )?;
+            Ok(())
+        })?;
+        tracing::info!(hash = %hex::encode(hash), %url, %provider, amount, "asking a provider for an invoice");
+        self.advance_invoice(&hash).await
+    }
+}
+
 /// Getting paid over Lightning.
 impl<T: Transport> Wallet<T> {
     /// Ask the hub at `url` for an invoice paying this wallet `amount`, its
@@ -829,6 +962,18 @@ impl<T: Transport> Wallet<T> {
         if !open {
             return Ok(());
         }
+        let via = self.store.read(|c| via(c, hash))?;
+        if let Some((provider, asks)) = via {
+            return self
+                .advance_invoice_via(
+                    hash,
+                    (&url, &provider),
+                    (preimage, amount as u64, asks),
+                    &body,
+                    request,
+                )
+                .await;
+        }
         if request.is_none() {
             let body: Receive = serde_json::from_str(&body).map_err(invalid)?;
             let asked = self
@@ -910,6 +1055,88 @@ impl<T: Transport> Wallet<T> {
         Ok(())
     }
 
+    /// [`Wallet::advance_invoice_from`], of an invoice asked of `provider`
+    /// paying at the hub at `url`, its invoice asking `asks` exactly.
+    async fn advance_invoice_via(
+        &self,
+        hash: &[u8; 32],
+        (url, provider): (&str, &str),
+        (preimage, amount, asks): ([u8; 32], u64, u64),
+        body: &str,
+        request: Option<String>,
+    ) -> Result<(), Error> {
+        if request.is_none() {
+            let body: ReceiveRequest = serde_json::from_str(body).map_err(invalid)?;
+            let asked = self
+                .post::<Receiving>(provider, swaps::RECEIVES, &body)
+                .await;
+            let receiving = match asked {
+                Ok(receiving) => receiving,
+                Err(Error::Refused { problem, .. }) => {
+                    return self.cancel_invoice(hash, &format!("refused: {problem}"));
+                }
+                Err(e) => return Err(e),
+            };
+            let invoice = decode(&receiving.request).map_err(|e| unavailable(provider, e))?;
+            let of: [u8; 32] = *invoice.payment_hash().as_ref();
+            // Exactly as offered: the payer pays no more than it was told.
+            if of != *hash || invoice.amount_milli_satoshis() != Some(asks.saturating_mul(1000)) {
+                return self
+                    .cancel_invoice(hash, "its provider answered an invoice of another payment");
+            }
+            if let Some(memo) = &body.memo {
+                if described(&invoice).as_ref() != Some(memo) {
+                    return self
+                        .cancel_invoice(hash, "its provider left the memo out of the invoice");
+                }
+            }
+            self.store.write(|tx| {
+                tx.execute(
+                    "UPDATE invoices SET request = ?2 WHERE hash = ?1",
+                    params![hash, invoice.to_string()],
+                )?;
+                Ok(())
+            })?;
+            tracing::info!(hash = %hex::encode(hash), %provider, "invoice made");
+        }
+        let status: ReceiveStatus = self.get(provider, &swaps::receive_state(hash)).await?;
+        let lock = status.lock().map_err(|p| unavailable(provider, p))?;
+        let lock = match (status.state, lock) {
+            (ReceiveState::Open, _) => return Ok(()),
+            (ReceiveState::Canceled, _) => {
+                return self.cancel_invoice(hash, "canceled by its provider");
+            }
+            (_, None) => return Err(unavailable(provider, "a payment locked to no lock")),
+            (_, Some(lock)) => lock,
+        };
+        self.store.write(|tx| {
+            tx.execute(
+                "UPDATE invoices SET lock = ?2 WHERE hash = ?1",
+                params![hash, lock.as_bytes()],
+            )?;
+            Ok(())
+        })?;
+        // The provider's lock at the hub, claimed as the hub's own would be.
+        let lock = hex::encode(lock.as_bytes());
+        match self.claim_paying(url, &lock, &preimage, amount).await {
+            Ok(_) | Err(Error::AlreadyReceived) => {}
+            Err(Error::Invalid(reason)) => return self.cancel_invoice(hash, &reason),
+            Err(Error::PaysNothing) => {
+                return self.cancel_invoice(hash, "its lock pays this wallet nothing");
+            }
+            Err(e) => return Err(e),
+        }
+        self.store.write(|tx| {
+            tx.execute(
+                "UPDATE invoices SET done_at = ?2 WHERE hash = ?1 AND done_at IS NULL",
+                params![hash, now()],
+            )?;
+            Ok(())
+        })?;
+        tracing::info!(hash = %hex::encode(hash), %url, %provider, amount, "invoice paid");
+        Ok(())
+    }
+
     fn cancel_invoice(&self, hash: &[u8; 32], reason: &str) -> Result<(), Error> {
         tracing::warn!(hash = %hex::encode(hash), reason, "invoice canceled");
         self.store.write(|tx| {
@@ -974,9 +1201,15 @@ fn invoice_of(r: &Row<'_>) -> rusqlite::Result<Invoice> {
         lock: r.get::<_, Option<[u8; 32]>>(7)?.map(hex::encode),
         received_at: r.get(8)?,
         protected: r.get(9)?,
-        // As asked: an older wallet's asked none.
-        memo: serde_json::from_str::<Receive>(&r.get::<_, String>(10)?)
-            .ok()
-            .and_then(|asked| asked.memo),
+        // As asked of a hub or a provider: an older wallet's asked none.
+        memo: {
+            let body = r.get::<_, String>(10)?;
+            match serde_json::from_str::<Receive>(&body) {
+                Ok(asked) => asked.memo,
+                Err(_) => serde_json::from_str::<ReceiveRequest>(&body)
+                    .ok()
+                    .and_then(|asked| asked.memo),
+            }
+        },
     })
 }
