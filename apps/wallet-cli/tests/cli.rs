@@ -740,6 +740,53 @@ fn hubs_announced_on_nostr_are_discovered_where_they_answer_as_the_announcer() {
 }
 
 #[test]
+fn an_invoice_made_by_a_provider_pays_the_wallet_at_a_hub_without_a_gateway() {
+    let hub = Server::start(FEE);
+    let node = std::sync::Arc::new(licash_hub_service::lightning::fake::Fake::new());
+    node.tip(hub.height(), [0; 32]);
+    let swaps = Swaps::receiving(&[&hub], 1_000, node.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _) = party(dir.path(), "alice", Some(&hub));
+    let provider = swaps.url();
+    // Protected by a contract, or made by a provider: not both.
+    let both = [
+        "invoice",
+        "100",
+        "--via",
+        &provider,
+        "--chain",
+        "http://chain.test",
+    ];
+    assert_eq!(wallet(&alice, &both, None).status.code(), Some(2));
+
+    let asked = wallet(&alice, &["invoice", "100", "--via", &provider], None);
+    let stderr = String::from_utf8_lossy(&asked.stderr).into_owned();
+    let hash = stderr.trim().strip_prefix("invoice ").unwrap().to_owned();
+    let request = licash_wallet::Payable::read(ok(asked).trim()).unwrap();
+    // Its default fee of 2 and 0.5% on top.
+    assert_eq!(request.amount, 103);
+    let mut held = [0; 32];
+    hex::decode_to_slice(&hash, &mut held).unwrap();
+    let cltv = node.held_cltv(held).unwrap() as u32;
+    node.pay_held(held, hub.height() + cltv);
+    // Locked to Alice once the provider sees it paid: claimed on resuming.
+    let mut state = String::new();
+    for _ in 0..100 {
+        let resumed = json(&alice, &["resume"]);
+        state = resumed["invoices"][0]["state"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        if state == "received" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(state, "received");
+    assert_eq!(available(&alice), (100, 0));
+}
+
+#[test]
 fn notes_swap_between_hubs_through_a_provider() {
     let (a, b) = (Server::swapping_from(FEE, Vec::new()), Server::start(FEE));
     let swaps = Swaps::start(&[&a, &b], 200);

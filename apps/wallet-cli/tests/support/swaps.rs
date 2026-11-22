@@ -20,6 +20,7 @@ use axum::{
 };
 use licash::spend::ChainProfile;
 use licash_api::{Code, Problem};
+use licash_hub_service::lightning::fake::Fake;
 use licash_swaps::{Config, Provider, Record};
 use licash_transport::Http;
 use licash_wallet::Wallet;
@@ -55,8 +56,25 @@ impl Swaps {
         Self::with(hubs, stock, 0x50, CONFIG)
     }
 
+    /// [`Swaps::start`], taking payments over Lightning for wallets through
+    /// `node` too, on the default terms, as the service does with
+    /// `--receive`.
+    pub fn receiving(hubs: &[&Server], stock: u64, node: Arc<Fake>) -> Self {
+        Self::started(hubs, stock, 0x50, CONFIG, Some(node))
+    }
+
     /// [`Swaps::start`], its wallet of seed `seed`, on terms `config`.
     pub fn with(hubs: &[&Server], stock: u64, seed: u8, config: Config) -> Self {
+        Self::started(hubs, stock, seed, config, None)
+    }
+
+    fn started(
+        hubs: &[&Server],
+        stock: u64,
+        seed: u8,
+        config: Config,
+        receiving: Option<Arc<Fake>>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallet.sqlite");
         let wallet = Wallet::create(
@@ -82,7 +100,15 @@ impl Swaps {
                     wallet.add_hub(url).await.unwrap();
                 }
                 wallet.receive(&stocked).unwrap();
-                let provider = Arc::new(Provider::create(wallet, config).unwrap());
+                let provider = Provider::create(wallet, config).unwrap();
+                let receives = receiving.is_some();
+                let provider = match receiving {
+                    Some(node) => provider
+                        .take_receives(node, licash_swaps::ReceiveTerms::default())
+                        .unwrap(),
+                    None => provider,
+                };
+                let provider = Arc::new(provider);
                 let nostr = licash_nostr::public_key(&provider.nostr_secret().unwrap()).unwrap();
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 ready
@@ -90,6 +116,9 @@ impl Swaps {
                     .unwrap();
                 let every = Duration::from_millis(100);
                 let stepping = tokio::spawn(licash_swaps_service::step(provider.clone(), every));
+                let following = receives.then(|| {
+                    tokio::spawn(licash_swaps_service::take_receives(provider.clone(), every))
+                });
                 let refusing = move |request: Request, next: Next| {
                     let refuse =
                         refusing.load(Ordering::Relaxed) && request.method() == Method::POST;
@@ -111,6 +140,9 @@ impl Swaps {
                     .await
                     .unwrap();
                 stepping.abort();
+                if let Some(following) = following {
+                    following.abort();
+                }
             });
         });
         let (addr, provider) = started.recv().unwrap();

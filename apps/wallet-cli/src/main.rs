@@ -302,9 +302,16 @@ enum Command {
     /// payment once made.
     Invoice {
         amount: u64,
-        /// Through this hub [default: the only one trusted].
+        /// Through this hub, or paid at it with --via [default: the only one
+        /// trusted].
         #[arg(long)]
         hub: Option<String>,
+        /// Made by the swap provider at this URL, from its own Lightning
+        /// node, for a hub without a gateway: once paid, it locks its notes
+        /// to the wallet at the hub, its fee on top for the payer. It sees
+        /// the amount, the memo, and which payments go to this wallet.
+        #[arg(long, value_name = "URL", conflicts_with = "chain")]
+        via: Option<String>,
         /// Also draw it as a QR code, on a terminal.
         #[arg(long)]
         qr: bool,
@@ -1285,6 +1292,7 @@ async fn run(cli: Cli, collection: &mut Option<background::Collection>) -> anyho
         Command::Invoice {
             amount,
             hub,
+            via,
             qr,
             chain,
             memo,
@@ -1294,11 +1302,12 @@ async fn run(cli: Cli, collection: &mut Option<background::Collection>) -> anyho
                 None => only_hub(&wallet)?,
             };
             let memo = memo.as_deref();
-            let invoice = match chain {
-                Some(chain) => {
+            let invoice = match (via, chain) {
+                (Some(via), _) => wallet.invoice_through(&via, &hub, amount, memo).await?,
+                (None, Some(chain)) => {
                     contract::invoice(&wallet, &path, &chain, &hub, amount, memo).await?
                 }
-                None => wallet.invoice_saying(&hub, amount, memo, false).await?,
+                (None, None) => wallet.invoice_saying(&hub, amount, memo, false).await?,
             };
             eprintln!("invoice {}", invoice.hash);
             let request = invoice.request.clone().unwrap_or_default();

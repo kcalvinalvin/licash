@@ -174,6 +174,13 @@ the `memo` feature in its info, and an invoice without it is canceled, never
 printed. The hub and its Lightning node read it too. `invoices` lists it.
 An invoice another wallet asked the same hub for is paid inside the hub,
 for its amount alone, with no gateway fee.
+`invoice <amount> --via <provider>` has a swap provider taking payments
+for wallets (`licash-swaps run --receive`) make the invoice from its own
+node instead, for a hub without a gateway: it asks the amount and the
+provider's fee exactly, and once paid the provider locks its notes to the
+wallet at `--hub`, which `resume` claims as it claims a hub's. Nothing is
+trusted to the provider, but it sees the amount, the memo and which
+payments go to the wallet. Not with `--chain`.
 `pay-invoice <bolt11> --via <provider>` has a swap provider that pays
 Lightning invoices pay it from its own node instead, for a lock of notes
 at `--hub` to the provider, its fee on top (at most `--max-fee`, 1% and 100
