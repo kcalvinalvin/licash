@@ -66,6 +66,23 @@ class ReceiveTest {
     }
 
     @Test
+    fun a_way_not_open_says_why() {
+        assertEquals(
+            listOf(
+                Way.LIGHTNING to "None of your hubs takes Lightning",
+                Way.SILENT to "Your hubs don't index silent payments",
+                Way.DONATIONS to "Looking for a provider…",
+            ),
+            closedWays(lightning = false, silent = false, donations = false, lookingForDonations = true),
+        )
+        assertEquals(
+            listOf(Way.DONATIONS to "No provider takes donations now"),
+            closedWays(lightning = true, silent = true, donations = false, lookingForDonations = false),
+        )
+        assertEquals(emptyList<Pair<Way, String>>(), closedWays(true, true, donations = true, lookingForDonations = false))
+    }
+
+    @Test
     fun a_donation_address_is_another_way_once_a_provider_takes_donations() {
         assertEquals(
             listOf(Way.CODE, Way.BITCOIN, Way.DONATIONS),

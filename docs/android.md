@@ -185,7 +185,9 @@ notes at the code's hub, less its fee. Once shown, its provider and code
 are kept and shown again, even unreachable, as an address handed out stays:
 the code while all its hubs are trusted, hubs added since or not; another
 takes its place only once it takes no more donations, or has failed to for a
-week while another can. Tapping a hub in Settings lists its fees. Silent payments
+week while another can. A way not open says why under Other ways, grayed
+out (no hub taking Lightning or indexing silent payments, no provider
+taking donations, or still looking for one). Tapping a hub in Settings lists its fees. Silent payments
 before the first block the hub indexed are not found; payments to the
 fallback address are, from the day before the wallet was made.
 
@@ -242,9 +244,10 @@ back; and "Protection closed", what it paid back to the wallet's Bitcoin
 (closed early with the hub, or forced closed), from the contract at its
 hub, rather than a coin received.
 
-Receive, showing the Licash code, lets the user pick which code: the
-wallet's own, or a separate one made there under a name only the user
-sees. A separate code has keys of its own, derived from the seed by its
+Receive, showing the Licash code, lets the user pick which identity: the
+main one (the wallet's own code), or an anonymous identity, a separate
+code made there under a name only the user sees, the sheet staying open
+with the seconds counted while its hubs are asked. A separate code has keys of its own, derived from the seed by its
 number, and names no mailbox, so no one can tell it belongs to the wallet
 or to another of its codes: two pseudonyms posted online share nothing.
 What it is paid is collected with the wallet's payments, from the inbox

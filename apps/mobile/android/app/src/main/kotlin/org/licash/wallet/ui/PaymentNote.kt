@@ -53,7 +53,7 @@ internal fun labelOf(typed: String): String? =
 
 /** The name of the code `index` among `codes`: 0 the wallet's own. */
 internal fun codeName(index: UInt, codes: List<ExtraCode>): String =
-    if (index == 0u) "Your code" else codes.firstOrNull { it.index == index }?.label ?: "Code $index"
+    if (index == 0u) MAIN_IDENTITY else codes.firstOrNull { it.index == index }?.label ?: "Identity $index"
 
 /**
  * A note for the payee, and whether to tell them a code of this wallet's,
@@ -74,7 +74,7 @@ internal fun NoteFields(
     var picking by remember { mutableStateOf(false) }
     if (picking) {
         Sheet("Share which code", dismiss = { picking = false }) {
-            Entry("Your code", sub = "The one your contacts know", tag = "share-as-0") {
+            Entry(MAIN_IDENTITY, sub = "The one your contacts know", tag = "share-as-0") {
                 picking = false
                 onShareAs(0u)
             }

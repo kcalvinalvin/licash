@@ -100,6 +100,26 @@ internal fun ways(lightning: Boolean, silent: Boolean, donations: Boolean = fals
     Way.DONATIONS.takeIf { donations },
 )
 
+/**
+ * The ways not open to the wallet now, each with why: said grayed out
+ * under the others, so none is a mystery. `lookingForDonations` while
+ * providers are still asked.
+ */
+internal fun closedWays(
+    lightning: Boolean,
+    silent: Boolean,
+    donations: Boolean,
+    lookingForDonations: Boolean,
+): List<Pair<Way, String>> = listOfNotNull(
+    (Way.LIGHTNING to "None of your hubs takes Lightning").takeIf { !lightning },
+    (Way.SILENT to "Your hubs don't index silent payments").takeIf { !silent },
+    when {
+        donations -> null
+        lookingForDonations -> Way.DONATIONS to "Looking for a provider…"
+        else -> Way.DONATIONS to "No provider takes donations now"
+    },
+)
+
 /** What a donation address takes and costs, and who pays it on, in words. */
 internal fun donationWords(address: DonationAddress): String {
     val by = address.name ?: address.provider.substringAfter("://").trimEnd('/')
@@ -154,6 +174,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
     var bitcoin by remember { mutableStateOf<Code?>(null) }
     // Looked for once, out of sight: a way to be paid only if found.
     var donations by remember { mutableStateOf<DonationAddress?>(null) }
+    var lookingForDonations by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
     // The amount typed in, in place of the QR code: asked for once done.
     var editing by remember { mutableStateOf(false) }
@@ -179,6 +200,9 @@ fun Receive(engine: Engine, back: () -> Unit) {
     var pickingCode by rememberSaveable { mutableStateOf(false) }
     var naming by rememberSaveable { mutableStateOf(false) }
     var typedLabel by rememberSaveable { mutableStateOf("") }
+    // A new identity being made: seconds, its hubs asked over Tor.
+    var creating by remember { mutableStateOf(false) }
+    var createError by remember { mutableStateOf<String?>(null) }
     var copied by remember { mutableStateOf(false) }
     var choosing by rememberSaveable { mutableStateOf(false) }
     val ui by engine.ui.collectAsState()
@@ -228,7 +252,9 @@ fun Receive(engine: Engine, back: () -> Unit) {
             .onFailure { error = explain(it) }
     }
     LaunchedEffect(ui.hubs) {
+        lookingForDonations = true
         donations = engine.donationAddress().getOrNull()
+        lookingForDonations = false
     }
     // Shown, its provider is kept: the same address shows from then on.
     val shownDonations = donations?.lnurl?.takeIf { way == Way.DONATIONS }
@@ -283,8 +309,8 @@ fun Receive(engine: Engine, back: () -> Unit) {
         engine.events.collect { event -> if (event.received != null) received = event.text }
     }
     if (pickingCode) {
-        Sheet("Which code", dismiss = { pickingCode = false }) {
-            Entry("Your code", sub = "The one your contacts know", tag = "code-0") {
+        Sheet("Which identity", dismiss = { pickingCode = false }) {
+            Entry(MAIN_IDENTITY, sub = "The one your contacts know", tag = "code-0") {
                 pickingCode = false
                 codeIndex = 0
             }
@@ -294,25 +320,30 @@ fun Receive(engine: Engine, back: () -> Unit) {
                     codeIndex = extra.index.toInt()
                 }
             }
-            Entry("New separate code", sub = "No one can tell it's yours", tag = "new-code") {
+            Entry("New anonymous identity", sub = "No one can tell it's yours", tag = "new-code") {
                 pickingCode = false
                 typedLabel = ""
+                createError = null
                 naming = true
             }
         }
     }
     if (naming) {
-        Sheet("New separate code", dismiss = { naming = false }) {
+        // Open while it is made, which asks its hubs: closed once made, or why not said under the button.
+        Sheet("New anonymous identity", dismiss = { naming = false }, dismissable = !creating) {
             val create = {
-                labelOf(typedLabel)?.let { label ->
-                    naming = false
+                labelOf(typedLabel)?.takeIf { !creating }?.let { label ->
+                    creating = true
+                    createError = null
                     scope.launch {
                         engine.addCode(label)
                             .onSuccess { made ->
                                 codes = codes + made
                                 codeIndex = made.index.toInt()
+                                naming = false
                             }
-                            .onFailure { error = explain(it) }
+                            .onFailure { createError = explain(it) }
+                        creating = false
                     }
                 }
                 Unit
@@ -337,7 +368,14 @@ fun Receive(engine: Engine, back: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(Modifier.height(16.dp))
-            BigButton("Create", Modifier.fillMaxWidth().testTag("create-code"), enabled = labelOf(typedLabel) != null) { create() }
+            BigButton(
+                if (creating) "Creating…" else "Create",
+                Modifier.fillMaxWidth().testTag("create-code"),
+                enabled = labelOf(typedLabel) != null,
+                busy = creating,
+            ) { create() }
+            Waited(rememberWait(creating), Modifier.fillMaxWidth().padding(top = 8.dp), center = true)
+            createError?.let { Problem(it) }
             Spacer(Modifier.height(16.dp))
         }
     }
@@ -351,6 +389,15 @@ fun Receive(engine: Engine, back: () -> Unit) {
                     // An invoice asks for an amount.
                     if (other == Way.LIGHTNING && amount == null) edit() else editing = false
                 }
+            }
+            val closed = closedWays(takesLightning, ui.hubs.any { it.silent }, donations != null, lookingForDonations)
+            closed.forEach { (other, why) ->
+                Entry(
+                    other.label,
+                    sub = why,
+                    tag = other.tag + "-closed",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                )
             }
         }
     }
@@ -521,14 +568,17 @@ private fun MemoField(memo: String, onMemo: (String) -> Unit, done: () -> Unit) 
 
 /** What a separate code is, said where one is made. */
 internal const val SEPARATE_WORDS =
-    "A code of its own: no one can tell it's yours, or link it to your other codes. " +
+    "A code of its own to be paid at: no one can tell it's yours, or link it to your other identities. " +
         "Payments to it move to your balance, less a hub fee."
+
+/** The wallet's own code, as an identity: the one its contacts know. */
+internal const val MAIN_IDENTITY = "Main identity"
 
 /** What an extra code took, in words. */
 internal fun codeWords(code: ExtraCode): String = when (code.payments) {
-    0u -> "A separate code, nothing received yet"
-    1u -> "A separate code, 1 payment received"
-    else -> "A separate code, ${code.payments} payments received"
+    0u -> "Anonymous, nothing received yet"
+    1u -> "Anonymous, 1 payment received"
+    else -> "Anonymous, ${code.payments} payments received"
 }
 
 /** Where a QR code shows once made. */

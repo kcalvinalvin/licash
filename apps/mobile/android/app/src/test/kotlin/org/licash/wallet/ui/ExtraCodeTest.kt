@@ -19,16 +19,16 @@ class ExtraCodeTest {
     @Test
     fun a_code_is_named_by_its_label_the_wallets_own_as_yours() {
         val codes = listOf(extra(1u, "Forum"), extra(2u, "Shop"))
-        assertEquals("Your code", codeName(0u, codes))
+        assertEquals("Main identity", codeName(0u, codes))
         assertEquals("Shop", codeName(2u, codes))
         // Not listed yet: by its number.
-        assertEquals("Code 3", codeName(3u, codes))
+        assertEquals("Identity 3", codeName(3u, codes))
     }
 
     @Test
     fun what_a_code_took_is_said_in_payments() {
-        assertEquals("A separate code, nothing received yet", codeWords(extra(1u, "a")))
-        assertEquals("A separate code, 1 payment received", codeWords(extra(1u, "a", 1u)))
-        assertEquals("A separate code, 3 payments received", codeWords(extra(1u, "a", 3u)))
+        assertEquals("Anonymous, nothing received yet", codeWords(extra(1u, "a")))
+        assertEquals("Anonymous, 1 payment received", codeWords(extra(1u, "a", 1u)))
+        assertEquals("Anonymous, 3 payments received", codeWords(extra(1u, "a", 3u)))
     }
 }
