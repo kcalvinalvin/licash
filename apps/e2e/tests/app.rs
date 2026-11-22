@@ -644,10 +644,43 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     restored(phone, hub, &silent.to_string()).await
 }
 
+/// The notes at its hub made few now, by hand, as the hub's page offers in
+/// advanced mode: the wallet does it by itself once they have rested, and
+/// then rests again for hours. A backup made between would not know the new
+/// notes, and the old ones are spent (docs/wallet-cli.md: keep backups
+/// current). Nothing to do if none is offered.
+async fn optimized(phone: &Phone) -> anyhow::Result<()> {
+    phone.launch().await?;
+    phone.tap("Settings").await?;
+    phone.tap_id("hubs").await?;
+    phone.tap_id("hub").await?;
+    let optimize = phone.scroll_to_id("optimize-notes").await?;
+    phone.tap_view(&optimize).await?;
+    let offered = until("the optimization offered or not", 30, || async {
+        let views = phone.views().await?;
+        if views.iter().any(|v| v.id == "confirm-optimize") {
+            return Ok(Some(true));
+        }
+        let none = views
+            .iter()
+            .any(|v| v.text.starts_with("No optimization is available"));
+        Ok(none.then_some(false))
+    })
+    .await?;
+    if offered {
+        phone.tap_id("confirm-optimize").await?;
+        phone
+            .wait("Optimized. Its fee is recorded in History.", 60)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Backed up from Settings, deleted and brought back from the first
 /// screen: from its backup file, all it held; from its 24 words, its keys,
 /// the same silent payment address.
 async fn restored(phone: &Phone, hub: &str, silent: &str) -> anyhow::Result<()> {
+    optimized(phone).await?;
     phone.launch().await?;
     let held = phone.balance().await?;
     phone.tap("Settings").await?;
