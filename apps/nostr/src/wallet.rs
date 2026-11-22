@@ -1240,9 +1240,11 @@ pub async fn invoice_providers_with<T: Transport>(
     max_fee: u64,
 ) -> anyhow::Result<Vec<InvoiceProvider>> {
     let network = wallet.network().name();
+    // One of several ways to pay, beside the hubs' gateways: a provider
+    // not answering lately is passed over, not waited on again.
     let ask = |url: String| async move {
         let quote = wallet.invoice_quote_via(&url, from, request, max_fee);
-        quote.await
+        licash_wallet::in_background(quote).await
     };
     let on = (relays, route, network);
     let none = HashSet::new();
@@ -1287,7 +1289,10 @@ pub async fn donation_providers_with<T: Transport>(
     code: &LicashCode,
 ) -> anyhow::Result<Vec<DonationProvider>> {
     let network = wallet.network().name();
-    let ask = |url: String| async move { wallet.donation_address(&url, code).await };
+    // Looked for out of sight: a provider not answering lately is passed over.
+    let ask = |url: String| async move {
+        licash_wallet::in_background(wallet.donation_address(&url, code)).await
+    };
     let on = (relays, route, network);
     let none = HashSet::new();
     let answering = announced.answering(on, &none, ask, |a: &DonationAddress| {
