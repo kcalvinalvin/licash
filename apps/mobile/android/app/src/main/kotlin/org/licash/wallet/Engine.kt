@@ -1234,11 +1234,16 @@ class Engine(context: Context) {
         val contacts: Map<String, String>,
     )
 
-    /** A new wallet of the network chosen, born at the chain's height if known. */
+    /**
+     * A new wallet of the network chosen, born at the chain's height if known,
+     * else at the block this release pins (mined before it, so nothing of the
+     * wallet's is earlier): never scanned from the first block.
+     */
     suspend fun create(): Result<Unit> = io {
         mutex.withLock {
             val light = light
-            val birthday = if (light != null && light.synced()) light.height().toUInt() else 0u
+            val pinned = Mobile.pinHeight(chainName(prefs.network)).toUInt()
+            val birthday = if (light != null && light.synced()) light.height().toUInt() else pinned
             wallet = configured(Wallet.create(walletDir, prefs.network, birthday, tor()))
             AppLog.info("wallet made at block $birthday")
         }

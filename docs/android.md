@@ -118,7 +118,8 @@ own page holds the notes, the log, the limit for renewing notes, the light
 client's settings, resetting its chain state and deleting the wallet.
 The app runs one Tor client and starts the light client
 through it at launch, wallet or not: catching up starts before a wallet is
-made. Its state lives in `files/tor`; an earlier version's, in the wallet's
+made. A wallet made before it caught up is born at the block the release
+pins for its network (regtest: the first), never scanned from the start. Its state lives in `files/tor`; an earlier version's, in the wallet's
 directory, moves there once (left where it is if it cannot).
 
 Cold storage, in advanced mode (or once set up), is a page of its own in

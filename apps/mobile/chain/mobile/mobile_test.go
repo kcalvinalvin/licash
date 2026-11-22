@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
+
+	"github.com/licash-org/licash/apps/mobile/chain/node"
 )
 
 func TestNetworks(t *testing.T) {
@@ -59,6 +61,19 @@ func TestNetworks(t *testing.T) {
 	}
 	if _, err := Start("testnet", t.TempDir(), "", ""); err == nil {
 		t.Error("started an unknown network")
+	}
+}
+
+func TestPinHeights(t *testing.T) {
+	for name, pin := range map[string]*node.Pin{"bitcoin": bitcoinPin, "signet": signetPin, "mutinynet": mutinynetPin} {
+		if pin == nil || PinHeight(name) != int32(pin.Height) || pin.Height == 0 {
+			t.Errorf("%s: pinned at %d", name, PinHeight(name))
+		}
+	}
+	for _, name := range []string{"regtest", "testnet", ""} {
+		if h := PinHeight(name); h != 0 {
+			t.Errorf("%q: pinned at %d", name, h)
+		}
 	}
 }
 
