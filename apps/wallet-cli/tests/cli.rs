@@ -438,7 +438,9 @@ fn explicit_note_optimization_previews_its_fee_and_records_the_actual_operation(
     assert_eq!(history.as_array().unwrap().len(), 1);
     assert_eq!(history[0]["optimization"], true);
     assert_eq!(history[0]["amount"], 0);
-    assert!(ok(wallet(&alice, &["history"], None)).contains("optimized notes"));
+    let text = ok(wallet(&alice, &["history"], None));
+    assert!(text.contains("optimized notes"));
+    assert!(text.contains("received  64 sat"), "{text}");
     assert_eq!(json(&alice, &["resume"])["paid"], Value::Array(vec![]));
 }
 

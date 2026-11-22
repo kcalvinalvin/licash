@@ -1,5 +1,5 @@
 //! How the wallet says amounts, fees and times to a person: amounts
-//! grouped and in sat, fees as a percentage, times as UTC dates. JSON
+//! grouped and in sat, fees as a percentage, times in local time. JSON
 //! keeps the raw numbers.
 
 /// Human output must not execute control sequences supplied by a peer.
@@ -204,29 +204,16 @@ pub fn percent(ppm: u64) -> String {
     }
 }
 
-/// Unix seconds as a UTC date and time: `2026-11-15 13:00`.
+/// Unix seconds in the system timezone: `2026-11-15 13:00`.
 pub fn when(at: i64) -> String {
-    let (days, secs) = (at.div_euclid(86_400), at.rem_euclid(86_400));
-    let (y, m, d) = civil(days);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
-        secs / 3600,
-        secs % 3600 / 60
-    )
+    in_zone(at, jiff::tz::TimeZone::system())
 }
 
-/// The year, month and day `days` after 1970-01-01.
-fn civil(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    (y, m, d)
+fn in_zone(at: i64, zone: jiff::tz::TimeZone) -> String {
+    match jiff::Timestamp::from_second(at) {
+        Ok(at) => at.to_zoned(zone).strftime("%Y-%m-%d %H:%M").to_string(),
+        Err(_) => format!("{at} Unix seconds"),
+    }
 }
 
 #[cfg(test)]
@@ -294,10 +281,18 @@ mod tests {
 
     #[test]
     fn times_are_utc_dates() {
+        let when = |at| in_zone(at, jiff::tz::TimeZone::UTC);
         assert_eq!(when(0), "1970-01-01 00:00");
         // 2026-11-15T13:05:00Z
         assert_eq!(when(1_794_700_800 + 13 * 3600 + 300), "2026-11-15 13:05");
         assert_eq!(when(951_782_400), "2000-02-29 00:00");
         assert_eq!(when(-1), "1969-12-31 23:59");
+    }
+
+    #[test]
+    fn local_times_follow_daylight_saving() {
+        let zone = jiff::tz::TimeZone::get("Europe/Madrid").unwrap();
+        assert_eq!(in_zone(1_775_178_000, zone.clone()), "2026-04-03 03:00");
+        assert_eq!(in_zone(1_768_014_000, zone), "2026-01-10 04:00");
     }
 }

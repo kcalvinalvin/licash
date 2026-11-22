@@ -97,8 +97,10 @@ size whatever they say, so neither the hub nor a relay reads them. Every
 payment to a code at a hub naming the `note` feature in its info carries
 one, empty if nothing is said; a note is asked only of such a hub, its info
 fetched again first if it named none (so the first note after a hub's
-upgrade may stand out), and another refuses the payment, nothing paid. `received`, `history`
-and `mailbox` show what a payment's note said, and who paid, once proved.
+upgrade may stand out), and another refuses the payment, nothing paid.
+`history` shows sends and collected receipts together, newest first, in
+local time. Scripts can use `--json history` for sends and `--json received`
+for receipts, both with Unix timestamps. `mailbox` shows what it collects.
 `new-code LABEL` makes an extra code, numbered from 1, of keys of its own
 derived from the seed, naming no mailbox: no one can tell it is the
 wallet's, or another extra code's. `codes` lists them, what each received

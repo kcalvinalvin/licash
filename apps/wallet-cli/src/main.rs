@@ -211,9 +211,9 @@ enum Command {
         #[arg(long, env = "LICASH_WALLET_CHAIN")]
         chain: Option<String>,
     },
-    /// The payments made, newest first.
+    /// Payments sent and received, newest first (JSON lists sends only).
     History,
-    /// The payments taken, newest first.
+    /// The payments taken, newest first (also shown in text history).
     Received,
     /// Drop the notes a copy of this wallet spent, as after restoring an
     /// old backup of its file. Each hub learns which notes are this
@@ -1009,34 +1009,51 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::History => {
             let sends = wallet.sends()?;
             let notes = wallet.payment_notes()?;
-            let rows = sends.iter().map(|s| {
-                let (note, from) = note_json(notes.get(&s.id));
-                json!({
-                    "id": s.id, "hub": s.hub, "payee": encode(&s.payee), "amount": s.amount,
-                    "fee": s.fee, "state": state(&s.state), "created_at": s.created_at,
-                    "optimization": s.is_optimization(&wallet.address()),
-                    "note": note, "shared_code": from.is_some(),
-                })
-            });
-            let lines = sends.iter().map(|s| {
-                let amount = if s.is_optimization(&wallet.address()) {
-                    format!("optimized notes, fee {}", say::sat(s.fee))
-                } else {
-                    say::plus(s.amount, s.fee)
-                };
-                let said = (notes.get(&s.id))
-                    .and_then(|n| n.text.as_deref())
-                    .map_or_else(String::new, |text| format!("  \"{}\"", say::terminal(text)));
-                format!(
-                    "{}  {}  {}  via {}  {}{said}",
-                    say::when(s.created_at),
-                    state(&s.state),
-                    amount,
-                    s.hub,
-                    s.id
-                )
-            });
-            show(json, rows.collect(), lines.collect::<Vec<_>>().join("\n"));
+            if json {
+                let rows = sends.iter().map(|s| {
+                    let (note, from) = note_json(notes.get(&s.id));
+                    json!({
+                        "id": s.id, "hub": s.hub, "payee": encode(&s.payee), "amount": s.amount,
+                        "fee": s.fee, "state": state(&s.state), "created_at": s.created_at,
+                        "optimization": s.is_optimization(&wallet.address()),
+                        "note": note, "shared_code": from.is_some(),
+                    })
+                });
+                show(true, rows.collect(), String::new());
+            } else {
+                let receipts = wallet.receipts()?;
+                let sent = sends.iter().map(|s| {
+                    let amount = if s.is_optimization(&wallet.address()) {
+                        format!("optimized notes, fee {}", say::sat(s.fee))
+                    } else {
+                        say::plus(s.amount, s.fee)
+                    };
+                    let said = notes
+                        .get(&s.id)
+                        .and_then(|n| n.text.as_deref())
+                        .map_or_else(String::new, |text| format!("  \"{}\"", say::terminal(text)));
+                    let line = format!(
+                        "{}  {amount}  via {}  {}{said}",
+                        state(&s.state),
+                        s.hub,
+                        s.id
+                    );
+                    (s.created_at, &s.id, line)
+                });
+                let received = receipts.iter().map(|r| {
+                    let amount = say::sat(r.amount);
+                    let said = note_said(notes.get(&r.id));
+                    let line = format!("received  {amount}  via {}  {}{said}", r.hub, r.id);
+                    (r.received_at, &r.id, line)
+                });
+                let mut rows: Vec<_> = sent.chain(received).collect();
+                rows.sort_by_key(|(at, id, _)| (std::cmp::Reverse(*at), *id));
+                let lines: Vec<_> = rows
+                    .into_iter()
+                    .map(|(at, _, line)| format!("{}  {line}", say::when(at)))
+                    .collect();
+                show(false, serde_json::Value::Null, lines.join("\n"));
+            }
         }
         Command::Received => {
             let receipts = wallet.receipts()?;
