@@ -1,0 +1,33 @@
+name: Prover build cache
+description: >
+  The cargo registry and target of the hub image's prover build (r0/host, CPU
+  and CUDA), kept between runs: the CUDA kernels of RISC Zero take over an
+  hour to compile, and a runner starts with none of apps/hub/Dockerfile's
+  cache mounts. Use before the image is built, in the job that builds it.
+inputs:
+  builder:
+    description: The buildx builder that builds the image, the active one if none.
+    default: ''
+runs:
+  using: composite
+  steps:
+    # Keyed on what the prover's dependencies are (r0/host/Cargo.lock): an
+    # edit of the lock restores the latest cache before it and builds on it.
+    # The version is bumped to start a cache over (a CUDA toolchain or
+    # CUDA_ARCHS change in the Dockerfile).
+    - id: cache
+      uses: actions/cache@v5
+      with:
+        path: docker-cache
+        key: prover-v1-${{ hashFiles('r0/host/Cargo.lock') }}
+        restore-keys: prover-v1-
+    - uses: reproducible-containers/buildkit-cache-dance@v3
+      with:
+        builder: ${{ inputs.builder }}
+        # The ids and targets of apps/hub/Dockerfile's prover stage.
+        cache-map: |
+          {
+            "docker-cache/registry": {"target": "/root/.cargo/registry", "id": "licash-r0-registry"},
+            "docker-cache/target": {"target": "/src/r0/host/target", "id": "licash-r0-target"}
+          }
+        skip-extraction: ${{ steps.cache.outputs.cache-hit == 'true' }}
