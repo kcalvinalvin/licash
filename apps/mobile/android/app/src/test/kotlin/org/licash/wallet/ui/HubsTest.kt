@@ -105,4 +105,12 @@ class HubsTest {
         assertEquals("3 more did not answer: try with Tor on", unanswered(found(3u, 2u), tor = false))
         assertEquals("3 more did not answer", unanswered(found(3u, 2u), tor = true))
     }
+
+    @Test
+    fun an_announced_name_is_shown_on_one_line_short_and_unturned() {
+        assertEquals("a test hub", shownName("  a\n test\thub "))
+        assertEquals("evil hub", shownName("evil\u202E hub"))
+        assertEquals(40, shownName("x".repeat(100))!!.length)
+        assertNull(shownName(" \u200B "))
+    }
 }

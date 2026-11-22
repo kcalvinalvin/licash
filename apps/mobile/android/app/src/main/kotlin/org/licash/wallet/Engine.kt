@@ -87,6 +87,7 @@ import org.licash.core.stateBundleMost
 import org.licash.core.setLogger
 import org.licash.core.walletExists
 import org.licash.wallet.ui.Progress
+import org.licash.wallet.ui.shownName
 import org.licash.wallet.ui.stages
 
 /** What the screens show. */
@@ -1438,7 +1439,7 @@ class Engine(context: Context) {
         poke()
     }
 
-    suspend fun addHub(url: String): Result<Hub> = io {
+    suspend fun addHub(url: String, announced: String? = null): Result<Hub> = io {
         val hub = locked {
             it.addHub(url).also { added ->
                 // Reached: the connections say so before learnHubs asks again.
@@ -1451,10 +1452,15 @@ class Engine(context: Context) {
                 }
             }
         }
+        // Kept to name it by in the list of hubs, its address under it.
+        announced?.let(::shownName)?.let { prefs.nameHub(hub.url, it) }
         refresh()
         poke()
         hub
     }
+
+    /** The name the hub at `url` announced itself under when added, if any. */
+    fun hubName(url: String): String? = prefs.hubName(url)
 
     /**
      * What the hub at [hub] charges beyond what was agreed, as the wallet

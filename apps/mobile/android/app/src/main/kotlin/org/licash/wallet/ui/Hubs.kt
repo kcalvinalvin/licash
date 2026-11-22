@@ -53,6 +53,16 @@ const val HUB_MEANS = "A hub holds your balance and moves it for you. Up to what
     "on Bitcoin without the hub. You can add more hubs later."
 
 /** A hub in a line under its name: its fee on a payment, and what else it does. */
+/**
+ * A name a hub announced, as shown: its words one space apart, at most 40
+ * characters, without control or formatting ones, none if blank. Its own
+ * word only: its address goes with it.
+ */
+internal fun shownName(announced: String): String? =
+    // No control or formatting characters, which could turn what follows around.
+    announced.filterNot { it.isISOControl() && !it.isWhitespace() || Character.getType(it) == Character.FORMAT.toInt() }
+        .split(Regex("\\s+")).filter { it.isNotEmpty() }.joinToString(" ").take(40).trim().ifEmpty { null }
+
 internal fun about(hub: Hub): String = listOfNotNull(
     paying(hub).let { if (it == "None") "No fee" else "Fee $it" },
     hub.lightning?.let { "Lightning" },
@@ -350,7 +360,7 @@ internal fun FoundHubs(engine: Engine, ui: Ui, auto: Boolean) {
                 joining = true
                 joinError = null
                 scope.launch {
-                    engine.addHub(f.hub.url)
+                    engine.addHub(f.hub.url, f.name)
                         .onSuccess {
                             joined = named
                             adding = null

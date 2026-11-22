@@ -188,8 +188,14 @@ private fun HubsPage(engine: Engine, ui: Ui) {
         Group("") {
             ui.hubs.forEachIndexed { i, hub ->
                 if (i > 0) Divider()
-                val sub = if (raised(hub) == null) about(hub) else "Raised its fees: approve to pay there"
-                Entry(name(hub.url), Modifier.testTag("hub"), sub = sub, onClick = { shown = hub })
+                // Named as it announced itself, its address under it, else by its address.
+                val announced = engine.hubName(hub.url)
+                val sub = when {
+                    raised(hub) != null -> "Raised its fees: approve to pay there"
+                    announced != null -> name(hub.url)
+                    else -> about(hub)
+                }
+                Entry(announced ?: name(hub.url), Modifier.testTag("hub"), sub = sub, onClick = { shown = hub })
             }
         }
     }

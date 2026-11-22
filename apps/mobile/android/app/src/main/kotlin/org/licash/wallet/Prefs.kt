@@ -59,6 +59,13 @@ class Prefs(context: Context) {
 
     private fun dismissedKey(hub: String) = "unprotected_dismissed:" + hub.trimEnd('/')
 
+    /** The name the hub at `url` announced itself under when it was added from those found, if it was. */
+    fun hubName(url: String): String? = prefs.getString(hubNameKey(url), null)
+
+    fun nameHub(url: String, name: String) = prefs.edit().putString(hubNameKey(url), name).apply()
+
+    private fun hubNameKey(hub: String) = "hub_name:" + hub.trimEnd('/')
+
     /** Whether [tor] was set rather than the default. */
     val torChosen: Boolean
         get() = prefs.contains("tor")
