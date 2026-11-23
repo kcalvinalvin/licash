@@ -41,3 +41,9 @@ tokio = { version = "1.54", features = ["macros", "net", "rt-multi-thread", "sig
 tower-http = { version = "0.7", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# sysinfo 0.38, which Arti's tor-memquota needs, calls proc_pidinfo on iOS,
+# where libc does not declare it: 0.38.4 with sysinfo's own fix (#1679,
+# released in 0.39.4).
+[patch.crates-io]
+sysinfo = { git = "https://github.com/kcalvinalvin/sysinfo", rev = "763bf918d46f641dcd6f8f68399c57e0f10335f1" }
