@@ -41,6 +41,8 @@ targets:
         INFOPLIST_FILE: Licash/Info.plist
         TARGETED_DEVICE_FAMILY: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # The commit built, for Settings and the logs: xcodebuild LICASH_COMMIT=<hash> sets it.
+        LICASH_COMMIT: unknown
   LicashTests:
     type: bundle.unit-test
     platform: iOS

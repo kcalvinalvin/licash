@@ -67,13 +67,13 @@ jobs:
           print(next(d["udid"] for runtime in sorted(devices, reverse=True) if "iOS" in runtime
                      for d in devices[runtime] if d["name"].startswith("iPhone")))')
           xcodebuild test -project Licash.xcodeproj -scheme Licash -destination "id=$udid" \
-            -resultBundlePath build/tests.xcresult CODE_SIGNING_ALLOWED=NO
+            -resultBundlePath build/tests.xcresult CODE_SIGNING_ALLOWED=NO LICASH_COMMIT=$(git rev-parse --short HEAD)
       # Unsigned: a sideloading tool signs it with the installer's own Apple ID.
       - name: App for iPhones, unsigned
         working-directory: apps/mobile/ios
         run: |
           xcodebuild build -project Licash.xcodeproj -scheme Licash -configuration Release \
-            -sdk iphoneos -derivedDataPath build/device CODE_SIGNING_ALLOWED=NO
+            -sdk iphoneos -derivedDataPath build/device CODE_SIGNING_ALLOWED=NO LICASH_COMMIT=$(git rev-parse --short HEAD)
           mkdir -p build/ipa/Payload
           cp -R build/device/Build/Products/Release-iphoneos/Licash.app build/ipa/Payload/
           (cd build/ipa && zip -qry ../licash-unsigned.ipa Payload)
