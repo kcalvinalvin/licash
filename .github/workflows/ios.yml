@@ -1,0 +1,91 @@
+name: ios
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ios-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # What native.sh builds changes only with the Rust, the Go and
+      # native.sh: kept for runs that change the Swift alone, failing ones
+      # included.
+      - uses: actions/cache/restore@v6
+        id: native
+        with:
+          path: apps/mobile/ios/build/native
+          key: ios-native-${{ hashFiles('Cargo.lock', 'crates/**', 'r0/**', 'apps/**', '!apps/mobile/android/**', '!apps/mobile/ios/**', 'apps/mobile/ios/native.sh') }}
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.native.outputs.cache-hit != 'true'
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        if: steps.native.outputs.cache-hit != 'true'
+        with:
+          workspaces: apps
+      - uses: actions/setup-go@v7
+        if: steps.native.outputs.cache-hit != 'true'
+        with:
+          go-version-file: apps/mobile/chain/go.mod
+          cache-dependency-path: apps/mobile/chain/go.sum
+      - name: Official neutrino, and gomobile at the version go.mod pins
+        if: steps.native.outputs.cache-hit != 'true'
+        working-directory: apps/mobile/chain
+        run: |
+          upstream/materialize.sh
+          version=$(go list -m -f '{{.Version}}' golang.org/x/mobile)
+          go install golang.org/x/mobile/cmd/gomobile@$version golang.org/x/mobile/cmd/gobind@$version
+          gomobile init
+      - name: Wallet core, its Swift bindings and the light client's XCFramework
+        if: steps.native.outputs.cache-hit != 'true'
+        working-directory: apps/mobile/ios
+        run: ./native.sh
+      - uses: actions/cache/save@v6
+        if: steps.native.outputs.cache-hit != 'true'
+        with:
+          path: apps/mobile/ios/build/native
+          key: ${{ steps.native.outputs.cache-primary-key }}
+      - name: Xcode project
+        working-directory: apps/mobile/ios
+        run: |
+          brew install xcodegen
+          xcodegen generate
+      - name: App on the simulator, and its tests
+        working-directory: apps/mobile/ios
+        run: |
+          udid=$(xcrun simctl list devices available --json | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          print(next(d["udid"] for runtime in sorted(devices, reverse=True) if "iOS" in runtime
+                     for d in devices[runtime] if d["name"].startswith("iPhone")))')
+          xcodebuild test -project Licash.xcodeproj -scheme Licash -destination "id=$udid" \
+            -resultBundlePath build/tests.xcresult CODE_SIGNING_ALLOWED=NO
+      # Unsigned: a sideloading tool signs it with the installer's own Apple ID.
+      - name: App for iPhones, unsigned
+        working-directory: apps/mobile/ios
+        run: |
+          xcodebuild build -project Licash.xcodeproj -scheme Licash -configuration Release \
+            -sdk iphoneos -derivedDataPath build/device CODE_SIGNING_ALLOWED=NO
+          mkdir -p build/ipa/Payload
+          cp -R build/device/Build/Products/Release-iphoneos/Licash.app build/ipa/Payload/
+          (cd build/ipa && zip -qry ../licash-unsigned.ipa Payload)
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: ios-tests
+          path: apps/mobile/ios/build/tests.xcresult
+          retention-days: 3
+      - uses: actions/upload-artifact@v7
+        with:
+          name: licash-ios-unsigned
+          path: apps/mobile/ios/build/licash-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
